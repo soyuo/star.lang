@@ -9,7 +9,7 @@ This document specifies operands, stack effects, side effects, and additional fa
 - Stack lists are written bottom-to-top. `A, B -> C` consumes `A` then `B` (so `B` is popped first) and pushes `C`. `-` means no values. `v1..vn, n -> Array` means values are pushed in order, followed by their count on top.
 - Unless an entry says otherwise, a runtime instruction can fail with `StackUnderflow` when inputs are missing, `TypeError` when an input has the wrong type, or `OutOfMemoryError` when it cannot allocate. It may also be stopped by the configured execution limit. The failure column lists additional instruction-specific cases.
 - A `CompileError` from a structural instruction means the source is rejected before execution. Structural instructions are consumed by the compiler and have no separate runtime bytecode effect. The compiler must verify stack depth and compatible types at control-flow joins.
-- Variable, function, field, method, module, and type identifiers are nonnegative `Int` values unless otherwise stated. A source operation that declares a stack effect must leave the remaining stack intact.
+- Variable, function, field, method, module, and type identifiers are nonnegative `Int` values unless otherwise stated. A non-`Int` identifier operand raises `TypeError`; a negative ID or missing binding raises the applicable `ReferenceError`. A source operation that declares a stack effect must leave the remaining stack intact.
 - `Null` is used for an absent optional result. `TYPE_OF` returns a canonical type-name `String`; `TYPE_CHECK` and `TYPE_ANNOTATE` take that same name as a `String`.
 - The source documents do not yet define every operand layout. Where a row below makes one explicit, it is the draft contract for the reference implementation and must remain consistent with the catalog and this notation.
 
@@ -98,8 +98,8 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `variable.declare` | `DECLARE` | `value, variable_id -> -` | Creates a mutable binding in the current scope. | `ReferenceError` for an invalid identifier or duplicate declaration in the same scope. |
-| `variable.const` | `CONST` | `value, variable_id -> -` | Creates an immutable binding in the current scope. | `ReferenceError` for an invalid identifier or duplicate declaration in the same scope. |
+| `variable.declare` | `DECLARE` | `value, variable_id -> -` | Creates a mutable binding in the current scope. | `ReferenceError` for a negative identifier or duplicate declaration in the same scope. |
+| `variable.const` | `CONST` | `value, variable_id -> -` | Creates an immutable binding in the current scope. | `ReferenceError` for a negative identifier or duplicate declaration in the same scope. |
 | `variable.delete` | `DELETE` | `variable_id -> -` | Removes the binding with that identifier from the current scope. | `ReferenceError` if it is absent or immutable. |
 | `variable.load_global` | `LOAD_GLOBAL` | `variable_id -> value` | Reads a binding from the current module's global scope. | `ReferenceError` if absent. |
 | `variable.store_global` | `STORE_GLOBAL` | `value, variable_id -> -` | Updates a mutable current-module global or creates it if absent. | `ReferenceError` if immutable or invalid. |
@@ -145,12 +145,12 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `module.import` | `IMPORT` | `path: Bytes -> Module` | Decodes the path as UTF-8, resolves and loads the module, initializes it once, and pushes its module handle. | `TypeError` for invalid UTF-8; `ReferenceError` if unresolved or for a circular read before initialization. |
-| `module.export` | `EXPORT` | `symbol_id -> -` | Exposes the current module's named binding to importers. | `ReferenceError` if the binding is absent. |
+| `module.import` | `IMPORT` | `path: Bytes -> Module` | Decodes the path as UTF-8, resolves and loads the module, initializes it once, and pushes its module handle. | `TypeError` for invalid UTF-8; `PermissionError` if resolution reaches `STAR_PATH` without `env.read`; `ReferenceError` if unresolved or for a circular read before initialization. |
+| `module.export` | `EXPORT` | `symbol_id -> -` | Exposes the current module's top-level binding with that numeric ID to importers. | `ReferenceError` if absent, ambiguous across binding kinds, or already exported. |
 | `module.get` | `MODULE_GET` | `module, symbol_id -> value` | Reads an exported symbol from a module handle. | `ReferenceError` if the module or exported symbol is absent. |
 | `module.call` | `MODULE_CALL` | `arg1..argN, argc, module, symbol_id -> result` | Calls an exported function and pushes its result. | `ReferenceError` for a missing module/symbol; `TypeError` for invalid arity; `StackOverflow` at the call-depth limit. |
 | `module.init` | `MODULE_INIT` | `module -> -` | Runs module initialization once per execution context; repeated calls have no effect. | `ReferenceError` for an invalid module or initialization cycle. |
-| `module.import_dynamic` | `IMPORT_DYNAMIC` | `path: String -> Module` | Resolves, loads, and initializes a module at runtime, then pushes its handle. | `ReferenceError` if unresolved or for a circular read before initialization. |
+| `module.import_dynamic` | `IMPORT_DYNAMIC` | `path: String -> Module` | Resolves, loads, and initializes a module at runtime, then pushes its handle. | `PermissionError` if resolution reaches `STAR_PATH` without `env.read`; `ReferenceError` if unresolved or for a circular read before initialization. |
 
 ## Asynchronous and concurrent operations
 

@@ -13,7 +13,7 @@ Star source has no alphabetic identifier tokens. An identifier operand is a nonn
 | Variable ID | A binding key within one lexical environment; may be shadowed by a declaration in a nested scope. |
 | Function ID | Unique among functions in its defining module. |
 | Parameter ID | A variable ID local to the function's parameter environment. |
-| Module symbol ID | Unique among a module's exported symbols; names one top-level binding in that module. |
+| Module symbol ID | The numeric ID of one top-level binding selected for export; there is no separate alias ID. |
 | Struct and interface ID | Unique by kind within the defining module. |
 | Field ID | Unique within one struct. |
 | Method ID | Unique within one struct or interface. |
@@ -49,13 +49,15 @@ The logical path uses `/` as its separator on every host. Resolution searches in
 4. The Star standard library, including registered aliases such as `std.core`.
 5. Directories registered in `STAR_PATH`.
 
+The final step reads the `STAR_PATH` environment variable and requires the `env.read` capability. If resolution reaches this step without that permission, import raises `PermissionError` without reading the variable. Earlier resolution steps remain available without `env.read`.
+
 Path matching is exact and case-sensitive at the language level. On a case-insensitive host filesystem, the resolver must verify the exact component spelling before accepting a match. `.` path components are removed. `..` may move within a permitted root but must not escape it. Embedded NUL is invalid and raises `TypeError`. Absolute paths and attempts to escape a permitted root are rejected with `PermissionError`; symlink resolution must not bypass the same root restriction. Filesystem capability checks still apply. If no module resolves, import raises `ReferenceError`.
 
 The resolved canonical module identity, rather than the spelling of the path used to find it, keys module state. Two paths that resolve to the same module therefore share one module instance within an execution context.
 
 ## Visibility and module initialization
 
-Top-level variables, functions, structs, and interfaces are private to their module by default. `EXPORT` maps a Module symbol ID to one module-level binding and makes it available to importers. A duplicate exported ID or an absent binding raises `ReferenceError`. `MODULE_GET` and `MODULE_CALL` can access only exported symbols; private symbols remain inaccessible across module boundaries.
+Top-level variables, functions, structs, and interfaces are private to their module by default. `EXPORT n` selects the top-level binding whose existing numeric identifier is `n`; it does not create a second ID or alias. Because `EXPORT` has no kind operand, exactly one top-level binding of any kind may have that numeric ID in a module's exportable namespace. No match, multiple cross-kind matches, or a repeated export raises `ReferenceError`. `MODULE_GET` and `MODULE_CALL` use the same numeric ID and can access only exported symbols; private symbols remain inaccessible across module boundaries.
 
 Each module has one state per execution context: `Unloaded`, `Loading`, `Initializing`, `Ready`, or `Failed`.
 
