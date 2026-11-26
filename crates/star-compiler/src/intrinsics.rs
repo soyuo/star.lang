@@ -317,7 +317,7 @@ impl IrOp {
         }
     }
     /// Resolves an intrinsic ID from the emitted bytecode instruction table.
-    pub(crate) fn from_intrinsic_id(id: u16) -> Option<Self> {
+    pub fn from_intrinsic_id(id: u16) -> Option<Self> {
         const OPS: [IrOp; 100] = [
             IrOp::Add,
             IrOp::Sub,

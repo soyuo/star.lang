@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 num-bigint = "0.5"
+num-traits.workspace = true
 star-common.workspace = true
+star-compiler.workspace = true
 star-parser.workspace = true
 
 [dev-dependencies]
