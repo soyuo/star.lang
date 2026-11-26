@@ -1137,8 +1137,6 @@ fn sections(bytes: &[u8]) -> Result<HashMap<u32, Section>, String> {
     let mut reader = Cursor::new(bytes);
     reader.skip(12)?;
     let count = reader.u32()? as usize;
-    let directory_length = count.checked_mul(24).ok_or("section directory overflow")?;
-    reader.skip(directory_length)?;
     let mut entries = HashMap::with_capacity(count);
     for _ in 0..count {
         let id = reader.u32()?;

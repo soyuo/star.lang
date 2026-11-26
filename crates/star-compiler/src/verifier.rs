@@ -1933,6 +1933,10 @@ fn verify_function_flow(
                 }
                 InstructionKind::ForInit { loop_state } => {
                     state.pop_many(2, absolute_offset)?;
+                    state.scope_depth = state
+                        .scope_depth
+                        .checked_add(1)
+                        .ok_or_else(|| failure(Some(absolute_offset), "scope depth overflow"))?;
                     state.loop_states.insert(loop_state);
                 }
                 InstructionKind::ForNext {
