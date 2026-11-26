@@ -2,7 +2,7 @@
 
 Status: draft
 
-This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`; identifier, scope, module, and import rules are in `spec/identifier-module-semantics.md`; block matching and logical branch-target rules are in `spec/control-flow.md`; runtime tags and conversion rules are in `spec/type-semantics.md`; arithmetic and numeric comparison rules are in `spec/arithmetic-semantics.md`. This document does not define `.starc` bytecode.
+This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`; identifier, scope, module, and import rules are in `spec/identifier-module-semantics.md`; block matching and logical branch-target rules are in `spec/control-flow.md`; function calls, frames, returns, and closure capture are in `spec/function-abi.md`; runtime tags and conversion rules are in `spec/type-semantics.md`; arithmetic and numeric comparison rules are in `spec/arithmetic-semantics.md`. This document does not define `.starc` bytecode.
 
 ## Notation and common rules
 
@@ -86,13 +86,13 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `function.define` | `FUNC` | `function_id, parameter_ids..., parameter_count -> -` | Defines the following `END`-delimited body; parameters are bound to call-frame slots. The header is consumed at compile time. | `CompileError` for duplicate IDs, mismatched count, or malformed body. |
-| `function.call` | `CALL` | `arg1..argN, argc, function_id -> result` | Calls the named function; pushes its return value, using `Null` when it returns no value. The function may mutate state or perform I/O. | `ReferenceError` for an unknown function; `TypeError` for invalid arity; `StackOverflow` at the call-depth limit. |
-| `function.return` | `RETURN` | `value? -> caller result` | Ends the current function and returns its top value, or `Null` if its frame has no return value. | `CompileError` when used outside a function. |
-| `function.lambda` | `LAMBDA` | `body_id, parameter_count -> Closure` | Creates a closure for a compiler-registered body using the shared cells recorded by its `CAPTURE` entries. | `ReferenceError` for an unknown body; `TypeError` for an invalid count. |
-| `function.capture` | `CAPTURE` | `variable_id -> -` | Adds the current lexical binding's shared cell to the capture list associated with the in-progress `LAMBDA`; the closure retains the cell, not a copy of its current value. | `CompileError` outside closure construction; `ReferenceError` if the binding does not exist. |
-| `function.tail_call` | `TAIL_CALL` | `arg1..argN, argc, function_id -> caller result` | Calls the named function and returns its result directly from the current frame, without adding a call frame. | `ReferenceError` for an unknown function; `TypeError` for invalid arity; `StackOverflow` if the target call cannot reuse the frame. |
-| `function.call_value` | `CALL_VALUE` | `arg1..argN, argc, callable -> result` | Calls a `Function`, `Closure`, or `NativeFunction` value; pushes the result. | `TypeError` for a non-callable or invalid arity; `StackOverflow` at the call-depth limit. |
+| `function.define` | `FUNC` | `function_id, parameter_ids..., parameter_count, rest_parameter_code -> -` | Registers the following `END`-delimited body and its ordered parameter IDs in the defining module; code `0` means fixed arity, otherwise the code equals the parameter count and marks the final ID as variadic rest slot. Header is consumed at compile time. See `spec/function-abi.md`. | `CompileError` for duplicate IDs, mismatched count, invalid rest code, or malformed body. |
+| `function.call` | `CALL` | `arg1..argN, argc, function_id -> result` | Calls the named function in the current module using the ABI's argument order and frame rules; pushes exactly one result. | `ReferenceError` for an unknown function; `TypeError` for invalid arity; `StackOverflow` at the call-depth limit. |
+| `function.return` | `RETURN` | `value? -> caller result` | Returns the top operand above the current frame base, or `Null` when none exists; discards other frame operands. See `spec/function-abi.md`. | `CompileError` when used outside a function. |
+| `function.lambda` | `LAMBDA` | `body_id, parameter_count -> Closure` | Creates a closure from the compiler-registered body and pending shared-cell capture vector, then clears that vector. | `ReferenceError` for an unknown body; `TypeError` for an invalid count. |
+| `function.capture` | `CAPTURE` | `variable_id -> -` | Resolves the nearest lexical binding and appends its shared cell to the pending closure capture vector; does not copy its value. | `CompileError` for duplicate capture IDs or invalid construction context; `ReferenceError` if the binding does not exist. |
+| `function.tail_call` | `TAIL_CALL` | `arg1..argN, argc, function_id -> caller result` | Performs a direct named tail call using the ABI's argument order; reuses the current frame and preserves its caller's return location. | `ReferenceError` for an unknown function; `TypeError` for invalid arity; `StackOverflow` if the replacement frame exceeds stack capacity. |
+| `function.call_value` | `CALL_VALUE` | `arg1..argN, argc, callable -> result` | Calls a `Function`, `Closure`, or `NativeFunction` value using its descriptor and pushes one result. | `TypeError` for a non-callable or invalid arity; `StackOverflow` at the call-depth limit. |
 
 ## Variables and scope
 
@@ -156,7 +156,7 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `async.function` | `ASYNC_FUNC` | `function_id, parameter_ids..., parameter_count -> -` | Defines an asynchronous function body; calling it creates a `Task` instead of executing it inline. Header is consumed at compile time. | `CompileError` for duplicate IDs, mismatched count, or malformed body. |
+| `async.function` | `ASYNC_FUNC` | `function_id, parameter_ids..., parameter_count, rest_parameter_code -> -` | Defines an asynchronous function body using the same function descriptor and arity rules as `FUNC`; calling it creates a `Task` instead of executing it inline. Header is consumed at compile time. | `CompileError` for duplicate IDs, mismatched count, invalid rest code, or malformed body. |
 | `async.await` | `AWAIT` | `Task -> result` | Suspends the current task until completion and pushes the task result. | `TypeError` for a non-task; propagates task failure or cancellation. |
 | `async.spawn` | `SPAWN` | `Function -> Task` | Schedules the function as a new task and pushes its handle. | `TypeError` for a non-function; `PermissionError` if task creation is disabled. |
 | `async.yield` | `YIELD` | `- -> -` | Returns the execution turn to the scheduler. | `TypeError` when used outside an async task. |

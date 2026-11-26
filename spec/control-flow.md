@@ -41,7 +41,7 @@ Before `FOR`, the stack contains an `Iterator` followed by a nonnegative variabl
 
 ## Functions and returns
 
-`RETURN` ends the current `FUNC` or `ASYNC_FUNC` invocation and transfers its result to the caller; with no return value it returns `Null`. Falling through the function's `END` also returns `Null`. It is invalid outside a function and raises `CompileError` at compile time. Returning from inside nested conditionals or loops exits the function, not merely the innermost block. Function entry and exit do not permit a branch target from another function.
+`RETURN` ends the current `FUNC` or `ASYNC_FUNC` invocation and transfers its result to the caller; with no return value it returns `Null`. Falling through the function's `END` also returns `Null`. It is invalid outside a function and raises `CompileError` at compile time. Returning from inside nested conditionals or loops exits the function, not merely the innermost block. Function entry and exit do not permit a branch target from another function. Call-frame, argument, and closure-capture behavior is specified in `spec/function-abi.md`.
 
 ## Labels and branch targets
 
