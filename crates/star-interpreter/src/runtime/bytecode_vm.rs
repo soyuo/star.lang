@@ -8,7 +8,7 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use star_common::{SourcePosition, Span};
 use star_compiler::{verify_bytecode, Capability, IrOp, VerificationPolicy, VerifiedProgram};
 
-use crate::gc::GcStats;
+use crate::gc::{GcError, GcStats};
 use crate::value::{
     binding_cell, BindingCell, ClosureState, FunctionRef, IteratorState, ObjectState, Value,
 };
@@ -53,7 +53,9 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     }
 
     /// Performs a tracing collection of values owned or externally held during execution.
-    pub fn collect_garbage(&mut self) -> GcStats {
+    /// Returns `BorrowConflict` without modifying the heap if the host has an
+    /// active borrow; automatic collection is retried at a later instruction.
+    pub fn collect_garbage(&mut self) -> Result<GcStats, GcError> {
         self.runtime.collect_garbage()
     }
 

@@ -15,7 +15,7 @@ use star_parser::{
 };
 
 use crate::{
-    gc::{GcHeap, GcStats},
+    gc::{GcError, GcHeap, GcStats},
     semantic::{self, ResolvedFunction},
     value::{
         binding_cell, BindingCell, ClosureState, FunctionRef, InterfaceDefinition, IteratorState,
@@ -183,14 +183,16 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     /// Performs a tracing collection from interpreter roots and external handles.
-    pub fn collect_garbage(&mut self) -> GcStats {
+    /// Returns `GcError::BorrowConflict` without modifying the heap if the host
+    /// currently borrows a runtime value.
+    pub fn collect_garbage(&mut self) -> Result<GcStats, GcError> {
         self.gc
             .collect(&self.stack, &self.scopes, &self.capture_vectors)
     }
 
     fn collect_if_needed(&mut self) {
         if self.gc.should_collect() {
-            self.collect_garbage();
+            let _ = self.collect_garbage();
         }
     }
 

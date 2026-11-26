@@ -5,9 +5,10 @@
 //! edges before dropping its temporary `Rc`s. Clearing edges is what allows
 //! cycles to be reclaimed without invalidating any still-rooted handle.
 
-use std::cell::RefCell;
+use std::cell::{BorrowError, BorrowMutError, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
+use std::{error::Error, fmt};
 
 use crate::value::{
     BindingCell, ClosureState, IteratorState, MapState, ObjectState, SetState, TupleState, Value,
@@ -31,6 +32,36 @@ pub struct GcStats {
     pub total_allocations: u64,
     /// Number of tracked nodes that will trigger the next automatic collection.
     pub next_threshold: usize,
+}
+
+/// A collection could not inspect a value because the host currently borrows it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GcError {
+    BorrowConflict,
+}
+
+impl fmt::Display for GcError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BorrowConflict => {
+                formatter.write_str("garbage collection deferred while a runtime value is borrowed")
+            }
+        }
+    }
+}
+
+impl Error for GcError {}
+
+impl From<BorrowError> for GcError {
+    fn from(_: BorrowError) -> Self {
+        Self::BorrowConflict
+    }
+}
+
+impl From<BorrowMutError> for GcError {
+    fn from(_: BorrowMutError) -> Self {
+        Self::BorrowConflict
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -135,20 +166,20 @@ impl StrongNode {
         &self,
         incoming: &mut HashMap<NodeKey, usize>,
         counted_cells: &mut HashSet<usize>,
-    ) {
+    ) -> Result<(), GcError> {
         match self {
             Self::Array(value) => {
-                for child in value.borrow().iter() {
+                for child in value.try_borrow()?.iter() {
                     count_value_handle(child, incoming);
                 }
             }
             Self::Tuple(value) => {
-                for child in value.values.borrow().iter() {
+                for child in value.values.try_borrow()?.iter() {
                     count_value_handle(child, incoming);
                 }
             }
             Self::Map(value) => {
-                let value = value.borrow();
+                let value = value.try_borrow()?;
                 for child in value.entries.values() {
                     count_value_handle(child, incoming);
                 }
@@ -157,70 +188,89 @@ impl StrongNode {
                 }
             }
             Self::Set(value) => {
-                for (_, child) in &value.borrow().order {
+                for (_, child) in &value.try_borrow()?.order {
                     count_value_handle(child, incoming);
                 }
             }
             Self::Iterator(value) => {
-                for child in &value.borrow().values {
+                for child in &value.try_borrow()?.values {
                     count_value_handle(child, incoming);
                 }
             }
             Self::Closure(value) => {
-                for (_, cell) in value.captures.borrow().iter() {
-                    count_binding_cell(cell, incoming, counted_cells);
+                for (_, cell) in value.captures.try_borrow()?.iter() {
+                    count_binding_cell(cell, incoming, counted_cells)?;
                 }
             }
             Self::Object(value) => {
-                for child in value.borrow().fields.values() {
+                for child in value.try_borrow()?.fields.values() {
                     count_value_handle(child, incoming);
                 }
             }
         }
+        Ok(())
     }
 
-    fn trace_children(&self, marked: &mut HashSet<NodeKey>, seen_cells: &mut HashSet<usize>) {
+    fn trace_children(
+        &self,
+        marked: &mut HashSet<NodeKey>,
+        seen_cells: &mut HashSet<usize>,
+    ) -> Result<(), GcError> {
         match self {
             Self::Array(value) => {
-                for child in value.borrow().iter() {
-                    trace_value(child, marked, seen_cells);
+                for child in value.try_borrow()?.iter() {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
             Self::Tuple(value) => {
-                for child in value.values.borrow().iter() {
-                    trace_value(child, marked, seen_cells);
+                for child in value.values.try_borrow()?.iter() {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
             Self::Map(value) => {
-                let value = value.borrow();
+                let value = value.try_borrow()?;
                 for child in value.entries.values() {
-                    trace_value(child, marked, seen_cells);
+                    trace_value(child, marked, seen_cells)?;
                 }
                 for (_, child) in &value.order {
-                    trace_value(child, marked, seen_cells);
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
             Self::Set(value) => {
-                for (_, child) in &value.borrow().order {
-                    trace_value(child, marked, seen_cells);
+                for (_, child) in &value.try_borrow()?.order {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
             Self::Iterator(value) => {
-                for child in &value.borrow().values {
-                    trace_value(child, marked, seen_cells);
+                for child in &value.try_borrow()?.values {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
             Self::Closure(value) => {
-                for (_, cell) in value.captures.borrow().iter() {
-                    trace_binding_cell(cell, marked, seen_cells);
+                for (_, cell) in value.captures.try_borrow()?.iter() {
+                    trace_binding_cell(cell, marked, seen_cells)?;
                 }
             }
             Self::Object(value) => {
-                for child in value.borrow().fields.values() {
-                    trace_value(child, marked, seen_cells);
+                for child in value.try_borrow()?.fields.values() {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    fn can_clear_edges(&self) -> Result<(), GcError> {
+        match self {
+            Self::Array(value) => drop(value.try_borrow_mut()?),
+            Self::Tuple(value) => drop(value.values.try_borrow_mut()?),
+            Self::Map(value) => drop(value.try_borrow_mut()?),
+            Self::Set(value) => drop(value.try_borrow_mut()?),
+            Self::Iterator(value) => drop(value.try_borrow_mut()?),
+            Self::Closure(value) => drop(value.captures.try_borrow_mut()?),
+            Self::Object(value) => drop(value.try_borrow_mut()?),
+        }
+        Ok(())
     }
 
     fn clear_edges(&self) {
@@ -331,7 +381,7 @@ impl GcHeap {
         stack: &[Value],
         scopes: &[HashMap<BigInt, BindingCell>],
         capture_vectors: &[Vec<(BigInt, BindingCell)>],
-    ) -> GcStats {
+    ) -> Result<GcStats, GcError> {
         let live_nodes = self
             .nodes
             .iter()
@@ -344,42 +394,47 @@ impl GcHeap {
         let mut counted_cells = HashSet::new();
         for scope in scopes {
             for cell in scope.values() {
-                count_binding_cell(cell, &mut incoming, &mut counted_cells);
+                count_binding_cell(cell, &mut incoming, &mut counted_cells)?;
             }
         }
         for capture_vector in capture_vectors {
             for (_, cell) in capture_vector {
-                count_binding_cell(cell, &mut incoming, &mut counted_cells);
+                count_binding_cell(cell, &mut incoming, &mut counted_cells)?;
             }
         }
         for node in &live_nodes {
-            node.count_children(&mut incoming, &mut counted_cells);
+            node.count_children(&mut incoming, &mut counted_cells)?;
         }
 
         let mut marked = HashSet::new();
         let mut seen_cells = HashSet::new();
         for value in stack {
-            trace_value(value, &mut marked, &mut seen_cells);
+            trace_value(value, &mut marked, &mut seen_cells)?;
         }
         for scope in scopes {
             for cell in scope.values() {
-                trace_binding_cell(cell, &mut marked, &mut seen_cells);
+                trace_binding_cell(cell, &mut marked, &mut seen_cells)?;
             }
         }
         for capture_vector in capture_vectors {
             for (_, cell) in capture_vector {
-                trace_binding_cell(cell, &mut marked, &mut seen_cells);
+                trace_binding_cell(cell, &mut marked, &mut seen_cells)?;
             }
         }
         for node in &live_nodes {
             // `live_nodes` contributes one temporary strong handle per node.
             let internal = incoming.get(&node.key()).copied().unwrap_or_default();
             if node.strong_count() > internal.saturating_add(1) {
-                trace_node(node, &mut marked, &mut seen_cells);
+                trace_node(node, &mut marked, &mut seen_cells)?;
             }
         }
 
         let objects_before = live_nodes.len();
+        for node in &live_nodes {
+            if !marked.contains(&node.key()) {
+                node.can_clear_edges()?;
+            }
+        }
         let mut reclaimed_objects = 0;
         for node in &live_nodes {
             if !marked.contains(&node.key()) {
@@ -396,14 +451,14 @@ impl GcHeap {
             .saturating_mul(2)
             .max(DEFAULT_THRESHOLD);
 
-        GcStats {
+        Ok(GcStats {
             objects_before,
             live_objects: objects_before.saturating_sub(reclaimed_objects),
             reclaimed_objects,
             collections: self.collections,
             total_allocations: self.total_allocations,
             next_threshold: self.threshold,
-        }
+        })
     }
 }
 
@@ -448,23 +503,29 @@ fn count_binding_cell(
     cell: &BindingCell,
     incoming: &mut HashMap<NodeKey, usize>,
     counted_cells: &mut HashSet<usize>,
-) {
+) -> Result<(), GcError> {
     if counted_cells.insert(Rc::as_ptr(cell) as usize) {
-        count_value_handle(&cell.borrow().value, incoming);
+        count_value_handle(&cell.try_borrow()?.value, incoming);
     }
+    Ok(())
 }
 
 fn trace_binding_cell(
     cell: &BindingCell,
     marked: &mut HashSet<NodeKey>,
     seen_cells: &mut HashSet<usize>,
-) {
+) -> Result<(), GcError> {
     if seen_cells.insert(Rc::as_ptr(cell) as usize) {
-        trace_value(&cell.borrow().value, marked, seen_cells);
+        trace_value(&cell.try_borrow()?.value, marked, seen_cells)?;
     }
+    Ok(())
 }
 
-fn trace_value(value: &Value, marked: &mut HashSet<NodeKey>, seen_cells: &mut HashSet<usize>) {
+fn trace_value(
+    value: &Value,
+    marked: &mut HashSet<NodeKey>,
+    seen_cells: &mut HashSet<usize>,
+) -> Result<(), GcError> {
     match value {
         Value::Array(node) => {
             let key = NodeKey {
@@ -472,8 +533,8 @@ fn trace_value(value: &Value, marked: &mut HashSet<NodeKey>, seen_cells: &mut Ha
                 pointer: Rc::as_ptr(node) as usize,
             };
             if marked.insert(key) {
-                for child in node.borrow().iter() {
-                    trace_value(child, marked, seen_cells);
+                for child in node.try_borrow()?.iter() {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
         }
@@ -483,8 +544,8 @@ fn trace_value(value: &Value, marked: &mut HashSet<NodeKey>, seen_cells: &mut Ha
                 pointer: Rc::as_ptr(node) as usize,
             };
             if marked.insert(key) {
-                for child in node.values.borrow().iter() {
-                    trace_value(child, marked, seen_cells);
+                for child in node.values.try_borrow()?.iter() {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
         }
@@ -494,12 +555,12 @@ fn trace_value(value: &Value, marked: &mut HashSet<NodeKey>, seen_cells: &mut Ha
                 pointer: Rc::as_ptr(node) as usize,
             };
             if marked.insert(key) {
-                let node = node.borrow();
+                let node = node.try_borrow()?;
                 for child in node.entries.values() {
-                    trace_value(child, marked, seen_cells);
+                    trace_value(child, marked, seen_cells)?;
                 }
                 for (_, child) in &node.order {
-                    trace_value(child, marked, seen_cells);
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
         }
@@ -509,8 +570,8 @@ fn trace_value(value: &Value, marked: &mut HashSet<NodeKey>, seen_cells: &mut Ha
                 pointer: Rc::as_ptr(node) as usize,
             };
             if marked.insert(key) {
-                for (_, child) in &node.borrow().order {
-                    trace_value(child, marked, seen_cells);
+                for (_, child) in &node.try_borrow()?.order {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
         }
@@ -520,8 +581,8 @@ fn trace_value(value: &Value, marked: &mut HashSet<NodeKey>, seen_cells: &mut Ha
                 pointer: Rc::as_ptr(node) as usize,
             };
             if marked.insert(key) {
-                for child in &node.borrow().values {
-                    trace_value(child, marked, seen_cells);
+                for child in &node.try_borrow()?.values {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
         }
@@ -531,8 +592,8 @@ fn trace_value(value: &Value, marked: &mut HashSet<NodeKey>, seen_cells: &mut Ha
                 pointer: Rc::as_ptr(node) as usize,
             };
             if marked.insert(key) {
-                for (_, cell) in node.captures.borrow().iter() {
-                    trace_binding_cell(cell, marked, seen_cells);
+                for (_, cell) in node.captures.try_borrow()?.iter() {
+                    trace_binding_cell(cell, marked, seen_cells)?;
                 }
             }
         }
@@ -542,17 +603,23 @@ fn trace_value(value: &Value, marked: &mut HashSet<NodeKey>, seen_cells: &mut Ha
                 pointer: Rc::as_ptr(node) as usize,
             };
             if marked.insert(key) {
-                for child in node.borrow().fields.values() {
-                    trace_value(child, marked, seen_cells);
+                for child in node.try_borrow()?.fields.values() {
+                    trace_value(child, marked, seen_cells)?;
                 }
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
-fn trace_node(node: &StrongNode, marked: &mut HashSet<NodeKey>, seen_cells: &mut HashSet<usize>) {
+fn trace_node(
+    node: &StrongNode,
+    marked: &mut HashSet<NodeKey>,
+    seen_cells: &mut HashSet<usize>,
+) -> Result<(), GcError> {
     if marked.insert(node.key()) {
-        node.trace_children(marked, seen_cells);
+        node.trace_children(marked, seen_cells)?;
     }
+    Ok(())
 }
