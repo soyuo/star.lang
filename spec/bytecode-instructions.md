@@ -20,9 +20,9 @@ This document defines the bytecode instruction subset emitted by `star-compiler`
 | `0xE8` | `TRAP` | none |
 | `0xFF` | `HALT` | none |
 
-`PUSH_CONST` pushes the value at its constant-pool index. `INTRINSIC` dispatches the IR operation identified below and consumes no encoded operands; it uses the source operation stack contract in `spec/instruction-semantics.md`. `JUMP` unwinds exactly the listed lexical scopes before transferring. `BRANCH_IF_FALSE` pops one condition and selects the false or true target. `FOR_INIT` and `FOR_NEXT` implement the hidden iterator state described in `spec/ir.md`. `RETURN_TOP` returns from the current function. `HALT` ends the module initializer. `TRAP` marks an unreachable block and must fail execution if reached.
+`PUSH_CONST` pushes the value at its constant-pool index. `INTRINSIC` dispatches the IR operation identified below and consumes no encoded operands; it uses the source operation stack contract in `spec/instruction-semantics.md`. `JUMP` unwinds exactly the listed lexical scopes before transferring. `BRANCH_IF_FALSE` pops one condition and selects the false or true target. `FOR_INIT` and `FOR_NEXT` implement the hidden iterator state described in `spec/ir.md`. `RETURN_TOP` returns from the current function with the top operand when present, or `Null` when its operand stack is empty. `HALT` ends the module initializer. `TRAP` marks an unreachable block and must fail execution if reached.
 
-Every operand width is fixed, so instruction sizes do not depend on branch distance. Function-relative targets and function-local loop-state indexes are `u32`; the compiler rejects values that do not fit. All target offsets identify the first byte of an instruction in the same function. The verifier in a later roadmap item validates target boundaries, opcode operands, stack effects, and resource limits.
+Every operand width is fixed, so instruction sizes do not depend on branch distance. Function-relative targets and function-local loop-state indexes are `u32`; the compiler rejects values that do not fit. All target offsets identify the first byte of an instruction in the same function. The bytecode verifier validates target boundaries, opcode operands, stack effects, and resource limits before execution.
 
 ## Stable intrinsic IDs
 

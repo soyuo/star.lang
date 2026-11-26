@@ -1747,9 +1747,9 @@ fn apply_intrinsic(
 ) -> Result<(), VerificationError> {
     use IrOp::*;
     match operation {
-        Add | Sub | Mul | Div | Mod | Eq | Gt | Lt | And | Or | Xor | BitAnd | BitOr | BitXor
-        | Shl | Shr | TypeCheck | IntToBytes | GetItem | Contains | Slice | Concat | FieldGet
-        | ObjectIs | Implement | ModuleGet | ChannelSend => {
+        Add | Sub | Mul | Div | Mod | Pow | Eq | Gt | Lt | And | Or | Xor | BitAnd | BitOr
+        | BitXor | Shl | Shr | TypeCheck | IntToBytes | GetItem | Contains | Slice | Concat
+        | FieldGet | ObjectIs | Implement | ModuleGet | ChannelSend => {
             let outputs = if matches!(operation, Implement) { 0 } else { 1 };
             let inputs = if matches!(operation, Slice) { 3 } else { 2 };
             fixed_effect(state, inputs, outputs, offset)?;
@@ -1815,12 +1815,6 @@ fn apply_intrinsic(
         Remove => fixed_effect(state, 2, 1, offset)?,
         NativeSymbol => fixed_effect(state, 3, 1, offset)?,
         NativeCallback => fixed_effect(state, 2, 1, offset)?,
-        _ => {
-            return Err(failure(
-                Some(offset),
-                "intrinsic has no verifier stack contract",
-            ))
-        }
     }
     Ok(())
 }
@@ -1992,7 +1986,9 @@ fn verify_function_flow(
                             "RETURN_TOP exits with pending closure captures",
                         ));
                     }
-                    state.pop_many(1, absolute_offset)?;
+                    if !state.stack.is_empty() {
+                        state.pop_many(1, absolute_offset)?;
+                    }
                     terminal = true;
                 }
                 InstructionKind::Trap => terminal = true,
