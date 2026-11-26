@@ -1,0 +1,118 @@
+# Star Grammar
+
+Status: draft
+
+This document defines token syntax and the nested block structure of Star source programs. `spec/source-format.md` defines UTF-8 validation and character handling. `spec/opcodes.toml` is the authority for which instruction opcodes are assigned.
+
+## Lexical conventions
+
+The lexer validates and normalizes the source before applying this grammar:
+
+- In normal mode, ASCII space, horizontal tab, CR, and LF are discarded, including inside data literals.
+- In strict mode, those formatting characters are rejected; only `*`, `'`, and `"` are accepted.
+- No comment syntax or other source characters are defined.
+- Diagnostics retain positions in the original source bytes as specified by `spec/source-format.md`.
+
+The grammar is applied to the resulting stream of `*`, `'`, and `"`. EBNF uses `|` for alternatives, `{ ... }` for zero or more repetitions, and `[ ... ]` for an optional sequence.
+
+## Token grammar
+
+```ebnf
+program                  = { statement } ;
+
+statement                = ordinary_instruction
+                         | data_literal
+                         | structured_block ;
+
+ordinary_instruction     = basic_instruction
+                         | ordinary_extended_instruction ;
+
+basic_instruction       = asterisk, { asterisk }, apostrophe ;
+
+extended_instruction    = apostrophe,
+                           bit, bit, bit, bit,
+                           bit, bit, bit, bit,
+                           double_quote ;
+
+ordinary_extended_instruction = extended_instruction ;
+
+data_literal             = double_quote, bit, { bit }, double_quote ;
+
+bit                      = asterisk | apostrophe ;
+
+asterisk                 = "*" ;
+apostrophe               = "'" ;
+double_quote             = '"' ;
+```
+
+`basic_instruction` is valid only when it contains 1 through 12 asterisks before the apostrophe, matching the basic instructions in `spec/opcodes.toml`. An extended instruction contains exactly eight payload bits, most-significant bit first; apostrophe represents 0 and asterisk represents 1. A data literal has a non-empty bit payload with the same bit mapping. There are no escape sequences.
+
+An `ordinary_extended_instruction` is an `extended_instruction` whose decoded opcode is assigned in `spec/opcodes.toml` and is not one of the structural opcodes below. The grammar intentionally does not copy the full opcode catalog. An unassigned or reserved opcode is not a valid instruction and must be rejected during compilation.
+
+## Structural opcode aliases
+
+The names in the grammar below are aliases for extended instructions with these source opcode values. The eight-bit payload is the value from `spec/opcodes.toml`; it is not a bytecode opcode.
+
+| Grammar terminal | Source opcode | Meaning |
+|---|---:|---|
+| `IF` | `0x30` | Begin conditional |
+| `ELSE` | `0x31` | Separate conditional branches |
+| `END` | `0x32` | Close an `IF`, `LOOP`, `FOR`, or function block |
+| `LOOP` | `0x33` | Begin loop |
+| `WHILE` | `0x34` | Separate loop condition from loop body |
+| `FOR` | `0x37` | Begin iterator loop |
+| `FUNC` | `0x40` | Begin function definition |
+| `SCOPE_BEGIN` | `0x55` | Begin lexical scope |
+| `SCOPE_END` | `0x56` | Close lexical scope |
+| `ASYNC_FUNC` | `0xA0` | Begin asynchronous function definition |
+
+These aliases are structural terminals and are excluded from `ordinary_extended_instruction`. Other assigned instructions, including `BREAK`, `CONTINUE`, and `RETURN`, remain ordinary instructions in this grammar.
+
+## Nested block grammar
+
+```ebnf
+structured_block         = conditional_block
+                         | loop_block
+                         | for_block
+                         | function_block
+                         | async_function_block
+                         | scope_block ;
+
+conditional_block        = IF, { statement }, [ ELSE, { statement } ], END ;
+
+loop_block               = LOOP, { statement }, [ WHILE, { statement } ], END ;
+
+for_block                = FOR, { statement }, END ;
+
+function_block           = FUNC, { statement }, END ;
+
+async_function_block     = ASYNC_FUNC, { statement }, END ;
+
+scope_block              = SCOPE_BEGIN, { statement }, SCOPE_END ;
+```
+
+The loop sequence before `WHILE` is its condition-producing sequence; the optional sequence after `WHILE` is its body. Omitting `WHILE` denotes the condition-free loop described in the control-flow specification. `FOR` iterator and variable inputs, and function identifiers and parameter metadata, are established by preceding instructions as described in their respective specifications; they are not grammar-level operands.
+
+## Well-formedness rules
+
+- A program may be empty. A data literal may not have an empty payload.
+- Every structural block must use its matching closer. `END` cannot close a lexical scope, and `SCOPE_END` cannot close another block.
+- An `IF` may contain at most one `ELSE`; `ELSE` is valid only directly inside its matching `IF`.
+- `WHILE` is optional and may occur at most once at the direct level of a `LOOP`; it separates the loop condition from the body. It is not a standalone statement.
+- `END` and `SCOPE_END` are closers, not standalone statements. A block opener without its matching closer is invalid.
+- `BREAK` and `CONTINUE` are syntactically ordinary instructions; they are valid only within a loop. Their placement is checked during semantic validation.
+- Each `ordinary_extended_instruction` must resolve to an assigned source opcode. Syntax alone does not make reserved or pending opcodes valid.
+- The object specification assigns struct, method, and interface opcodes but defines no block delimiters for them. They remain ordinary instruction tokens until their source syntax is specified.
+- The exception document currently describes `0x80–0x86` as VM instructions, and `spec/opcodes.toml` leaves that family pending source-level assignment. Exception markers therefore are not source structural terminals in this grammar.
+
+## References
+
+- QLM `star-lang/language/syntax/grammar.md`
+- QLM `star-lang/language/syntax/instructions.md`
+- QLM `star-lang/language/source-format/characters.md`
+- QLM `star-lang/programming/control-flow.md`
+- QLM `star-lang/programming/functions.md`
+- QLM `star-lang/programming/objects.md`
+- QLM `star-lang/platform/concurrency.md`
+- QLM `star-lang/language/semantics/variables.md`
+- QLM `star-lang/programming/exceptions.md`
