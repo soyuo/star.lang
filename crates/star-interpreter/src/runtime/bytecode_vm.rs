@@ -242,7 +242,10 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
 
     fn check_capability(&self, operation: IrOp, span: Span) -> Result<(), RuntimeError> {
         let required: &[Capability] = match operation {
-            IrOp::Import | IrOp::ImportDynamic => &[Capability::FsRead, Capability::EnvRead],
+            // Import permissions depend on the resolution path: check fs.read
+            // on an actual file read and env.read only when STAR_PATH is used.
+            // This runtime slice has no module resolver and rejects imports.
+            IrOp::Import | IrOp::ImportDynamic => &[],
             IrOp::Sleep => &[Capability::Clock],
             IrOp::NativeLoad
             | IrOp::NativeSymbol
@@ -695,6 +698,9 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     function_id,
                     arguments,
                 }));
+            }
+            Import | ImportDynamic => {
+                return Err(self.unsupported(span, "module import resolution"))
             }
             TailCall => return Err(self.unsupported(span, "TAIL_CALL")),
             _ => return Err(self.unsupported(span, "intrinsic runtime feature")),
