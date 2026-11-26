@@ -319,13 +319,14 @@ impl AbstractStack {
 struct Binding {
     mutable: bool,
     value_type: ValueType,
+    declaration_span: Option<Span>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FlowState {
     stack: AbstractStack,
     scopes: Vec<HashMap<Identifier, Binding>>,
-    captures: Vec<Identifier>,
+    captures: Vec<Option<Identifier>>,
     reachable: bool,
 }
 
@@ -340,10 +341,11 @@ impl FlowState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct FunctionSignature {
     parameter_count: usize,
     variadic: bool,
+    kind: FunctionKind,
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +374,11 @@ struct Context {
 struct Analyzer {
     functions: HashMap<Identifier, FunctionSignature>,
     call_sites: Vec<CallSite>,
+    global_load_sites: Vec<(Identifier, Span)>,
+    global_store_ids: HashSet<Identifier>,
+    completed_globals: Option<HashMap<Identifier, Binding>>,
+    reanalysis: bool,
+    loop_reanalysis: bool,
     structs: HashMap<Identifier, HashSet<Identifier>>,
     struct_methods: HashMap<Identifier, HashSet<Identifier>>,
     interfaces: HashMap<Identifier, HashSet<Identifier>>,
@@ -385,6 +392,11 @@ impl Analyzer {
         Self {
             functions: HashMap::new(),
             call_sites: Vec::new(),
+            global_load_sites: Vec::new(),
+            global_store_ids: HashSet::new(),
+            completed_globals: None,
+            reanalysis: false,
+            loop_reanalysis: false,
             structs: HashMap::new(),
             struct_methods: HashMap::new(),
             interfaces: HashMap::new(),
@@ -398,6 +410,17 @@ impl Analyzer {
         let mut state = FlowState::root();
         let mut context = Context::default();
         self.analyze_sequence(&program.statements, &mut state, &mut context)?;
+        self.completed_globals = Some(state.scopes.first().cloned().unwrap_or_default());
+
+        self.reanalysis = true;
+        let mut final_state = FlowState::root();
+        let mut final_context = Context::default();
+        let final_analysis =
+            self.analyze_sequence(&program.statements, &mut final_state, &mut final_context);
+        self.reanalysis = false;
+        final_analysis?;
+        state = final_state;
+
         if !state.captures.is_empty() {
             return Err(SemanticError {
                 kind: SemanticErrorKind::InvalidCaptureState,
@@ -407,6 +430,15 @@ impl Analyzer {
                     .map(statement_span)
                     .unwrap_or_else(empty_span),
             });
+        }
+        let root_scope = state.scopes.first().cloned().unwrap_or_default();
+        for (id, span) in &self.global_load_sites {
+            if !root_scope.contains_key(id) && !self.global_store_ids.contains(id) {
+                return Err(SemanticError {
+                    kind: SemanticErrorKind::UnknownBinding,
+                    span: *span,
+                });
+            }
         }
         for call in self.call_sites {
             let Some(signature) = self.functions.get(&call.function_id) else {
@@ -452,7 +484,6 @@ impl Analyzer {
                 }
             }
         }
-        let root_scope = state.scopes.first().cloned().unwrap_or_default();
         let mut exported = HashSet::new();
         for (id, span) in self.export_sites {
             let symbol_count = usize::from(root_scope.contains_key(&id))
@@ -488,12 +519,18 @@ impl Analyzer {
                         )))
                 }
                 Statement::Instruction(instruction) => {
+                    if self.loop_reanalysis && is_compile_time_opcode(instruction.opcode) {
+                        continue;
+                    }
                     self.analyze_instruction(*instruction, state, context)?;
                 }
                 Statement::If(block) => self.analyze_if(block, state, context)?,
                 Statement::Loop(block) => self.analyze_loop(block, state, context)?,
                 Statement::For(block) => self.analyze_for(block, state, context)?,
-                Statement::Function(block) => self.analyze_function(block, state)?,
+                Statement::Function(block) if !self.loop_reanalysis => {
+                    self.analyze_function(block, state)?;
+                }
+                Statement::Function(_) => {}
                 Statement::Scope(block) => self.analyze_scope(block, state, context)?,
             }
         }
@@ -547,77 +584,108 @@ impl Analyzer {
             breaks: Vec::new(),
             continues: Vec::new(),
         });
-
-        let condition_exit = if let Some(condition) = &block.condition {
-            let mut condition_state = entry.clone();
-            self.analyze_sequence(condition, &mut condition_state, context)?;
-            if condition_state.reachable {
-                let condition_value = condition_state.stack.pop(block.span)?;
-                expect_type(&condition_value, &[ValueType::Bool], block.span)?;
-                if condition_state.captures != entry.captures {
-                    return Err(SemanticError {
-                        kind: SemanticErrorKind::InvalidCaptureState,
-                        span: block.span,
-                    });
-                }
-                if !same_stack(&condition_state.stack, &entry.stack) {
-                    return Err(SemanticError {
-                        kind: SemanticErrorKind::IncompatibleLoopStack,
-                        span: block.span,
-                    });
-                }
-                Some(condition_state)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let mut body_state = entry.clone();
-        if condition_exit.is_none() && block.condition.is_some() {
-            body_state.reachable = false;
-        } else {
-            self.analyze_sequence(&block.body, &mut body_state, context)?;
-        }
-        if body_state.reachable && !same_stack(&body_state.stack, &entry.stack) {
-            return Err(SemanticError {
-                kind: SemanticErrorKind::IncompatibleLoopStack,
-                span: block.span,
-            });
-        }
-        if body_state.reachable && body_state.captures != entry.captures {
-            return Err(SemanticError {
-                kind: SemanticErrorKind::InvalidCaptureState,
-                span: block.span,
-            });
-        }
-
-        let loop_frame = context.loops.pop().expect("loop context was pushed");
-        for break_state in &loop_frame.breaks {
-            if !same_stack(&break_state.stack, &entry.stack) {
-                return Err(SemanticError {
-                    kind: SemanticErrorKind::IncompatibleLoopStack,
-                    span: block.span,
-                });
-            }
-        }
-
+        let mut pending = vec![entry.clone()];
+        let mut seen = vec![entry.clone()];
         let mut exits = Vec::new();
-        if let Some(mut exit) = condition_exit {
-            exit.stack = entry.stack.clone();
-            exits.push(exit);
-            if body_state.reachable {
-                exits.push(body_state);
+        let mut break_states = Vec::new();
+        let mut pass = 0;
+
+        while let Some(header_state) = pending.pop() {
+            let previous_reanalysis = self.reanalysis;
+            let previous_loop_reanalysis = self.loop_reanalysis;
+            if pass > 0 {
+                self.reanalysis = true;
+                self.loop_reanalysis = true;
             }
-            exits.extend(loop_frame.continues.iter().cloned());
-            exits.extend(loop_frame.breaks.iter().cloned());
-        } else if block.condition.is_none() {
-            exits.extend(loop_frame.breaks);
-        } else {
-            exits.extend(loop_frame.breaks);
+            let result = (|| {
+                let body_entry = if let Some(condition) = &block.condition {
+                    let mut condition_state = header_state.clone();
+                    self.analyze_sequence(condition, &mut condition_state, context)?;
+                    if condition_state.reachable {
+                        let condition_value = condition_state.stack.pop(block.span)?;
+                        expect_type(&condition_value, &[ValueType::Bool], block.span)?;
+                        if condition_state.captures != header_state.captures {
+                            return Err(SemanticError {
+                                kind: SemanticErrorKind::InvalidCaptureState,
+                                span: block.span,
+                            });
+                        }
+                        if !same_stack(&condition_state.stack, &header_state.stack) {
+                            return Err(SemanticError {
+                                kind: SemanticErrorKind::IncompatibleLoopStack,
+                                span: block.span,
+                            });
+                        }
+                        exits.push(condition_state.clone());
+                        Some(condition_state)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(header_state.clone())
+                };
+
+                if let Some(mut body_state) = body_entry {
+                    self.analyze_sequence(&block.body, &mut body_state, context)?;
+                    if body_state.reachable {
+                        if !same_stack(&body_state.stack, &header_state.stack) {
+                            return Err(SemanticError {
+                                kind: SemanticErrorKind::IncompatibleLoopStack,
+                                span: block.span,
+                            });
+                        }
+                        if body_state.captures != header_state.captures {
+                            return Err(SemanticError {
+                                kind: SemanticErrorKind::InvalidCaptureState,
+                                span: block.span,
+                            });
+                        }
+                        enqueue_flow(body_state, &mut seen, &mut pending);
+                    }
+                }
+
+                let loop_frame = context.loops.last_mut().expect("loop context exists");
+                let continues = std::mem::take(&mut loop_frame.continues);
+                for continue_state in continues {
+                    if !same_stack(&continue_state.stack, &header_state.stack) {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::IncompatibleLoopStack,
+                            span: block.span,
+                        });
+                    }
+                    if continue_state.captures != header_state.captures {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::InvalidCaptureState,
+                            span: block.span,
+                        });
+                    }
+                    enqueue_flow(continue_state, &mut seen, &mut pending);
+                }
+                for break_state in std::mem::take(&mut loop_frame.breaks) {
+                    if !same_stack(&break_state.stack, &header_state.stack) {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::IncompatibleLoopStack,
+                            span: block.span,
+                        });
+                    }
+                    if break_state.captures != header_state.captures {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::InvalidCaptureState,
+                            span: block.span,
+                        });
+                    }
+                    push_unique_flow(break_state, &mut break_states);
+                }
+                Ok(())
+            })();
+            self.reanalysis = previous_reanalysis;
+            self.loop_reanalysis = previous_loop_reanalysis;
+            result?;
+            pass += 1;
         }
 
+        context.loops.pop().expect("loop context was pushed");
+        exits.extend(break_states);
         if exits.is_empty() {
             state.reachable = false;
             return Ok(());
@@ -643,16 +711,18 @@ impl Analyzer {
 
         let exit_depth = state.scopes.len();
         state.scopes.push(HashMap::new());
-        if let Some(id) = variable_id {
+        if let Some(id) = &variable_id {
             state.scopes.last_mut().expect("loop scope exists").insert(
-                id,
+                id.clone(),
                 Binding {
                     mutable: true,
                     value_type: ValueType::Any,
+                    declaration_span: None,
                 },
             );
         }
         let entry = state.clone();
+        let loop_variable_id = variable_id;
         context.loops.push(LoopFrame {
             header: entry.stack.clone(),
             continue_scope_depth: entry.scopes.len(),
@@ -660,43 +730,100 @@ impl Analyzer {
             breaks: Vec::new(),
             continues: Vec::new(),
         });
-        let mut body_state = entry.clone();
-        self.analyze_sequence(&block.body, &mut body_state, context)?;
-        if body_state.reachable && !same_stack(&body_state.stack, &entry.stack) {
-            return Err(SemanticError {
-                kind: SemanticErrorKind::IncompatibleLoopStack,
-                span,
-            });
-        }
-        if body_state.reachable && body_state.captures != entry.captures {
-            return Err(SemanticError {
-                kind: SemanticErrorKind::InvalidCaptureState,
-                span,
-            });
-        }
-        let loop_frame = context.loops.pop().expect("loop context was pushed");
-        for break_state in &loop_frame.breaks {
-            if !same_stack(&break_state.stack, &entry.stack) {
-                return Err(SemanticError {
-                    kind: SemanticErrorKind::IncompatibleLoopStack,
-                    span,
-                });
+        let mut pending = vec![entry.clone()];
+        let mut seen = vec![entry.clone()];
+        let mut exits = Vec::new();
+        let mut break_states = Vec::new();
+        let mut pass = 0;
+
+        while let Some(header_state) = pending.pop() {
+            let mut exhaustion = header_state.clone();
+            exhaustion.scopes.truncate(exit_depth);
+            push_unique_flow(exhaustion, &mut exits);
+
+            let previous_reanalysis = self.reanalysis;
+            let previous_loop_reanalysis = self.loop_reanalysis;
+            if pass > 0 {
+                self.reanalysis = true;
+                self.loop_reanalysis = true;
             }
+            let result = (|| {
+                let mut body_state = header_state.clone();
+                self.analyze_sequence(&block.body, &mut body_state, context)?;
+                if body_state.reachable {
+                    if !same_stack(&body_state.stack, &header_state.stack) {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::IncompatibleLoopStack,
+                            span,
+                        });
+                    }
+                    if body_state.captures != header_state.captures {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::InvalidCaptureState,
+                            span,
+                        });
+                    }
+                    let mut body_exit = body_state.clone();
+                    body_exit.scopes.truncate(exit_depth);
+                    push_unique_flow(body_exit, &mut exits);
+                    if let Some(id) = &loop_variable_id {
+                        reset_binding_type(&mut body_state, id);
+                    }
+                    enqueue_flow(body_state, &mut seen, &mut pending);
+                }
+
+                let loop_frame = context.loops.last_mut().expect("loop context exists");
+                let continues = std::mem::take(&mut loop_frame.continues);
+                for mut continue_state in continues {
+                    if !same_stack(&continue_state.stack, &header_state.stack) {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::IncompatibleLoopStack,
+                            span,
+                        });
+                    }
+                    if continue_state.captures != header_state.captures {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::InvalidCaptureState,
+                            span,
+                        });
+                    }
+                    let mut continue_exit = continue_state.clone();
+                    continue_exit.scopes.truncate(exit_depth);
+                    push_unique_flow(continue_exit, &mut exits);
+                    if let Some(id) = &loop_variable_id {
+                        reset_binding_type(&mut continue_state, id);
+                    }
+                    enqueue_flow(continue_state, &mut seen, &mut pending);
+                }
+                for mut break_state in std::mem::take(&mut loop_frame.breaks) {
+                    if !same_stack(&break_state.stack, &header_state.stack) {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::IncompatibleLoopStack,
+                            span,
+                        });
+                    }
+                    if break_state.captures != header_state.captures {
+                        return Err(SemanticError {
+                            kind: SemanticErrorKind::InvalidCaptureState,
+                            span,
+                        });
+                    }
+                    break_state.scopes.truncate(exit_depth);
+                    push_unique_flow(break_state, &mut break_states);
+                }
+                Ok(())
+            })();
+            self.reanalysis = previous_reanalysis;
+            self.loop_reanalysis = previous_loop_reanalysis;
+            result?;
+            pass += 1;
         }
 
-        let mut after = state.clone();
-        after.scopes.truncate(exit_depth);
-        if body_state.reachable {
-            body_state.scopes.truncate(exit_depth);
-            after = join_flows(after, body_state, span)?;
-        }
-        for mut break_state in loop_frame.breaks {
-            break_state.scopes.truncate(exit_depth);
-            after = join_flows(after, break_state, span)?;
-        }
-        for mut continue_state in loop_frame.continues {
-            continue_state.scopes.truncate(exit_depth);
-            after = join_flows(after, continue_state, span)?;
+        context.loops.pop().expect("loop context was pushed");
+        exits.extend(break_states);
+        let mut after = exits.remove(0);
+        for exit in exits {
+            after = join_flows(after, exit, span)?;
         }
         *state = after;
         Ok(())
@@ -707,20 +834,25 @@ impl Analyzer {
         block: &FunctionBlock,
         outer: &mut FlowState,
     ) -> Result<(), SemanticError> {
-        let signature = take_function_header(outer, block.span)?;
-        if self
-            .functions
-            .insert(signature.0.clone(), signature.1.clone())
-            .is_some()
-        {
-            return Err(SemanticError {
-                kind: SemanticErrorKind::DuplicateFunction,
-                span: block.span,
-            });
+        let signature = take_function_header(outer, block.span, block.kind)?;
+        if let Some(existing) = self.functions.get(&signature.0) {
+            if !self.reanalysis || existing != &signature.1 {
+                return Err(SemanticError {
+                    kind: SemanticErrorKind::DuplicateFunction,
+                    span: block.span,
+                });
+            }
+        } else {
+            self.functions
+                .insert(signature.0.clone(), signature.1.clone());
         }
 
         let mut body_state = FlowState::root();
-        body_state.scopes[0] = outer.scopes.first().cloned().unwrap_or_default();
+        body_state.scopes[0] = self
+            .completed_globals
+            .clone()
+            .or_else(|| outer.scopes.first().cloned())
+            .unwrap_or_default();
         body_state.scopes.push(HashMap::new());
         for id in signature.2 {
             if body_state
@@ -732,6 +864,7 @@ impl Analyzer {
                     Binding {
                         mutable: true,
                         value_type: ValueType::Any,
+                        declaration_span: None,
                     },
                 )
                 .is_some()
@@ -800,7 +933,7 @@ impl Analyzer {
                 state.stack.pop(span)?;
             }
             7 => state.stack.push(AbstractValue::new(ValueType::Any)),
-            8 => self.store(state, span, false)?,
+            8 => self.store(state, span, false, false)?,
             9 => self.load(state, span, false)?,
             10 => {
                 state.stack.pop(span)?;
@@ -1016,13 +1149,15 @@ impl Analyzer {
                             span,
                         });
                     }
-                    if state.captures.contains(&id) {
+                    if state.captures.contains(&Some(id.clone())) {
                         return Err(SemanticError {
                             kind: SemanticErrorKind::DuplicateCapture,
                             span,
                         });
                     }
-                    state.captures.push(id);
+                    state.captures.push(Some(id));
+                } else {
+                    state.captures.push(None);
                 }
             }
             0x46 => self.indirect_call(state, span)?,
@@ -1030,7 +1165,7 @@ impl Analyzer {
             0x51 => self.declare(state, span, false)?,
             0x52 => self.delete(state, span)?,
             0x53 => self.load(state, span, true)?,
-            0x54 => self.store(state, span, true)?,
+            0x54 => self.store(state, span, true, context.in_function)?,
             0x57 => self.annotate(state, span)?,
             0x60 | 0x62 | 0x6B => {
                 let count = pop_count(state, span)?;
@@ -1377,7 +1512,10 @@ impl Analyzer {
                 .scopes
                 .last_mut()
                 .expect("module or function scope exists");
-            if current.contains_key(&id) {
+            if current
+                .get(&id)
+                .is_some_and(|binding| !(self.reanalysis && binding.declaration_span == Some(span)))
+            {
                 return Err(SemanticError {
                     kind: SemanticErrorKind::DuplicateBinding,
                     span,
@@ -1388,13 +1526,19 @@ impl Analyzer {
                 Binding {
                     mutable,
                     value_type: value.value_type,
+                    declaration_span: Some(span),
                 },
             );
         }
         Ok(())
     }
 
-    fn load(&self, state: &mut FlowState, span: Span, global: bool) -> Result<(), SemanticError> {
+    fn load(
+        &mut self,
+        state: &mut FlowState,
+        span: Span,
+        global: bool,
+    ) -> Result<(), SemanticError> {
         let id = pop_identifier(state, span)?;
         let binding = id.as_ref().and_then(|id| {
             if global {
@@ -1403,11 +1547,16 @@ impl Analyzer {
                 lookup_binding(&state.scopes, id)
             }
         });
-        if global && id.is_some() && binding.is_none() {
-            return Err(SemanticError {
-                kind: SemanticErrorKind::UnknownBinding,
-                span,
-            });
+        if global && binding.is_none() {
+            if let Some(id) = id {
+                if !self
+                    .global_load_sites
+                    .iter()
+                    .any(|(seen_id, seen_span)| seen_id == &id && *seen_span == span)
+                {
+                    self.global_load_sites.push((id, span));
+                }
+            }
         }
         state.stack.push(AbstractValue::new(
             binding.map_or(ValueType::Any, |binding| binding.value_type),
@@ -1415,13 +1564,22 @@ impl Analyzer {
         Ok(())
     }
 
-    fn store(&self, state: &mut FlowState, span: Span, global: bool) -> Result<(), SemanticError> {
+    fn store(
+        &mut self,
+        state: &mut FlowState,
+        span: Span,
+        global: bool,
+        in_function: bool,
+    ) -> Result<(), SemanticError> {
         let id = pop_identifier(state, span)?;
         let value = state.stack.pop(span)?;
         let Some(id) = id else {
             return Ok(());
         };
         if global {
+            if in_function {
+                self.global_store_ids.insert(id.clone());
+            }
             let root = state.scopes.first_mut().expect("root scope exists");
             if let Some(binding) = root.get_mut(&id) {
                 if !binding.mutable {
@@ -1430,13 +1588,14 @@ impl Analyzer {
                         span,
                     });
                 }
-                binding.value_type = binding.value_type.join(value.value_type);
+                binding.value_type = value.value_type;
             } else {
                 root.insert(
                     id,
                     Binding {
                         mutable: true,
                         value_type: value.value_type,
+                        declaration_span: None,
                     },
                 );
             }
@@ -1452,7 +1611,7 @@ impl Analyzer {
                     span,
                 });
             }
-            binding.value_type = binding.value_type.join(value.value_type);
+            binding.value_type = value.value_type;
         } else {
             state
                 .scopes
@@ -1463,6 +1622,7 @@ impl Analyzer {
                     Binding {
                         mutable: true,
                         value_type: value.value_type,
+                        declaration_span: None,
                     },
                 );
         }
@@ -1521,23 +1681,39 @@ impl Analyzer {
         let argument_count = pop_count(state, span)?;
         let arguments = pop_many(state, argument_count, span)?;
         let dynamic_call = function_id.is_none() || argument_count.is_none() || arguments.is_none();
-        if let (Some(function_id), Some(argument_count)) = (function_id, argument_count) {
-            self.call_sites.push(CallSite {
-                function_id,
-                argument_count,
-                span,
+        let result_type = function_id
+            .as_ref()
+            .and_then(|id| self.functions.get(id))
+            .map_or(ValueType::Any, |signature| {
+                if signature.kind == FunctionKind::Asynchronous {
+                    ValueType::Task
+                } else {
+                    ValueType::Any
+                }
             });
+        if let (Some(function_id), Some(argument_count)) = (function_id, argument_count) {
+            if !self.call_sites.iter().any(|site| {
+                site.function_id == function_id
+                    && site.argument_count == argument_count
+                    && site.span == span
+            }) {
+                self.call_sites.push(CallSite {
+                    function_id,
+                    argument_count,
+                    span,
+                });
+            }
         }
         if tail {
             state.reachable = false;
-        } else {
-            state.stack.push(AbstractValue::new(ValueType::Any));
-        }
-        if dynamic_call {
-            state.stack.make_opaque();
-            if !tail {
-                state.stack.push(AbstractValue::new(ValueType::Any));
+            if dynamic_call {
+                state.stack.make_opaque();
             }
+        } else if dynamic_call {
+            state.stack.make_opaque();
+            state.stack.push(AbstractValue::new(result_type));
+        } else {
+            state.stack.push(AbstractValue::new(result_type));
         }
         Ok(())
     }
@@ -1695,7 +1871,16 @@ impl Analyzer {
             span,
         })?;
         let unique: HashSet<_> = field_ids.iter().cloned().collect();
-        if unique.len() != field_ids.len() || self.structs.contains_key(&struct_id) {
+        if unique.len() != field_ids.len() {
+            return Err(SemanticError {
+                kind: SemanticErrorKind::DuplicateBinding,
+                span,
+            });
+        }
+        if let Some(existing) = self.structs.get(&struct_id) {
+            if self.reanalysis && existing == &unique {
+                return Ok(());
+            }
             return Err(SemanticError {
                 kind: SemanticErrorKind::DuplicateBinding,
                 span,
@@ -1788,18 +1973,24 @@ impl Analyzer {
                 span,
             });
         }
-        let methods = self.struct_methods.entry(struct_id.clone()).or_default();
-        if !methods.insert(method_id.clone())
-            || self
-                .methods
-                .insert((struct_id, method_id), (function_id, span))
-                .is_some()
-        {
+        let key = (struct_id.clone(), method_id.clone());
+        if let Some((existing_function, _)) = self.methods.get(&key) {
+            if self.reanalysis && existing_function == &function_id {
+                return Ok(());
+            }
             return Err(SemanticError {
                 kind: SemanticErrorKind::DuplicateBinding,
                 span,
             });
         }
+        let methods = self.struct_methods.entry(struct_id.clone()).or_default();
+        if !methods.insert(method_id.clone()) {
+            return Err(SemanticError {
+                kind: SemanticErrorKind::DuplicateBinding,
+                span,
+            });
+        }
+        self.methods.insert(key, (function_id, span));
         Ok(())
     }
 
@@ -1817,12 +2008,22 @@ impl Analyzer {
             span,
         })?;
         let unique: HashSet<_> = methods.iter().cloned().collect();
-        if unique.len() != methods.len() || self.interfaces.insert(interface_id, unique).is_some() {
+        if unique.len() != methods.len() {
             return Err(SemanticError {
                 kind: SemanticErrorKind::DuplicateBinding,
                 span,
             });
         }
+        if let Some(existing) = self.interfaces.get(&interface_id) {
+            if self.reanalysis && existing == &unique {
+                return Ok(());
+            }
+            return Err(SemanticError {
+                kind: SemanticErrorKind::DuplicateBinding,
+                span,
+            });
+        }
+        self.interfaces.insert(interface_id, unique);
         Ok(())
     }
 
@@ -1842,6 +2043,9 @@ impl Analyzer {
                 existing_struct == &struct_id && existing_interface == &interface_id
             })
         {
+            if self.reanalysis {
+                return Ok(());
+            }
             return Err(SemanticError {
                 kind: SemanticErrorKind::DuplicateBinding,
                 span,
@@ -1856,7 +2060,9 @@ impl Analyzer {
             kind: SemanticErrorKind::InvalidIdentifier,
             span,
         })?;
-        self.export_sites.push((id, span));
+        if !self.reanalysis {
+            self.export_sites.push((id, span));
+        }
         Ok(())
     }
 
@@ -1877,12 +2083,22 @@ impl Analyzer {
         let method_id = pop_identifier(state, span)?;
         let receiver = state.stack.pop(span)?;
         expect_type(&receiver, &[ValueType::Struct], span)?;
+        let mut result_type = ValueType::Any;
         if let (Some(struct_id), Some(method_id)) = (&receiver.nominal_id, method_id) {
-            if !self.methods.contains_key(&(struct_id.clone(), method_id)) {
-                return Err(SemanticError {
+            let function_id = self
+                .methods
+                .get(&(struct_id.clone(), method_id))
+                .map(|(function_id, _)| function_id)
+                .ok_or(SemanticError {
                     kind: SemanticErrorKind::UnknownBinding,
                     span,
-                });
+                })?;
+            if self
+                .functions
+                .get(function_id)
+                .is_some_and(|signature| signature.kind == FunctionKind::Asynchronous)
+            {
+                result_type = ValueType::Task;
             }
         }
         let count = pop_count(state, span)?;
@@ -1890,7 +2106,7 @@ impl Analyzer {
         if args.is_none() {
             state.stack.make_opaque();
         }
-        state.stack.push(AbstractValue::new(ValueType::Any));
+        state.stack.push(AbstractValue::new(result_type));
         Ok(())
     }
 
@@ -1954,6 +2170,7 @@ fn numeric_result_type(left: ValueType, right: ValueType) -> ValueType {
 fn take_function_header(
     state: &mut FlowState,
     span: Span,
+    kind: FunctionKind,
 ) -> Result<(Identifier, FunctionSignature, Vec<Identifier>), SemanticError> {
     let rest_code = pop_count(state, span)?.ok_or_else(|| SemanticError {
         kind: SemanticErrorKind::InvalidFunctionHeader,
@@ -1990,6 +2207,7 @@ fn take_function_header(
         FunctionSignature {
             parameter_count,
             variadic: rest_code != 0,
+            kind,
         },
         parameters,
     ))
@@ -2135,6 +2353,37 @@ fn lookup_binding_mut<'a>(
     id: &Identifier,
 ) -> Option<&'a mut Binding> {
     scopes.iter_mut().rev().find_map(|scope| scope.get_mut(id))
+}
+
+fn is_compile_time_opcode(opcode: InstructionOpcode) -> bool {
+    matches!(
+        opcode,
+        InstructionOpcode::Extended(0x70 | 0x74 | 0x76 | 0x77 | 0x91)
+    )
+}
+
+fn enqueue_flow(state: FlowState, seen: &mut Vec<FlowState>, pending: &mut Vec<FlowState>) {
+    if state.reachable && !seen.contains(&state) {
+        seen.push(state.clone());
+        pending.push(state);
+    }
+}
+
+fn push_unique_flow(state: FlowState, states: &mut Vec<FlowState>) {
+    if !states.contains(&state) {
+        states.push(state);
+    }
+}
+
+fn reset_binding_type(state: &mut FlowState, id: &Identifier) {
+    if let Some(binding) = state
+        .scopes
+        .iter_mut()
+        .rev()
+        .find_map(|scope| scope.get_mut(id))
+    {
+        binding.value_type = ValueType::Any;
+    }
 }
 
 fn same_stack(left: &AbstractStack, right: &AbstractStack) -> bool {
