@@ -20,6 +20,7 @@ FunctionIR {
     rest_parameter_code: Int,
     asynchronous: Bool,
     entry: BlockId,
+    max_stack: u32,
     blocks: [BasicBlock],
 }
 
@@ -34,7 +35,7 @@ BasicBlock {
 IrInstruction { op: IrOp, immediate: Immediate?, span: Span }
 ```
 
-`BlockId` and compiler-generated loop-state IDs are function-local, nonserialized identifiers. `TypeHint` may be a known source type or `Any`; it guides verification and lowering but never removes a runtime check required for a dynamic value. Every block has exactly one terminator, and no operation follows it. The entry stack and scope depth are the states established by all incoming edges.
+`BlockId` and compiler-generated loop-state IDs are function-local, nonserialized identifiers. `TypeHint` may be a known source type or `Any`; it guides verification and lowering but never removes a runtime check required for a dynamic value. `max_stack` is the maximum operand-stack depth computed by semantic analysis and is serialized into the function record. Every block has exactly one terminator, and no operation follows it. The entry stack and scope depth are the states established by all incoming edges.
 
 The evaluation stack is not converted to SSA in this IR. A stack slot has the same position on every incoming edge; the semantic analyzer's height and type-compatibility rules apply at joins and loop back-edges. This avoids implicit value merging and leaves the later bytecode verifier an explicit stack contract. Side-effecting operations remain in source evaluation order.
 
@@ -107,4 +108,4 @@ Control-flow targets are function-local `BlockId`s, not source opcode values or 
 - Function IDs and parameter IDs remain arbitrary-precision nonnegative integers in IR metadata.
 - Reserved or pending source opcode values have no IR operation. `.starc` opcodes are assigned independently by the bytecode format.
 - Future optimization passes may add constants, simplify branches, or remove dead blocks only when they preserve output, I/O, bindings, errors and their order, function behavior, and source attribution.
-- IR is an in-memory compiler representation in this item. Versioning, serialization, constant-pool layout, bytecode instruction selection, and VM verification are specified by later roadmap items.
+- IR is an in-memory compiler representation. `.starc` serialization and the emitted bytecode instruction subset are defined by `spec/bytecode-format.md` and `spec/bytecode-instructions.md`; VM verification remains a later roadmap item.
