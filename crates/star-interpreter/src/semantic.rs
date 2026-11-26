@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::BigInt;
 use star_common::{SourcePosition, Span};
 use star_parser::{
     DataLiteral, FunctionBlock, FunctionKind, Instruction, InstructionOpcode, LoopBlock, Program,
@@ -124,11 +125,36 @@ impl fmt::Display for SemanticError {
 
 impl std::error::Error for SemanticError {}
 
+/// A statically resolved named function available to the reference runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedFunction {
+    /// The module-level function identifier.
+    pub id: BigInt,
+    /// Parameter identifiers in declaration order.
+    pub parameter_ids: Vec<BigInt>,
+    /// Whether the final parameter collects extra arguments.
+    pub variadic: bool,
+    /// Whether the function is synchronous or asynchronous.
+    pub kind: FunctionKind,
+    /// The function body statements.
+    pub body: Vec<Statement>,
+    /// Original source range of the function definition.
+    pub span: Span,
+}
+
 /// Checks statically provable name, type, stack, and control-context rules.
 ///
 /// Values that remain dynamic are left for the runtime's specified checks. This
 /// function does not execute the program or resolve external modules.
 pub fn analyze(program: &Program) -> Result<(), SemanticError> {
+    resolve_functions(program).map(|_| ())
+}
+
+/// Performs semantic analysis and returns the statically declared functions.
+///
+/// The reference interpreter uses this table to support forward and recursive
+/// direct calls without executing function bodies at definition time.
+pub fn resolve_functions(program: &Program) -> Result<Vec<ResolvedFunction>, SemanticError> {
     Analyzer::new().analyze(program)
 }
 
@@ -238,6 +264,13 @@ impl IntegerConstant {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Identifier(Vec<u8>);
+
+fn identifier_to_bigint(identifier: &Identifier) -> BigInt {
+    identifier
+        .0
+        .iter()
+        .fold(BigInt::from(0), |value, bit| value * 2 + BigInt::from(*bit))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AbstractValue {
@@ -373,6 +406,7 @@ struct Context {
 
 struct Analyzer {
     functions: HashMap<Identifier, FunctionSignature>,
+    resolved_functions: Vec<ResolvedFunction>,
     call_sites: Vec<CallSite>,
     global_load_sites: Vec<(Identifier, Span)>,
     global_store_ids: HashSet<Identifier>,
@@ -391,6 +425,7 @@ impl Analyzer {
     fn new() -> Self {
         Self {
             functions: HashMap::new(),
+            resolved_functions: Vec::new(),
             call_sites: Vec::new(),
             global_load_sites: Vec::new(),
             global_store_ids: HashSet::new(),
@@ -406,7 +441,7 @@ impl Analyzer {
         }
     }
 
-    fn analyze(mut self, program: &Program) -> Result<(), SemanticError> {
+    fn analyze(mut self, program: &Program) -> Result<Vec<ResolvedFunction>, SemanticError> {
         let mut state = FlowState::root();
         let mut context = Context::default();
         self.analyze_sequence(&program.statements, &mut state, &mut context)?;
@@ -500,7 +535,7 @@ impl Analyzer {
                 });
             }
         }
-        Ok(())
+        Ok(self.resolved_functions)
     }
 
     fn analyze_sequence(
@@ -838,6 +873,22 @@ impl Analyzer {
         outer: &mut FlowState,
     ) -> Result<(), SemanticError> {
         let signature = take_function_header(outer, block.span, block.kind)?;
+        if !self.reanalysis
+            && !self.loop_reanalysis
+            && !self
+                .resolved_functions
+                .iter()
+                .any(|function| function.span == block.span)
+        {
+            self.resolved_functions.push(ResolvedFunction {
+                id: identifier_to_bigint(&signature.0),
+                parameter_ids: signature.2.iter().rev().map(identifier_to_bigint).collect(),
+                variadic: signature.1.variadic,
+                kind: block.kind,
+                body: block.body.clone(),
+                span: block.span,
+            });
+        }
         if let Some(existing) = self.functions.get(&signature.0) {
             if !self.reanalysis || existing != &signature.1 {
                 return Err(SemanticError {
