@@ -62,22 +62,28 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     /// Verifies and executes a `.starc` program, returning the module result.
     pub fn execute(&mut self, bytes: &[u8]) -> Result<Value, RuntimeError> {
         self.reset_state();
-        let verified = verify_bytecode(bytes, &self.policy).map_err(|error| {
-            self.runtime.error(
-                RuntimeErrorKind::CompileError(error.to_string()),
-                empty_span(),
-            )
-        })?;
-        let image = Image::parse(&verified).map_err(|message| {
-            self.runtime
-                .error(RuntimeErrorKind::CompileError(message), empty_span())
-        })?;
-        let result = self.execute_image(&image)?;
-        self.runtime.output.flush().map_err(|error| {
-            self.runtime
-                .error(RuntimeErrorKind::IOError(error.to_string()), empty_span())
-        })?;
-        Ok(result)
+        let result = (|| {
+            let verified = verify_bytecode(bytes, &self.policy).map_err(|error| {
+                self.runtime.error(
+                    RuntimeErrorKind::CompileError(error.to_string()),
+                    empty_span(),
+                )
+            })?;
+            let image = Image::parse(&verified).map_err(|message| {
+                self.runtime
+                    .error(RuntimeErrorKind::CompileError(message), empty_span())
+            })?;
+            let result = self.execute_image(&image)?;
+            self.runtime.output.flush().map_err(|error| {
+                self.runtime
+                    .error(RuntimeErrorKind::IOError(error.to_string()), empty_span())
+            })?;
+            Ok(result)
+        })();
+        if result.is_err() {
+            self.cleanup_after_error();
+        }
+        result
     }
 
     /// Returns the current operand stack, from bottom to top.
@@ -109,8 +115,23 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.interfaces.clear();
         self.runtime.capture_vectors.clear();
         self.runtime.capture_vectors.push(Vec::new());
+        self.runtime.call_trace.clear();
         self.runtime.call_depth = 0;
         self.runtime.executed_steps = 0;
+    }
+
+    fn cleanup_after_error(&mut self) {
+        self.runtime.stack.clear();
+        self.runtime.scopes.truncate(1);
+        self.runtime.scope_floors.truncate(1);
+        if self.runtime.scope_floors.is_empty() {
+            self.runtime.scope_floors.push(0);
+        }
+        self.runtime.frame_stack_bases.clear();
+        self.runtime.capture_vectors.truncate(1);
+        self.runtime.capture_vectors[0].clear();
+        self.runtime.call_trace.clear();
+        self.runtime.call_depth = 0;
     }
 
     fn execute_image(&mut self, image: &Image<'_>) -> Result<Value, RuntimeError> {
@@ -241,8 +262,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         ));
                     }
                     let action = frame.return_action.clone();
+                    let initializer = frame.initializer;
                     let value = self.return_frame(unwind as usize, span, frame)?;
                     frames.pop();
+                    if !initializer {
+                        self.runtime.call_trace.pop();
+                    }
                     if frames.is_empty() {
                         return Ok(value);
                     }
@@ -537,6 +562,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.scopes.push(parameters);
         self.runtime.capture_vectors.push(Vec::new());
         self.runtime.call_depth += 1;
+        self.runtime
+            .call_trace
+            .push(crate::runtime::StackTraceFrame {
+                function_id: request.function_id.clone(),
+                call_site: span,
+            });
         frames.push(Frame::function(
             function_index,
             function,

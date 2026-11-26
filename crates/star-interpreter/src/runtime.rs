@@ -96,6 +96,17 @@ pub struct RuntimeError {
     pub kind: RuntimeErrorKind,
     /// Source range of the failing instruction or construct.
     pub span: Span,
+    /// Active function frames from outermost to innermost at the failure site.
+    pub stack_trace: Vec<StackTraceFrame>,
+}
+
+/// A function frame recorded while propagating a runtime error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackTraceFrame {
+    /// Stable function ID of the active frame.
+    pub function_id: BigInt,
+    /// Source location of the call that entered this frame.
+    pub call_site: Span,
 }
 
 impl fmt::Display for RuntimeError {
@@ -104,7 +115,18 @@ impl fmt::Display for RuntimeError {
             formatter,
             "{} at line {}, column {} (byte offset {})",
             self.kind, self.span.start.line, self.span.start.column, self.span.start.byte_offset
-        )
+        )?;
+        for frame in self.stack_trace.iter().rev() {
+            write!(
+                formatter,
+                "\n  at function {} (called at line {}, column {}, byte offset {})",
+                frame.function_id,
+                frame.call_site.start.line,
+                frame.call_site.start.column,
+                frame.call_site.start.byte_offset
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -129,6 +151,7 @@ pub struct Interpreter<R: BufRead, W: Write> {
     capture_vectors: Vec<Vec<(BigInt, BindingCell)>>,
     gc: GcHeap,
     call_depth: usize,
+    call_trace: Vec<StackTraceFrame>,
     call_depth_limit: usize,
     executed_steps: u64,
     execution_limit: u64,
@@ -158,6 +181,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             capture_vectors: vec![Vec::new()],
             gc: GcHeap::default(),
             call_depth: 0,
+            call_trace: Vec::new(),
             call_depth_limit: 512,
             executed_steps: 0,
             execution_limit: 10_000_000,
@@ -226,14 +250,37 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     /// Executes supported statements in source order.
     pub fn execute(&mut self, program: &Program) -> Result<(), RuntimeError> {
+        let stack_base = self.stack.len();
+        let scope_base = self.scopes.len();
+        let scope_floor_base = self.scope_floors.len();
+        let frame_base = self.frame_stack_bases.len();
+        let capture_base = self.capture_vectors.len();
+        let trace_base = self.call_trace.len();
+        let call_depth_base = self.call_depth;
+        let result = self.execute_program(program);
+        if result.is_err() {
+            self.stack.truncate(stack_base);
+            self.scopes.truncate(scope_base);
+            self.scope_floors.truncate(scope_floor_base);
+            self.frame_stack_bases.truncate(frame_base);
+            self.capture_vectors.truncate(capture_base);
+            self.call_trace.truncate(trace_base);
+            self.call_depth = call_depth_base;
+        }
+        result
+    }
+
+    fn execute_program(&mut self, program: &Program) -> Result<(), RuntimeError> {
         self.executed_steps = 0;
         self.structs.clear();
         self.interfaces.clear();
         self.capture_vectors = vec![Vec::new()];
         self.functions = semantic::resolve_functions(program)
-            .map_err(|error| RuntimeError {
-                kind: RuntimeErrorKind::CompileError(error.kind.to_string()),
-                span: error.span,
+            .map_err(|error| {
+                self.error(
+                    RuntimeErrorKind::CompileError(error.kind.to_string()),
+                    error.span,
+                )
             })?
             .into_iter()
             .map(|function| (function.id.clone(), function))
@@ -564,7 +611,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         self.frame_stack_bases.push(stack_base);
         self.capture_vectors.push(Vec::new());
         self.call_depth += 1;
+        self.call_trace.push(StackTraceFrame {
+            function_id: function.id.clone(),
+            call_site: span,
+        });
         let result = self.execute_statements(&function.body);
+        self.call_trace.pop();
         self.call_depth -= 1;
         self.capture_vectors.pop();
         self.frame_stack_bases.pop();
@@ -1927,10 +1979,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             let buffer = match self.input.fill_buf() {
                 Ok(buffer) => buffer,
                 Err(error) => {
-                    return Err(RuntimeError {
-                        kind: RuntimeErrorKind::IOError(error.to_string()),
-                        span,
-                    });
+                    return Err(self.error(RuntimeErrorKind::IOError(error.to_string()), span));
                 }
             };
             if buffer.is_empty() {
@@ -1947,10 +1996,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     let next_is_lf = match self.input.fill_buf() {
                         Ok(buffer) => buffer.first() == Some(&b'\n'),
                         Err(error) => {
-                            return Err(RuntimeError {
-                                kind: RuntimeErrorKind::IOError(error.to_string()),
-                                span,
-                            });
+                            return Err(
+                                self.error(RuntimeErrorKind::IOError(error.to_string()), span)
+                            );
                         }
                     };
                     if next_is_lf {
@@ -1976,7 +2024,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     fn error(&self, kind: RuntimeErrorKind, span: Span) -> RuntimeError {
-        RuntimeError { kind, span }
+        RuntimeError {
+            kind,
+            span,
+            stack_trace: self.call_trace.clone(),
+        }
     }
 }
 
