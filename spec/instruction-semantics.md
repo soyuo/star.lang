@@ -73,9 +73,9 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `control.if` | `IF` | `condition: Bool -> -` | Starts a conditional block; the compiler emits a branch and consumes the condition once. | `CompileError` for a non-Boolean condition or malformed nesting. |
+| `control.if` | `IF` | `condition: Bool -> -` | Starts a conditional block; the compiler emits a branch and consumes the condition once. | `TypeError` for a non-Boolean condition at runtime; `CompileError` for malformed nesting or a statically proven violation. |
 | `control.else` | `ELSE` | `- -> -` | Starts the alternate branch of the matching `IF`. | `CompileError` without one unmatched `IF` or when duplicated. |
-| `control.end` | `END` | `- -> -` | Closes the innermost `IF`, loop, function, or scope block. | `CompileError` when no compatible block is open. |
+| `control.end` | `END` | `- -> -` | Closes the innermost `IF`, loop, or function block. | `CompileError` when no compatible block is open. |
 | `control.loop` | `LOOP` | `- -> -` | Starts a loop; with `WHILE`, condition code runs before each iteration; without it, the loop repeats until control transfer. | `CompileError` for malformed nesting. |
 | `control.while` | `WHILE` | `condition: Bool -> -` | Ends the loop condition sequence; false exits, true enters the body. | `CompileError` outside a matching `LOOP`; `TypeError` for a non-Boolean condition. |
 | `control.break` | `BREAK` | `- -> -` | Transfers control to the end of the innermost loop. | `CompileError` outside a loop. |
@@ -145,12 +145,12 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `module.import` | `IMPORT` | `path: Bytes -> Module` | Decodes the path as UTF-8, resolves and loads the module, initializes it once, and pushes its module handle. | `TypeError` for invalid UTF-8; `ReferenceError` if unresolved; `CompileError` for a circular read before initialization. |
+| `module.import` | `IMPORT` | `path: Bytes -> Module` | Decodes the path as UTF-8, resolves and loads the module, initializes it once, and pushes its module handle. | `TypeError` for invalid UTF-8; `ReferenceError` if unresolved or for a circular read before initialization. |
 | `module.export` | `EXPORT` | `symbol_id -> -` | Exposes the current module's named binding to importers. | `ReferenceError` if the binding is absent. |
 | `module.get` | `MODULE_GET` | `module, symbol_id -> value` | Reads an exported symbol from a module handle. | `ReferenceError` if the module or exported symbol is absent. |
 | `module.call` | `MODULE_CALL` | `arg1..argN, argc, module, symbol_id -> result` | Calls an exported function and pushes its result. | `ReferenceError` for a missing module/symbol; `TypeError` for invalid arity; `StackOverflow` at the call-depth limit. |
-| `module.init` | `MODULE_INIT` | `module -> -` | Runs module initialization once per execution context; repeated calls have no effect. | `ReferenceError` for an invalid module; `CompileError` for an initialization cycle. |
-| `module.import_dynamic` | `IMPORT_DYNAMIC` | `path: String -> Module` | Resolves, loads, and initializes a module at runtime, then pushes its handle. | `ReferenceError` if unresolved; `CompileError` for a circular read before initialization. |
+| `module.init` | `MODULE_INIT` | `module -> -` | Runs module initialization once per execution context; repeated calls have no effect. | `ReferenceError` for an invalid module or initialization cycle. |
+| `module.import_dynamic` | `IMPORT_DYNAMIC` | `path: String -> Module` | Resolves, loads, and initializes a module at runtime, then pushes its handle. | `ReferenceError` if unresolved or for a circular read before initialization. |
 
 ## Asynchronous and concurrent operations
 
