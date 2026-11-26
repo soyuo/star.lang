@@ -2,7 +2,7 @@
 
 Status: draft
 
-This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`; identifier, scope, module, and import rules are in `spec/identifier-module-semantics.md`; block matching and logical branch-target rules are in `spec/control-flow.md`. This document does not define `.starc` bytecode.
+This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`; identifier, scope, module, and import rules are in `spec/identifier-module-semantics.md`; block matching and logical branch-target rules are in `spec/control-flow.md`; runtime tags and conversion rules are in `spec/type-semantics.md`. This document does not define `.starc` bytecode.
 
 ## Notation and common rules
 
@@ -34,9 +34,9 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `type.to_int` | `TO_INT` | `value -> Int` | Converts an `Int`, finite `Float`, `Bool`, or decimal `String` to `Int`; float conversion truncates toward zero. | `TypeError` for unsupported or invalid input. |
-| `type.to_float` | `TO_FLOAT` | `value -> Float` | Converts an `Int`, `Float`, `Bool`, or decimal `String` to `Float`. | `TypeError` for unsupported or invalid input. |
-| `type.to_bool` | `TO_BOOL` | `value -> Bool` | Returns false for `Null`, false, numeric zero, and empty `String`, `Bytes`, `Array`, `Map`, or `Set`; true otherwise. | None beyond common failures. |
+| `type.to_int` | `TO_INT` | `value -> Int` | Converts an `Int`, `Byte`, finite `Float`, `Bool`, or ASCII decimal `String` to `Int`; float conversion truncates toward zero. | `TypeError` for unsupported or invalid input. |
+| `type.to_float` | `TO_FLOAT` | `value -> Float` | Converts an `Int`, `Byte`, `Float`, `Bool`, or ASCII decimal `String` to `Float`. | `TypeError` for unsupported or invalid input. |
+| `type.to_bool` | `TO_BOOL` | `value -> Bool` | Returns false for `Null`, false, numeric zero, and empty `String`, `Bytes`, `Array`, `Tuple`, `Map`, or `Set`; true otherwise. | None beyond common failures. |
 | `type.to_string` | `TO_STRING` | `value -> String` | Produces the canonical user-facing string form of the value. | None beyond common failures. |
 | `type.to_bytes` | `TO_BYTES` | `String -> Bytes` | Encodes the string as UTF-8 bytes. | None beyond common failures. |
 | `encoding.utf8_decode` | `UTF8_DECODE` | `Bytes -> String` | Decodes UTF-8 bytes to a string. | `TypeError` for malformed UTF-8. |
