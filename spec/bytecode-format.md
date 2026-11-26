@@ -11,7 +11,7 @@ This document defines version 1.0 of the serialized `.starc` container, its sect
 - Counts and table indexes are `u32`; byte offsets and section lengths are `u64`. Indexes are zero-based. `0xFFFFFFFF` is reserved as the absent-index sentinel and cannot be a valid table index.
 - Text in the file is UTF-8. String constants must be valid UTF-8 and are not normalized. Byte constants may contain any byte sequence.
 
-Version 1.0 uses major version `1` and minor version `0`. A reader rejects an unsupported major version. A reader may accept a newer minor version only when all unknown sections are optional and all defined reserved fields remain zero; otherwise it rejects the file. Writers set the file flags to zero in version 1.0.
+Version 1.0 uses major version `1` and minor version `0`. A reader rejects an unsupported major version. A reader may accept a newer minor version only when the layouts of known sections remain unchanged, all unknown sections are optional, and all defined reserved fields remain zero; otherwise it rejects the file. Writers set the file flags to zero in version 1.0.
 
 ## File header and section directory
 
@@ -175,4 +175,4 @@ Records are ordered by function index and code offset. Source offsets are zero-b
 
 A loader validates the checksum, version, header flags, directory ordering and bounds, required sections, section payload lengths, constant tags and references, table references, module/function ownership, function code ranges, type descriptors, exception ranges, and DebugInfo references before execution. The bytecode verifier validates instruction boundaries and branch targets before execution. Loaders and verifiers reject integer overflow, out-of-bounds references, invalid UTF-8, noncanonical LEB128, invalid reserved bits, malformed records, and code bytes not covered by exactly one function range.
 
-Version 1.0 uses no implicit padding and no native pointers. A later incompatible container change increments the major version. A backward-compatible addition increments the minor version and uses an optional section or a newly defined flag bit; readers of version 1.0 skip unknown optional sections and reject unknown required ones. Bytecode opcode additions require an available assigned opcode and a reader that understands the instruction; an unknown opcode is always rejected.
+Version 1.0 uses no implicit padding and no native pointers. It accepts only its defined section IDs, with `DebugInfo` optional. A later incompatible container change increments the major version. A backward-compatible addition increments the minor version and may add optional sections; readers accept those sections only when they accept the corresponding minor version, and they reject unknown required sections. Bytecode opcode additions require a reader that understands the instruction; an unknown opcode is always rejected.
