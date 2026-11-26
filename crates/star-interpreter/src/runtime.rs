@@ -1,12 +1,13 @@
 //! Reference execution for literals, primitive operations, variables, and I/O.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 use num_bigint::Sign;
+use num_traits::Zero;
 use star_common::SourcePosition;
 use star_parser::Span;
 use star_parser::{
@@ -16,7 +17,7 @@ use star_parser::{
 
 use crate::{
     semantic::{self, ResolvedFunction},
-    value::{IteratorState, Value},
+    value::{IteratorState, MapState, RuntimeKey, SetState, Value},
     BigInt,
 };
 
@@ -575,6 +576,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 Ok(())
             }
             InstructionOpcode::Extended(0x10) => self.to_int(span),
+            InstructionOpcode::Extended(0x12) => self.to_bool(span),
             InstructionOpcode::Extended(0x14 | 0x16) => self.utf8_encode(span),
             InstructionOpcode::Extended(0x15) => self.utf8_decode(span),
             InstructionOpcode::Extended(0x13) => {
@@ -587,12 +589,18 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x23) => self.less_than(span),
             InstructionOpcode::Extended(0x41) => self.call_function(span),
             InstructionOpcode::Extended(0x60) => self.array_new(span),
+            InstructionOpcode::Extended(0x61) => self.map_new(span),
+            InstructionOpcode::Extended(0x62) => self.set_new(span),
             InstructionOpcode::Extended(0x63) => self.get_item(span),
             InstructionOpcode::Extended(0x64) => self.set_item(span),
             InstructionOpcode::Extended(0x65) => self.append(span),
+            InstructionOpcode::Extended(0x66) => self.remove(span),
             InstructionOpcode::Extended(0x67) => self.length(span),
+            InstructionOpcode::Extended(0x68) => self.contains(span),
             InstructionOpcode::Extended(0x69) => self.iter(span),
             InstructionOpcode::Extended(0x6A) => self.next(span),
+            InstructionOpcode::Extended(0x6B) => self.tuple_new(span),
+            InstructionOpcode::Extended(0x6C) => self.slice(span),
             InstructionOpcode::Extended(0x6D) => self.concat(span),
             InstructionOpcode::Extended(0x50) => self.declare(span, true),
             InstructionOpcode::Extended(0x51) => self.declare(span, false),
@@ -641,6 +649,26 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
         };
         self.stack.push(Value::Int(integer));
+        Ok(())
+    }
+
+    fn to_bool(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let truthy = match &value {
+            Value::Null => false,
+            Value::Bool(value) => *value,
+            Value::Int(value) => !value.is_zero(),
+            Value::Float(value) => *value != 0.0,
+            Value::Byte(value) => *value != 0,
+            Value::String(value) => !value.is_empty(),
+            Value::Bytes(value) => !value.is_empty(),
+            Value::Array(value) => !value.borrow().is_empty(),
+            Value::Tuple(value) => !value.is_empty(),
+            Value::Map(value) => !value.borrow().entries.is_empty(),
+            Value::Set(value) => !value.borrow().members.is_empty(),
+            Value::Iterator(_) | Value::Char(_) => true,
+        };
+        self.stack.push(Value::Bool(truthy));
         Ok(())
     }
 
@@ -744,36 +772,238 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         Ok(())
     }
 
+    fn tuple_new(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let values = self.pop_collection_items(span)?;
+        self.stack.push(Value::Tuple(Rc::new(values)));
+        Ok(())
+    }
+
+    fn map_new(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let count = self.pop_count(span, "representable nonnegative Map pair count")?;
+        let operand_count = count.checked_mul(2).ok_or_else(|| {
+            self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "Map pair count within available operands",
+                    found: "excessive count",
+                },
+                span,
+            )
+        })?;
+        if operand_count > self.stack.len() {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "Map pair count within available operands",
+                    found: "excessive count",
+                },
+                span,
+            ));
+        }
+        let mut pairs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let value = self.pop(span)?;
+            let key_value = self.pop(span)?;
+            let key = RuntimeKey::from_value(&key_value)
+                .ok_or_else(|| self.type_error("hashable Map key", &key_value, span))?;
+            pairs.push((key, key_value, value));
+        }
+        pairs.reverse();
+        let mut map = MapState {
+            entries: HashMap::with_capacity(count),
+            order: Vec::with_capacity(count),
+        };
+        for (key, key_value, value) in pairs {
+            if !map.entries.contains_key(&key) {
+                map.order.push((key.clone(), key_value));
+            }
+            map.entries.insert(key, value);
+        }
+        self.stack.push(Value::Map(Rc::new(RefCell::new(map))));
+        Ok(())
+    }
+
+    fn set_new(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let values = self.pop_collection_items(span)?;
+        let mut set = SetState {
+            members: HashSet::with_capacity(values.len()),
+            order: Vec::with_capacity(values.len()),
+        };
+        for value in values {
+            let key = RuntimeKey::from_value(&value)
+                .ok_or_else(|| self.type_error("hashable Set member", &value, span))?;
+            if set.members.insert(key.clone()) {
+                set.order.push((key, value));
+            }
+        }
+        self.stack.push(Value::Set(Rc::new(RefCell::new(set))));
+        Ok(())
+    }
+
+    fn pop_collection_items(&mut self, span: Span) -> Result<Vec<Value>, RuntimeError> {
+        let count = self.pop_count(span, "representable nonnegative collection length")?;
+        if count > self.stack.len() {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "collection count not exceeding available operands",
+                    found: "excessive count",
+                },
+                span,
+            ));
+        }
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push(self.pop(span)?);
+        }
+        values.reverse();
+        Ok(values)
+    }
+
     fn get_item(&mut self, span: Span) -> Result<(), RuntimeError> {
-        let index = self.pop_index(span)?;
+        let key = self.pop(span)?;
         let collection = self.pop(span)?;
         let item = match collection {
-            Value::Array(values) => values.borrow().get(index).cloned(),
-            Value::String(value) => value.chars().nth(index).map(Value::Char),
-            Value::Bytes(value) => value.get(index).copied().map(Value::Byte),
-            other => return Err(self.type_error("Array, String, or Bytes", &other, span)),
-        }
-        .ok_or_else(|| self.error(RuntimeErrorKind::IndexError("index is out of bounds"), span))?;
+            Value::Array(values) => values
+                .borrow()
+                .get(self.index_from_value(key, span)?)
+                .cloned()
+                .ok_or_else(|| self.index_error(span))?,
+            Value::Tuple(values) => values
+                .get(self.index_from_value(key, span)?)
+                .cloned()
+                .ok_or_else(|| self.index_error(span))?,
+            Value::String(value) => value
+                .chars()
+                .nth(self.index_from_value(key, span)?)
+                .map(Value::Char)
+                .ok_or_else(|| self.index_error(span))?,
+            Value::Bytes(value) => value
+                .get(self.index_from_value(key, span)?)
+                .copied()
+                .map(Value::Byte)
+                .ok_or_else(|| self.index_error(span))?,
+            Value::Map(map) => {
+                let key_value = RuntimeKey::from_value(&key)
+                    .ok_or_else(|| self.type_error("hashable Map key", &key, span))?;
+                map.borrow()
+                    .entries
+                    .get(&key_value)
+                    .cloned()
+                    .ok_or_else(|| {
+                        self.error(RuntimeErrorKind::ReferenceError("Map key not found"), span)
+                    })?
+            }
+            other => return Err(self.type_error("indexable collection or Map", &other, span)),
+        };
         self.stack.push(item);
         Ok(())
     }
 
     fn set_item(&mut self, span: Span) -> Result<(), RuntimeError> {
         let value = self.pop(span)?;
-        let index = self.pop_index(span)?;
+        let key = self.pop(span)?;
         match self.pop(span)? {
             Value::Array(values) => {
+                let index = self.index_from_value(key, span)?;
                 let mut values = values.borrow_mut();
                 let Some(slot) = values.get_mut(index) else {
-                    return Err(
-                        self.error(RuntimeErrorKind::IndexError("index is out of bounds"), span)
-                    );
+                    return Err(self.index_error(span));
                 };
                 *slot = value;
                 Ok(())
             }
-            other => Err(self.type_error("mutable Array", &other, span)),
+            Value::Map(map) => {
+                let key_value = key;
+                let key = RuntimeKey::from_value(&key_value)
+                    .ok_or_else(|| self.type_error("hashable Map key", &key_value, span))?;
+                let mut map = map.borrow_mut();
+                if !map.entries.contains_key(&key) {
+                    map.order.push((key.clone(), key_value));
+                }
+                map.entries.insert(key, value);
+                Ok(())
+            }
+            other => Err(self.type_error("mutable Array or Map", &other, span)),
         }
+    }
+
+    fn remove(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let key_value = self.pop(span)?;
+        let result = match self.pop(span)? {
+            Value::Array(values) => {
+                let index = self.index_from_value(key_value, span)?;
+                let mut values = values.borrow_mut();
+                if index >= values.len() {
+                    return Err(self.index_error(span));
+                }
+                values.remove(index)
+            }
+            Value::Map(map) => {
+                let key = RuntimeKey::from_value(&key_value)
+                    .ok_or_else(|| self.type_error("hashable Map key", &key_value, span))?;
+                let mut map = map.borrow_mut();
+                map.order.retain(|(entry, _)| entry != &key);
+                map.entries.remove(&key).unwrap_or(Value::Null)
+            }
+            Value::Set(set) => {
+                let key = RuntimeKey::from_value(&key_value)
+                    .ok_or_else(|| self.type_error("hashable Set member", &key_value, span))?;
+                let mut set = set.borrow_mut();
+                let removed_value = set
+                    .order
+                    .iter()
+                    .find(|(entry, _)| entry == &key)
+                    .map(|(_, value)| value.clone());
+                let removed = set.members.remove(&key);
+                if removed {
+                    set.order.retain(|(entry, _)| entry != &key);
+                    removed_value.unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                }
+            }
+            other => return Err(self.type_error("mutable Array, Map, or Set", &other, span)),
+        };
+        self.stack.push(result);
+        Ok(())
+    }
+
+    fn contains(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let needle = self.pop(span)?;
+        let collection = self.pop(span)?;
+        let found = match collection {
+            Value::Array(values) => values.borrow().contains(&needle),
+            Value::Tuple(values) => values.contains(&needle),
+            Value::String(value) => match needle {
+                Value::String(needle) => value.contains(&needle),
+                Value::Char(needle) => value.contains(needle),
+                other => return Err(self.type_error("String or Char search value", &other, span)),
+            },
+            Value::Bytes(value) => match needle {
+                Value::Byte(needle) => value.contains(&needle),
+                Value::Bytes(needle) => {
+                    needle.is_empty() || value.windows(needle.len()).any(|window| window == needle)
+                }
+                other => return Err(self.type_error("Bytes or Byte search value", &other, span)),
+            },
+            Value::Map(map) => {
+                let key = RuntimeKey::from_value(&needle)
+                    .ok_or_else(|| self.type_error("hashable Map key", &needle, span))?;
+                map.borrow().entries.contains_key(&key)
+            }
+            Value::Set(set) => {
+                let key = RuntimeKey::from_value(&needle)
+                    .ok_or_else(|| self.type_error("hashable Set member", &needle, span))?;
+                set.borrow().members.contains(&key)
+            }
+            other => {
+                return Err(self.type_error(
+                    "Array, Tuple, String, Bytes, Map, or Set",
+                    &other,
+                    span,
+                ))
+            }
+        };
+        self.stack.push(Value::Bool(found));
+        Ok(())
     }
 
     fn append(&mut self, span: Span) -> Result<(), RuntimeError> {
@@ -791,9 +1021,18 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let value = self.pop(span)?;
         let count = match value {
             Value::Array(values) => values.borrow().len(),
+            Value::Tuple(values) => values.len(),
+            Value::Map(map) => map.borrow().entries.len(),
+            Value::Set(set) => set.borrow().members.len(),
             Value::String(value) => value.chars().count(),
             Value::Bytes(value) => value.len(),
-            other => return Err(self.type_error("Array, String, or Bytes", &other, span)),
+            other => {
+                return Err(self.type_error(
+                    "Array, Tuple, Map, Set, String, or Bytes",
+                    &other,
+                    span,
+                ))
+            }
         };
         self.stack.push(Value::Int(BigInt::from(count)));
         Ok(())
@@ -803,15 +1042,72 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let value = self.pop(span)?;
         let values = match value {
             Value::Array(values) => values.borrow().clone(),
+            Value::Tuple(values) => values.as_ref().clone(),
+            Value::Map(map) => map
+                .borrow()
+                .order
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect(),
+            Value::Set(set) => set
+                .borrow()
+                .order
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect(),
             Value::String(value) => value.chars().map(Value::Char).collect(),
             Value::Bytes(value) => value.into_iter().map(Value::Byte).collect(),
-            other => return Err(self.type_error("Array, String, or Bytes", &other, span)),
+            other => {
+                return Err(self.type_error(
+                    "Array, Tuple, Map, Set, String, or Bytes",
+                    &other,
+                    span,
+                ))
+            }
         };
         self.stack
             .push(Value::Iterator(Rc::new(RefCell::new(IteratorState {
                 values,
                 next_index: 0,
             }))));
+        Ok(())
+    }
+
+    fn slice(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let end_value = self.pop(span)?;
+        let start_value = self.pop(span)?;
+        let collection = self.pop(span)?;
+        let (start, end) = self.slice_bounds(start_value, end_value, span)?;
+        let sliced = match collection {
+            Value::Array(values) => {
+                let values = values.borrow();
+                if start > end || end > values.len() {
+                    return Err(self.index_error(span));
+                }
+                Value::Array(Rc::new(RefCell::new(values[start..end].to_vec())))
+            }
+            Value::Tuple(values) => {
+                if start > end || end > values.len() {
+                    return Err(self.index_error(span));
+                }
+                Value::Tuple(Rc::new(values[start..end].to_vec()))
+            }
+            Value::String(value) => {
+                let length = value.chars().count();
+                if start > end || end > length {
+                    return Err(self.index_error(span));
+                }
+                Value::String(value.chars().skip(start).take(end - start).collect())
+            }
+            Value::Bytes(value) => {
+                if start > end || end > value.len() {
+                    return Err(self.index_error(span));
+                }
+                Value::Bytes(value[start..end].to_vec())
+            }
+            other => return Err(self.type_error("Array, Tuple, String, or Bytes", &other, span)),
+        };
+        self.stack.push(sliced);
         Ok(())
     }
 
@@ -858,9 +1154,14 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 values.extend(right.borrow().iter().cloned());
                 Value::Array(Rc::new(RefCell::new(values)))
             }
+            (Value::Tuple(left), Value::Tuple(right)) => {
+                let mut values = left.as_ref().clone();
+                values.extend(right.iter().cloned());
+                Value::Tuple(Rc::new(values))
+            }
             (left, _) => {
                 return Err(self.type_error(
-                    "matching String, Bytes, or Array values",
+                    "matching String, Bytes, Array, or Tuple values",
                     &left,
                     span,
                 ));
@@ -1102,17 +1403,33 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         })
     }
 
-    fn pop_index(&mut self, span: Span) -> Result<usize, RuntimeError> {
-        let value = self.pop(span)?;
+    fn index_from_value(&self, value: Value, span: Span) -> Result<usize, RuntimeError> {
         let Value::Int(index) = value else {
             return Err(self.type_error("nonnegative Int index", &value, span));
         };
-        index.to_string().parse::<usize>().map_err(|_| {
-            self.error(
-                RuntimeErrorKind::IndexError("index is negative or too large"),
-                span,
-            )
-        })
+        index
+            .to_string()
+            .parse::<usize>()
+            .map_err(|_| self.index_error(span))
+    }
+
+    fn slice_bounds(
+        &self,
+        start: Value,
+        end: Value,
+        span: Span,
+    ) -> Result<(usize, usize), RuntimeError> {
+        Ok((
+            self.index_from_value(start, span)?,
+            self.index_from_value(end, span)?,
+        ))
+    }
+
+    fn index_error(&self, span: Span) -> RuntimeError {
+        self.error(
+            RuntimeErrorKind::IndexError("index or slice is out of bounds"),
+            span,
+        )
     }
 
     fn pop(&mut self, span: Span) -> Result<Value, RuntimeError> {

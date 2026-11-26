@@ -126,6 +126,8 @@ This document specifies operands, stack effects, side effects, and additional fa
 | `collection.slice` | `SLICE` | `collection, start, end -> slice` | Returns a copy of the half-open range `[start, end)` for `Array`, `Tuple`, `String`, or `Bytes`. | `IndexError` for invalid bounds; `TypeError` for an unsupported collection. |
 | `collection.concat` | `CONCAT` | `left, right -> combined` | Returns a new concatenation of two values of the same supported type: `Array`, `Tuple`, `String`, or `Bytes`. | `TypeError` for mismatched or unsupported types. |
 
+Collection key rules, iteration order, indexing details, and complexity contracts are defined in `spec/collection-semantics.md`.
+
 ## Objects and interfaces
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |

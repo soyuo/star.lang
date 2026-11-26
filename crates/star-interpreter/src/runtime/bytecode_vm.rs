@@ -563,21 +563,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 };
                 self.runtime.stack.push(Value::Float(converted));
             }
-            ToBool => {
-                let value = self.runtime.pop(span)?;
-                let truthy = match &value {
-                    Value::Null => false,
-                    Value::Bool(value) => *value,
-                    Value::Int(value) => !value.is_zero(),
-                    Value::Float(value) => *value != 0.0,
-                    Value::Byte(value) => *value != 0,
-                    Value::String(value) => !value.is_empty(),
-                    Value::Bytes(value) => !value.is_empty(),
-                    Value::Array(value) => !value.borrow().is_empty(),
-                    Value::Iterator(_) | Value::Char(_) => true,
-                };
-                self.runtime.stack.push(Value::Bool(truthy));
-            }
+            ToBool => self.runtime.to_bool(span)?,
             FloatFromBits => {
                 let value = self.runtime.pop(span)?;
                 let Value::Int(bits) = value else {
@@ -668,12 +654,18 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             ToByte => self.runtime.to_byte(span)?,
             Lt => self.runtime.less_than(span)?,
             ArrayNew => self.runtime.array_new(span)?,
+            MapNew => self.runtime.map_new(span)?,
+            SetNew => self.runtime.set_new(span)?,
             GetItem => self.runtime.get_item(span)?,
             SetItem => self.runtime.set_item(span)?,
             Append => self.runtime.append(span)?,
+            Remove => self.runtime.remove(span)?,
             Length => self.runtime.length(span)?,
+            Contains => self.runtime.contains(span)?,
             Iter => self.runtime.iter(span)?,
             Next => self.runtime.next(span)?,
+            TupleNew => self.runtime.tuple_new(span)?,
+            Slice => self.runtime.slice(span)?,
             Concat => self.runtime.concat(span)?,
             Declare => self.runtime.declare(span, true)?,
             Const => self.runtime.declare(span, false)?,
