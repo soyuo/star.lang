@@ -135,7 +135,7 @@ Each field record is `{ field_id_int_constant_index:u32, name_string_index:u32 }
 
 ## Code and exception tables
 
-`Code` is the raw concatenation of function byte ranges in FunctionTable order, with no section-level prefix or padding. `code_offset` and `code_length` measure bytes. The bytes are decoded using the VM instruction set; its opcode values, per-instruction operand encodings, and mapping from IR operations are separate from the container layout and are defined by the bytecode compiler/VM work. The container does not equate source opcode numbers with VM opcode numbers. This separation also leaves the VM instruction namespace independent of this file's section IDs.
+`Code` is the raw concatenation of function byte ranges in FunctionTable order, with no section-level prefix or padding. `code_offset` and `code_length` measure bytes. The emitted instruction subset, opcode values, operand encodings, and mapping from IR operations are defined in `spec/bytecode-instructions.md`. Those VM opcodes are independent from source opcode numbers and from this file's section IDs.
 
 The `ExceptionTable` payload is `handler_count:u32`, followed by fixed records:
 
