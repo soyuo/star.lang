@@ -93,7 +93,7 @@ async_function_block     = ASYNC_FUNC, { statement }, END ;
 scope_block              = SCOPE_BEGIN, { statement }, SCOPE_END ;
 ```
 
-When present, the non-empty statement sequence before `WHILE` produces the loop condition, and the optional sequence after it is the body. Omitting `WHILE` denotes the condition-free loop described in the control-flow specification. `FOR` iterator and variable inputs, and function identifiers and parameter metadata, are established by preceding instructions as described in their respective specifications; they are not grammar-level operands.
+When present, the non-empty statement sequence before `WHILE` produces the loop condition, and the optional sequence after it is the body. Omitting `WHILE` denotes the condition-free loop described in the control-flow specification. `FOR` iterator and variable inputs, and function identifiers and parameter metadata, are established by preceding instructions as described in their respective specifications; function parameter IDs, counts, and the rest-parameter code are defined in `spec/function-abi.md`, and are not grammar-level operands.
 
 ## Well-formedness rules
 

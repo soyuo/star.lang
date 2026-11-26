@@ -11,12 +11,14 @@ Function IDs are nonnegative `Int` values unique within their defining module. P
 `FUNC` consumes a header in this order, bottom to top:
 
 ```text
-function_id, parameter_id_1, ..., parameter_id_N, parameter_count
+function_id, parameter_id_1, ..., parameter_id_N, parameter_count, rest_parameter_code
 ```
 
-`parameter_count` must equal the number of listed parameter IDs. The function ID must be unique in the module, and parameter IDs must be distinct within the function signature. Violations are `CompileError`. `FUNC` associates the following matching `END`-delimited body with this function ID; the body is a separate code unit and is not executed while the definition is encountered. The compiler registers module function descriptors before resolving calls so forward references, recursion, and mutual recursion can use the same module-local function table.
+`parameter_count` must equal the number of listed parameter IDs. `rest_parameter_code` is `0` for a fixed-arity function, or must equal `parameter_count` to mark the final parameter ID as a variadic rest slot. The function ID must be unique in the module, and parameter IDs must be distinct within the function signature. An invalid count or rest code, duplicate ID, or malformed body is a `CompileError`. `FUNC` associates the following matching `END`-delimited body with this function ID; the body is a separate code unit and is not executed while the definition is encountered. The compiler registers module function descriptors before resolving calls so forward references, recursion, and mutual recursion can use the same module-local function table.
 
-A function descriptor contains its module identity, function ID, ordered parameter IDs, body, and optional rest-parameter designation. If variadic, the final listed parameter ID is the rest slot and the descriptor marks it explicitly; it is not inferred from any numeric ID. `parameter_count` still counts all listed parameter IDs. The `FUNC` header itself declares fixed arity; the optional rest designation is descriptor metadata supplied by a declaration form that supports variadic functions. Native variadic functions carry the same designation in their host descriptor. This is a logical ABI record, not a `.starc` serialization rule.
+For example, parameter IDs `[10, 11]` with `parameter_count = 2` and `rest_parameter_code = 0` require exactly two arguments. With `rest_parameter_code = 2`, ID `10` receives the first argument and ID `11` receives an `Array` containing all remaining arguments, including an empty array when only one argument is supplied.
+
+A function descriptor contains its module identity, function ID, ordered parameter IDs, body, and rest-parameter code. The rest slot is always the final listed parameter; it is not inferred from any numeric ID. `parameter_count` counts all listed parameter IDs, including the rest slot. Native variadic functions use the corresponding host descriptor fields for fixed parameter count and rest behavior. These are logical ABI fields, not a `.starc` serialization rule.
 
 ## Arguments and calls
 
@@ -26,7 +28,7 @@ A function descriptor contains its module identity, function ID, ordered paramet
 arg1, arg2, ..., argN, argc, function_id
 ```
 
-`argc` is a nonnegative `Int` equal to the number of argument values immediately below it. Arguments bind from left to right to the descriptor's ordered parameter IDs. A fixed-arity function requires `argc` to equal its parameter count. A variadic function requires at least the number of fixed parameters; remaining arguments are collected, in order, into an `Array` bound to the rest parameter ID. Invalid counts raise `TypeError`; an unknown function ID in the current module raises `ReferenceError`.
+`argc` is a nonnegative `Int` equal to the number of argument values immediately below it. Arguments bind from left to right to the descriptor's ordered parameter IDs. A fixed-arity function requires `argc` to equal its parameter count. A variadic function requires `argc` to be at least `parameter_count - 1`; remaining arguments are collected, in order, into an `Array` bound to the final parameter ID. Invalid counts raise `TypeError`; an unknown function ID in the current module raises `ReferenceError`.
 
 `CALL_VALUE` uses the same argument order, with a `Function`, `Closure`, or `NativeFunction` value in place of `function_id`. A `Function` uses its defining module and function ID. A `Closure` uses its body and captured-cell vector. A `NativeFunction` receives the ordered values through the host-call interface and returns either one Star value or a runtime failure. All callable kinds apply their own fixed or variadic arity descriptor. A non-callable value raises `TypeError`.
 
@@ -34,13 +36,14 @@ arg1, arg2, ..., argN, argc, function_id
 
 ## Call frames and bindings
 
-Each call creates a fresh frame containing:
+Each call creates a fresh frame. The top-level program is also an execution frame. Each frame contains:
 
 - the defining module and function or closure body ID;
 - the current instruction location and the caller's return location;
 - a function environment with parameter and local bindings;
 - the operand-stack base for this invocation;
 - the closure's captured shared-cell references, if any;
+- a pending closure-capture vector, initially empty for this frame;
 - active exception-handler state and the caller-frame link.
 
 The caller's argument setup is consumed before the callee begins. The callee starts with an empty operand stack above its frame base. Parameters are initialized in argument order as mutable bindings. Local bindings use the normal lexical lookup and STORE rules. For a closure, lookup priority is the current function environment, captured cells, the defining module's globals, then the execution-context globals. A named function has no captured cells and uses its defining module's globals. Each recursive invocation has a distinct frame and local environment; it does not overwrite another invocation's parameters or locals.
@@ -57,11 +60,11 @@ Direct and mutual recursion use ordinary calls through the module function table
 
 ## Closure capture
 
-`CAPTURE` consumes one Variable ID and resolves it using the current lexical environment chain. It appends a reference to that binding's shared cell to the pending capture vector; it does not copy the current value. Captures are ordered by their `CAPTURE` instructions. Repeating an ID in one capture vector is a `CompileError`; an unavailable binding is a `ReferenceError`.
+`CAPTURE` consumes one Variable ID and resolves it using the current lexical environment chain. It appends a reference to that binding's shared cell to the pending capture vector owned by the current execution frame; it does not copy the current value. Captures are ordered by their `CAPTURE` instructions. Repeating an ID in one capture vector is a `CompileError`; an unavailable binding is a `ReferenceError`.
 
-`LAMBDA` consumes a compiler-registered body ID and parameter count, then creates a `Closure` from that body and the pending capture vector. The body descriptor's parameter count must match; otherwise construction fails with `TypeError`. The pending vector is consumed and cleared, so each construction produces a closure with its own vector of cell references. With no preceding `CAPTURE`, the closure has an empty capture vector. A nested closure may capture a cell already captured by its enclosing closure.
+`LAMBDA` consumes a compiler-registered body ID and parameter count, then creates a `Closure` from that body and the current frame's pending capture vector. The body descriptor's parameter count must match; otherwise construction fails with `TypeError`. The pending vector is consumed and cleared, so each construction produces a closure with its own vector of cell references. With no preceding `CAPTURE`, the closure has an empty capture vector. A nested closure may capture a cell already captured by its enclosing closure.
 
-The compiler identifies each closure-construction sequence and verifies that every `CAPTURE` contributes to exactly one `LAMBDA`, that capture IDs are unique within that sequence, and that all control-flow paths agree on the pending capture vector. No pending captures may remain at a code-unit exit or tail call. A violation is `CompileError`.
+The compiler identifies each closure-construction sequence and verifies that every `CAPTURE` contributes to exactly one `LAMBDA`, that capture IDs are unique within that sequence, and that all control-flow paths agree on the pending capture vector. A call creates a callee frame with a separate empty vector and leaves the caller's vector unchanged; this includes recursive calls. No pending captures may remain at a code-unit exit or tail call. A violation is `CompileError`.
 
 Captured cells are shared: stores through the defining scope or any closure observe the same cell. The cell remains alive after its defining scope or frame exits for as long as a closure references it. Garbage collection traces closure-to-cell references. Captured bindings retain their Variable IDs, so ordinary shadowing and nearest-binding lookup rules continue to apply.
 

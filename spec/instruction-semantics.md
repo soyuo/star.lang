@@ -86,7 +86,7 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `function.define` | `FUNC` | `function_id, parameter_ids..., parameter_count -> -` | Registers the following `END`-delimited body and its ordered parameter IDs in the defining module; header is consumed at compile time. See `spec/function-abi.md`. | `CompileError` for duplicate IDs, mismatched count, or malformed body. |
+| `function.define` | `FUNC` | `function_id, parameter_ids..., parameter_count, rest_parameter_code -> -` | Registers the following `END`-delimited body and its ordered parameter IDs in the defining module; code `0` means fixed arity, otherwise the code equals the parameter count and marks the final ID as variadic rest slot. Header is consumed at compile time. See `spec/function-abi.md`. | `CompileError` for duplicate IDs, mismatched count, invalid rest code, or malformed body. |
 | `function.call` | `CALL` | `arg1..argN, argc, function_id -> result` | Calls the named function in the current module using the ABI's argument order and frame rules; pushes exactly one result. | `ReferenceError` for an unknown function; `TypeError` for invalid arity; `StackOverflow` at the call-depth limit. |
 | `function.return` | `RETURN` | `value? -> caller result` | Returns the top operand above the current frame base, or `Null` when none exists; discards other frame operands. See `spec/function-abi.md`. | `CompileError` when used outside a function. |
 | `function.lambda` | `LAMBDA` | `body_id, parameter_count -> Closure` | Creates a closure from the compiler-registered body and pending shared-cell capture vector, then clears that vector. | `ReferenceError` for an unknown body; `TypeError` for an invalid count. |
@@ -156,7 +156,7 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `async.function` | `ASYNC_FUNC` | `function_id, parameter_ids..., parameter_count -> -` | Defines an asynchronous function body; calling it creates a `Task` instead of executing it inline. Header is consumed at compile time. | `CompileError` for duplicate IDs, mismatched count, or malformed body. |
+| `async.function` | `ASYNC_FUNC` | `function_id, parameter_ids..., parameter_count, rest_parameter_code -> -` | Defines an asynchronous function body using the same function descriptor and arity rules as `FUNC`; calling it creates a `Task` instead of executing it inline. Header is consumed at compile time. | `CompileError` for duplicate IDs, mismatched count, invalid rest code, or malformed body. |
 | `async.await` | `AWAIT` | `Task -> result` | Suspends the current task until completion and pushes the task result. | `TypeError` for a non-task; propagates task failure or cancellation. |
 | `async.spawn` | `SPAWN` | `Function -> Task` | Schedules the function as a new task and pushes its handle. | `TypeError` for a non-function; `PermissionError` if task creation is disabled. |
 | `async.yield` | `YIELD` | `- -> -` | Returns the execution turn to the scheduler. | `TypeError` when used outside an async task. |
