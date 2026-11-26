@@ -2,7 +2,7 @@
 
 Status: draft
 
-This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; this document does not define `.starc` bytecode.
+This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`. This document does not define `.starc` bytecode.
 
 ## Notation and common rules
 
