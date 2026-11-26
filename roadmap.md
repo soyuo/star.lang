@@ -13,7 +13,7 @@ Progress: **0 / 47**
 - [ ] Specify each instruction's operands, stack inputs/outputs, side effects, and failure cases.
 - [ ] Define integer literal encoding, signed values, arbitrary-precision representation, and byte order.
 - [ ] Define string and byte literal encoding, lengths, UTF-8 validity, and round-trip behavior.
-- [ ] Define identifier encoding, variable declaration, initialization, and lexical scope rules.
+- [ ] Define identifier and module/import encoding, variable declaration, lexical scope, visibility, and module initialization rules.
 - [ ] Define block boundaries, labels, branch targets, and control-flow instruction semantics.
 - [ ] Define primitive/composite types, conversions, truthiness, and type-error behavior.
 - [ ] Define arithmetic semantics: overflow, integer division, remainder for negative operands, and mixed numeric operations.
@@ -64,7 +64,7 @@ Progress: **0 / 47**
 - [ ] Implement REPL and bytecode disassembler.
 - [ ] Implement debugger with breakpoints, stepping, stack inspection, and source locations.
 - [ ] Implement LSP and editor syntax support for VS Code, Zed, Neovim, and Tree-sitter.
-- [ ] Implement package manifests, dependency resolution, package manager, registry, and SDK integration.
+- [ ] Implement module loading/initialization and exported visibility, plus package manifests, dependency resolution, package manager, registry, and SDK integration.
 
 ## Phase 7 — Stabilization and release (3)
 
