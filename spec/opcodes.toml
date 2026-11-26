@@ -1,0 +1,849 @@
+schema_version = 1
+status = "draft"
+namespace = "source"
+
+# This catalog describes source-level Star instructions only.
+# .starc VM bytecode has an independent opcode namespace and must not reuse
+# these values by assumption.
+
+[encoding]
+allowed_characters = ["*", "'", '"']
+bit_zero = "'"
+bit_one = "*"
+basic_form = "N asterisks followed by a single quote; N is the basic ordinal."
+extended_form = "Single quote, 8 payload bits (most significant bit first), double quote."
+whitespace = "Spaces, tabs, CR, and LF are formatting only in normal mode."
+literal_form = "Double quote, encoded data bits, double quote."
+
+[allocation]
+"0x00-0x0F" = "Reserved: stack and basic execution control; no source assignments yet."
+"0x10-0x1F" = "Type conversion and type operations."
+"0x20-0x2F" = "Arithmetic, logical, and bitwise operations."
+"0x30-0x3F" = "Conditionals and loops."
+"0x40-0x4F" = "Functions and calls."
+"0x50-0x5F" = "Variables and scope."
+"0x60-0x6F" = "Arrays, maps, sets, and strings."
+"0x70-0x7F" = "Structs and objects."
+"0x80-0x8F" = "Exception handling."
+"0x90-0x9F" = "Modules and libraries."
+"0xA0-0xAF" = "Asynchronous operations and concurrency."
+"0xB0-0xBF" = "Native interface."
+"0xC0-0xCF" = "Reserved: debugging and diagnostics."
+"0xD0-0xFE" = "Reserved for future expansion."
+"0xFF" = "Reserved as an extended-instruction page prefix."
+
+# Basic instructions use their ordinal as the number of leading asterisks.
+[[basic]]
+id = "arith.add"
+mnemonic = "ADD"
+ordinal = 1
+encoding = "*'"
+family = "arithmetic"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "arith.sub"
+mnemonic = "SUB"
+ordinal = 2
+encoding = "**'"
+family = "arithmetic"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "arith.mul"
+mnemonic = "MUL"
+ordinal = 3
+encoding = "***'"
+family = "arithmetic"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "arith.div"
+mnemonic = "DIV"
+ordinal = 4
+encoding = "****'"
+family = "arithmetic"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "arith.mod"
+mnemonic = "MOD"
+ordinal = 5
+encoding = "*****'"
+family = "arithmetic"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "io.print"
+mnemonic = "PRINT"
+ordinal = 6
+encoding = "******'"
+family = "io"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "io.input"
+mnemonic = "INPUT"
+ordinal = 7
+encoding = "*******'"
+family = "io"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "variable.store"
+mnemonic = "STORE"
+ordinal = 8
+encoding = "********'"
+family = "variables"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "variable.load"
+mnemonic = "LOAD"
+ordinal = 9
+encoding = "*********'"
+family = "variables"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "compare.eq"
+mnemonic = "EQ"
+ordinal = 10
+encoding = "**********'"
+family = "comparison"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "compare.gt"
+mnemonic = "GT"
+ordinal = 11
+encoding = "***********'"
+family = "comparison"
+reference = "language/syntax/instructions.md"
+
+[[basic]]
+id = "logic.not"
+mnemonic = "NOT"
+ordinal = 12
+encoding = "************'"
+family = "logical"
+reference = "language/syntax/instructions.md"
+
+# Extended opcode values are source opcodes, not .starc bytecode opcodes.
+[[extended]]
+id = "type.to_int"
+mnemonic = "TO_INT"
+opcode = 0x10
+family = "conversion"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "type.to_float"
+mnemonic = "TO_FLOAT"
+opcode = 0x11
+family = "conversion"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "type.to_bool"
+mnemonic = "TO_BOOL"
+opcode = 0x12
+family = "conversion"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "type.to_string"
+mnemonic = "TO_STRING"
+opcode = 0x13
+family = "conversion"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "type.to_bytes"
+mnemonic = "TO_BYTES"
+opcode = 0x14
+family = "conversion"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "encoding.utf8_decode"
+mnemonic = "UTF8_DECODE"
+opcode = 0x15
+family = "encoding"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "encoding.utf8_encode"
+mnemonic = "UTF8_ENCODE"
+opcode = 0x16
+family = "encoding"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "type.float_from_bits"
+mnemonic = "FLOAT_FROM_BITS"
+opcode = 0x17
+family = "conversion"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "literal.push_null"
+mnemonic = "PUSH_NULL"
+opcode = 0x18
+family = "literal"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "literal.push_true"
+mnemonic = "PUSH_TRUE"
+opcode = 0x19
+family = "literal"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "literal.push_false"
+mnemonic = "PUSH_FALSE"
+opcode = 0x1A
+family = "literal"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "type.of"
+mnemonic = "TYPE_OF"
+opcode = 0x1B
+family = "type"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "type.check"
+mnemonic = "TYPE_CHECK"
+opcode = 0x1C
+family = "type"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "type.to_char"
+mnemonic = "TO_CHAR"
+opcode = 0x1D
+family = "conversion"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "type.to_byte"
+mnemonic = "TO_BYTE"
+opcode = 0x1E
+family = "conversion"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "encoding.int_to_bytes"
+mnemonic = "INT_TO_BYTES"
+opcode = 0x1F
+family = "encoding"
+reference = "language/semantics/types.md"
+
+[[extended]]
+id = "arith.pow"
+mnemonic = "POW"
+opcode = 0x20
+family = "arithmetic"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "arith.neg"
+mnemonic = "NEG"
+opcode = 0x21
+family = "arithmetic"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "arith.abs"
+mnemonic = "ABS"
+opcode = 0x22
+family = "arithmetic"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "compare.lt"
+mnemonic = "LT"
+opcode = 0x23
+family = "comparison"
+reference = "programming/control-flow.md"
+
+[[extended]]
+id = "logic.and"
+mnemonic = "AND"
+opcode = 0x24
+family = "logical"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "logic.or"
+mnemonic = "OR"
+opcode = 0x25
+family = "logical"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "logic.xor"
+mnemonic = "XOR"
+opcode = 0x26
+family = "logical"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "bitwise.and"
+mnemonic = "BIT_AND"
+opcode = 0x27
+family = "bitwise"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "bitwise.or"
+mnemonic = "BIT_OR"
+opcode = 0x28
+family = "bitwise"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "bitwise.xor"
+mnemonic = "BIT_XOR"
+opcode = 0x29
+family = "bitwise"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "bitwise.not"
+mnemonic = "BIT_NOT"
+opcode = 0x2A
+family = "bitwise"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "bitwise.shift_left"
+mnemonic = "SHL"
+opcode = 0x2B
+family = "bitwise"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "bitwise.shift_right"
+mnemonic = "SHR"
+opcode = 0x2C
+family = "bitwise"
+reference = "language/semantics/operators.md"
+
+[[extended]]
+id = "control.if"
+mnemonic = "IF"
+opcode = 0x30
+family = "control_flow"
+reference = "programming/control-flow.md"
+
+[[extended]]
+id = "control.else"
+mnemonic = "ELSE"
+opcode = 0x31
+family = "control_flow"
+reference = "programming/control-flow.md"
+
+[[extended]]
+id = "control.end"
+mnemonic = "END"
+opcode = 0x32
+family = "control_flow"
+reference = "programming/control-flow.md"
+
+[[extended]]
+id = "control.loop"
+mnemonic = "LOOP"
+opcode = 0x33
+family = "control_flow"
+reference = "programming/control-flow.md"
+
+[[extended]]
+id = "control.while"
+mnemonic = "WHILE"
+opcode = 0x34
+family = "control_flow"
+reference = "programming/control-flow.md"
+
+[[extended]]
+id = "control.break"
+mnemonic = "BREAK"
+opcode = 0x35
+family = "control_flow"
+reference = "programming/control-flow.md"
+
+[[extended]]
+id = "control.continue"
+mnemonic = "CONTINUE"
+opcode = 0x36
+family = "control_flow"
+reference = "programming/control-flow.md"
+
+[[extended]]
+id = "control.for"
+mnemonic = "FOR"
+opcode = 0x37
+family = "control_flow"
+reference = "programming/control-flow.md"
+
+[[extended]]
+id = "function.define"
+mnemonic = "FUNC"
+opcode = 0x40
+family = "functions"
+reference = "programming/functions.md"
+
+[[extended]]
+id = "function.call"
+mnemonic = "CALL"
+opcode = 0x41
+family = "functions"
+reference = "programming/functions.md"
+
+[[extended]]
+id = "function.return"
+mnemonic = "RETURN"
+opcode = 0x42
+family = "functions"
+reference = "programming/functions.md"
+
+[[extended]]
+id = "function.lambda"
+mnemonic = "LAMBDA"
+opcode = 0x43
+family = "functions"
+reference = "programming/functions.md"
+
+[[extended]]
+id = "function.capture"
+mnemonic = "CAPTURE"
+opcode = 0x44
+family = "functions"
+reference = "programming/functions.md"
+
+[[extended]]
+id = "function.tail_call"
+mnemonic = "TAIL_CALL"
+opcode = 0x45
+family = "functions"
+reference = "programming/functions.md"
+
+[[extended]]
+id = "function.call_value"
+mnemonic = "CALL_VALUE"
+opcode = 0x46
+family = "functions"
+reference = "programming/functions.md"
+
+[[extended]]
+id = "variable.declare"
+mnemonic = "DECLARE"
+opcode = 0x50
+family = "variables"
+reference = "language/semantics/variables.md"
+
+[[extended]]
+id = "variable.const"
+mnemonic = "CONST"
+opcode = 0x51
+family = "variables"
+reference = "language/semantics/variables.md"
+
+[[extended]]
+id = "variable.delete"
+mnemonic = "DELETE"
+opcode = 0x52
+family = "variables"
+reference = "language/semantics/variables.md"
+
+[[extended]]
+id = "variable.load_global"
+mnemonic = "LOAD_GLOBAL"
+opcode = 0x53
+family = "variables"
+reference = "language/semantics/variables.md"
+
+[[extended]]
+id = "variable.store_global"
+mnemonic = "STORE_GLOBAL"
+opcode = 0x54
+family = "variables"
+reference = "language/semantics/variables.md"
+
+[[extended]]
+id = "scope.begin"
+mnemonic = "SCOPE_BEGIN"
+opcode = 0x55
+family = "scope"
+reference = "language/semantics/variables.md"
+
+[[extended]]
+id = "scope.end"
+mnemonic = "SCOPE_END"
+opcode = 0x56
+family = "scope"
+reference = "language/semantics/variables.md"
+
+[[extended]]
+id = "variable.type_annotate"
+mnemonic = "TYPE_ANNOTATE"
+opcode = 0x57
+family = "variables"
+reference = "language/semantics/variables.md"
+
+[[extended]]
+id = "collection.array_new"
+mnemonic = "ARRAY_NEW"
+opcode = 0x60
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.map_new"
+mnemonic = "MAP_NEW"
+opcode = 0x61
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.set_new"
+mnemonic = "SET_NEW"
+opcode = 0x62
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.get_item"
+mnemonic = "GET_ITEM"
+opcode = 0x63
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.set_item"
+mnemonic = "SET_ITEM"
+opcode = 0x64
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.append"
+mnemonic = "APPEND"
+opcode = 0x65
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.remove"
+mnemonic = "REMOVE"
+opcode = 0x66
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.length"
+mnemonic = "LENGTH"
+opcode = 0x67
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.contains"
+mnemonic = "CONTAINS"
+opcode = 0x68
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.iter"
+mnemonic = "ITER"
+opcode = 0x69
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.next"
+mnemonic = "NEXT"
+opcode = 0x6A
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.tuple_new"
+mnemonic = "TUPLE_NEW"
+opcode = 0x6B
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.slice"
+mnemonic = "SLICE"
+opcode = 0x6C
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "collection.concat"
+mnemonic = "CONCAT"
+opcode = 0x6D
+family = "collections"
+reference = "programming/data-structures.md"
+
+[[extended]]
+id = "object.struct_def"
+mnemonic = "STRUCT_DEF"
+opcode = 0x70
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "object.new"
+mnemonic = "OBJECT_NEW"
+opcode = 0x71
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "object.field_get"
+mnemonic = "FIELD_GET"
+opcode = 0x72
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "object.field_set"
+mnemonic = "FIELD_SET"
+opcode = 0x73
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "object.method_def"
+mnemonic = "METHOD_DEF"
+opcode = 0x74
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "object.method_call"
+mnemonic = "METHOD_CALL"
+opcode = 0x75
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "object.interface_def"
+mnemonic = "INTERFACE_DEF"
+opcode = 0x76
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "object.implement"
+mnemonic = "IMPLEMENT"
+opcode = 0x77
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "object.is"
+mnemonic = "OBJECT_IS"
+opcode = 0x78
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "object.clone"
+mnemonic = "OBJECT_CLONE"
+opcode = 0x79
+family = "objects"
+reference = "programming/objects.md"
+
+[[extended]]
+id = "module.import"
+mnemonic = "IMPORT"
+opcode = 0x90
+family = "modules"
+reference = "platform/modules-packages.md"
+
+[[extended]]
+id = "module.export"
+mnemonic = "EXPORT"
+opcode = 0x91
+family = "modules"
+reference = "platform/modules-packages.md"
+
+[[extended]]
+id = "module.get"
+mnemonic = "MODULE_GET"
+opcode = 0x92
+family = "modules"
+reference = "platform/modules-packages.md"
+
+[[extended]]
+id = "module.call"
+mnemonic = "MODULE_CALL"
+opcode = 0x93
+family = "modules"
+reference = "platform/modules-packages.md"
+
+[[extended]]
+id = "module.init"
+mnemonic = "MODULE_INIT"
+opcode = 0x94
+family = "modules"
+reference = "platform/modules-packages.md"
+
+[[extended]]
+id = "module.import_dynamic"
+mnemonic = "IMPORT_DYNAMIC"
+opcode = 0x95
+family = "modules"
+reference = "platform/modules-packages.md"
+
+[[extended]]
+id = "async.function"
+mnemonic = "ASYNC_FUNC"
+opcode = 0xA0
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.await"
+mnemonic = "AWAIT"
+opcode = 0xA1
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.spawn"
+mnemonic = "SPAWN"
+opcode = 0xA2
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.yield"
+mnemonic = "YIELD"
+opcode = 0xA3
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.sleep"
+mnemonic = "SLEEP"
+opcode = 0xA4
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.join"
+mnemonic = "JOIN"
+opcode = 0xA5
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.cancel"
+mnemonic = "CANCEL"
+opcode = 0xA6
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.channel_new"
+mnemonic = "CHANNEL_NEW"
+opcode = 0xA7
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.channel_send"
+mnemonic = "CHANNEL_SEND"
+opcode = 0xA8
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.channel_recv"
+mnemonic = "CHANNEL_RECV"
+opcode = 0xA9
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.mutex_new"
+mnemonic = "MUTEX_NEW"
+opcode = 0xAA
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.mutex_lock"
+mnemonic = "MUTEX_LOCK"
+opcode = 0xAB
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "async.mutex_unlock"
+mnemonic = "MUTEX_UNLOCK"
+opcode = 0xAC
+family = "async"
+reference = "platform/concurrency.md"
+
+[[extended]]
+id = "ffi.native_load"
+mnemonic = "NATIVE_LOAD"
+opcode = 0xB0
+family = "ffi"
+reference = "platform/ffi.md"
+
+[[extended]]
+id = "ffi.native_symbol"
+mnemonic = "NATIVE_SYMBOL"
+opcode = 0xB1
+family = "ffi"
+reference = "platform/ffi.md"
+
+[[extended]]
+id = "ffi.native_call"
+mnemonic = "NATIVE_CALL"
+opcode = 0xB2
+family = "ffi"
+reference = "platform/ffi.md"
+
+[[extended]]
+id = "ffi.native_close"
+mnemonic = "NATIVE_CLOSE"
+opcode = 0xB3
+family = "ffi"
+reference = "platform/ffi.md"
+
+[[extended]]
+id = "ffi.native_callback"
+mnemonic = "NATIVE_CALLBACK"
+opcode = 0xB4
+family = "ffi"
+reference = "platform/ffi.md"
+
+[[extended]]
+id = "ffi.native_buffer"
+mnemonic = "NATIVE_BUFFER"
+opcode = 0xB5
+family = "ffi"
+reference = "platform/ffi.md"
+
+# Opcodes such as NE, GTE, LTE, INC, and DEC are expressible through existing
+# instructions and do not receive dedicated values in this catalog.
+# The exception specification currently labels 0x80-0x86 as VM instructions.
+# Keep these out of the source namespace until the source-to-bytecode mapping
+# is explicitly resolved.
+[[pending_assignments]]
+family = "exceptions"
+candidate_opcodes = [0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86]
+reference = "programming/exceptions.md"
+reason = "The source document identifies these as VM opcodes; this catalog is source-only."
