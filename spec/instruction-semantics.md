@@ -132,16 +132,18 @@ Collection key rules, iteration order, indexing details, and complexity contract
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `object.struct_def` | `STRUCT_DEF` | `struct_id, field_ids..., field_count -> -` | Registers a struct descriptor and its ordered fields at compile time. | `CompileError` for duplicate IDs, duplicate fields, or a mismatched count. |
+| `object.struct_def` | `STRUCT_DEF` | `struct_id, field_ids..., field_count -> -` | Registers a struct descriptor and its ordered fields while the module initializer executes. | `CompileError` for duplicate IDs, duplicate fields, or a mismatched count. |
 | `object.new` | `OBJECT_NEW` | `arg1..argN, argc, struct_id -> Object` | Allocates an instance, initializes declared fields, then calls its constructor if present. | `ReferenceError` for an unknown struct; `TypeError` for invalid constructor arity. |
 | `object.field_get` | `FIELD_GET` | `object, field_id -> value` | Reads an instance field. | `ReferenceError` for an unknown field. |
-| `object.field_set` | `FIELD_SET` | `object, field_id, value -> -` | Updates a mutable instance field. | `ReferenceError` for an unknown field; `TypeError` for an incompatible or immutable field. |
-| `object.method_def` | `METHOD_DEF` | `struct_id, method_id, function_id -> -` | Attaches the named function to the struct as a method at compile time. | `CompileError` for unknown or duplicate IDs. |
+| `object.field_set` | `FIELD_SET` | `object, field_id, value -> -` | Updates a declared mutable instance field. All declared fields are mutable in the current runtime. | `ReferenceError` for an unknown field; `TypeError` for a non-object receiver. |
+| `object.method_def` | `METHOD_DEF` | `struct_id, method_id, function_id -> -` | Attaches the function-table function to the struct while the module initializer executes. | `CompileError` for unknown or duplicate IDs. |
 | `object.method_call` | `METHOD_CALL` | `arg1..argN, argc, object, method_id -> result` | Calls the method with the object as its receiver and pushes its result. | `ReferenceError` for an unknown method; `TypeError` for invalid receiver or arity; `StackOverflow` at the call-depth limit. |
-| `object.interface_def` | `INTERFACE_DEF` | `interface_id, method_ids..., method_count -> -` | Registers the required method identifiers at compile time. | `CompileError` for duplicate IDs or a mismatched count. |
+| `object.interface_def` | `INTERFACE_DEF` | `interface_id, method_ids..., method_count -> -` | Registers the required method identifiers while the module initializer executes. | `CompileError` for duplicate IDs or a mismatched count. |
 | `object.implement` | `IMPLEMENT` | `struct_id, interface_id -> -` | Declares that a struct implements an interface and validates required methods. | `CompileError` for unknown IDs or missing methods. |
 | `object.is` | `OBJECT_IS` | `object, type_id -> Bool` | Checks whether the object is an instance of the struct or interface identified by `type_id`. | `ReferenceError` for an unknown type ID. |
 | `object.clone` | `OBJECT_CLONE` | `object -> Object` | Creates a shallow copy with the same struct and field values. | `TypeError` for a non-object. |
+
+Constructor binding, method receivers, interface conformance, closure cells, and current runtime limits are defined in `spec/object-closure-semantics.md`.
 
 ## Modules
 

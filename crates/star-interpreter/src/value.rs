@@ -6,6 +6,55 @@ use std::{cell::RefCell, rc::Rc};
 
 use crate::BigInt;
 
+/// A mutable binding shared by ordinary lookup and any closures that capture it.
+pub(crate) type BindingCell = Rc<RefCell<Binding>>;
+
+/// Runtime state stored in one lexical binding cell.
+#[derive(Clone, Debug)]
+pub(crate) struct Binding {
+    pub(crate) value: Value,
+    pub(crate) mutable: bool,
+}
+
+pub(crate) fn binding_cell(value: Value, mutable: bool) -> BindingCell {
+    Rc::new(RefCell::new(Binding { value, mutable }))
+}
+
+/// A module-qualified named function reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionRef {
+    pub(crate) module_index: u32,
+    pub(crate) id: BigInt,
+}
+
+/// A closure's function reference and ordered captured shared cells.
+#[derive(Clone, Debug)]
+pub struct ClosureState {
+    pub(crate) function: FunctionRef,
+    pub(crate) captures: Vec<(BigInt, BindingCell)>,
+}
+
+/// A nominal object instance with mutable fields addressed by numeric IDs.
+#[derive(Clone, Debug)]
+pub struct ObjectState {
+    pub(crate) struct_id: BigInt,
+    pub(crate) fields: HashMap<BigInt, Value>,
+}
+
+/// Runtime descriptor for one struct type.
+#[derive(Clone, Debug)]
+pub(crate) struct StructDefinition {
+    pub(crate) field_ids: Vec<BigInt>,
+    pub(crate) methods: HashMap<BigInt, BigInt>,
+    pub(crate) interfaces: HashSet<BigInt>,
+}
+
+/// Runtime descriptor for an interface's required method IDs.
+#[derive(Clone, Debug)]
+pub(crate) struct InterfaceDefinition {
+    pub(crate) method_ids: HashSet<BigInt>,
+}
+
 /// A Star value supported by the current reference-execution slice.
 #[derive(Clone, Debug)]
 pub enum Value {
@@ -33,6 +82,12 @@ pub enum Value {
     Set(Rc<RefCell<SetState>>),
     /// Stateful iterator over a snapshot of values.
     Iterator(Rc<RefCell<IteratorState>>),
+    /// A named function value.
+    Function(FunctionRef),
+    /// A function body paired with captured shared cells.
+    Closure(Rc<ClosureState>),
+    /// A mutable instance of a nominal struct.
+    Object(Rc<RefCell<ObjectState>>),
     /// Absence of a value.
     Null,
 }
@@ -103,7 +158,13 @@ impl RuntimeKey {
                     .map(Self::from_value)
                     .collect::<Option<Vec<_>>>()?,
             ),
-            Value::Array(_) | Value::Map(_) | Value::Set(_) | Value::Iterator(_) => return None,
+            Value::Array(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::Iterator(_)
+            | Value::Function(_)
+            | Value::Closure(_)
+            | Value::Object(_) => return None,
         })
     }
 }
@@ -186,6 +247,9 @@ fn values_equal(left: &Value, right: &Value, active: &mut ActiveValuePairs) -> b
             active.remove(&pair);
             equal
         }
+        (Value::Function(left), Value::Function(right)) => left == right,
+        (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
+        (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
         _ => false,
     }
 }
@@ -227,6 +291,9 @@ impl Value {
             Self::Map(_) => "Map",
             Self::Set(_) => "Set",
             Self::Iterator(_) => "Iterator",
+            Self::Function(_) => "Function",
+            Self::Closure(_) => "Closure",
+            Self::Object(_) => "Struct",
             Self::Null => "Null",
         }
     }
@@ -300,6 +367,9 @@ fn fmt_value(
         Value::Map(map) => write!(formatter, "Map(len={})", map.borrow().entries.len()),
         Value::Set(set) => write!(formatter, "Set(len={})", set.borrow().members.len()),
         Value::Iterator(_) => formatter.write_str("Iterator"),
+        Value::Function(function) => write!(formatter, "Function#{}", function.id),
+        Value::Closure(closure) => write!(formatter, "Closure#{}", closure.function.id),
+        Value::Object(object) => write!(formatter, "Struct#{}", object.borrow().struct_id),
         Value::Null => formatter.write_str("null"),
     }
 }
