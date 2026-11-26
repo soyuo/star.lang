@@ -105,6 +105,8 @@ struct Binding {
 ///
 /// The first environment is the module-global scope. Nested `SCOPE` nodes add
 /// temporary lexical environments; ordinary reads and stores walk outward.
+/// This execution slice runs synchronous named functions. Calling an
+/// `ASYNC_FUNC` returns `Unsupported` until task scheduling is implemented.
 pub struct Interpreter<R: BufRead, W: Write> {
     input: R,
     output: W,
@@ -406,20 +408,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn call_function(&mut self, span: Span) -> Result<(), RuntimeError> {
         let function_id = self.pop_identifier(span)?;
-        let argument_count = self.pop_identifier(span)?;
-        let argument_count = argument_count
-            .to_string()
-            .parse::<usize>()
-            .ok()
-            .ok_or_else(|| {
-                self.error(
-                    RuntimeErrorKind::TypeError {
-                        expected: "representable nonnegative argument count",
-                        found: "Int",
-                    },
-                    span,
-                )
-            })?;
+        let argument_count = self.pop_count(span, "representable nonnegative argument count")?;
         if argument_count > self.stack.len() {
             return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
         }
@@ -715,13 +704,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let left = self.pop(span)?;
         let result = match (&left, &right) {
             (Value::Int(left), Value::Int(right)) => left < right,
-            (Value::Int(left), Value::Float(right)) => {
-                left.to_string().parse::<f64>().unwrap_or(f64::INFINITY) < *right
+            (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+                to_float(&left) < to_float(&right)
             }
-            (Value::Float(left), Value::Int(right)) => {
-                *left < right.to_string().parse::<f64>().unwrap_or(f64::INFINITY)
-            }
-            (Value::Float(left), Value::Float(right)) => left < right,
             _ => return Err(self.type_error("numeric operands", &left, span)),
         };
         self.stack.push(Value::Bool(result));
@@ -729,16 +714,15 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     fn array_new(&mut self, span: Span) -> Result<(), RuntimeError> {
-        let count = self.pop_identifier(span)?;
-        let Some(count) = count.to_string().parse::<usize>().ok() else {
-            return Err(self.type_error(
-                "representable nonnegative Array length",
-                &Value::Int(count),
+        let count = self.pop_count(span, "representable nonnegative Array length")?;
+        if count > self.stack.len() {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "Array count not exceeding available operands",
+                    found: "excessive count",
+                },
                 span,
             ));
-        };
-        if count > self.stack.len() {
-            return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
         }
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
@@ -750,10 +734,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     fn get_item(&mut self, span: Span) -> Result<(), RuntimeError> {
-        let key = self.pop_identifier(span)?;
-        let Some(index) = key.to_string().parse::<usize>().ok() else {
-            return Err(self.error(RuntimeErrorKind::IndexError("index is too large"), span));
-        };
+        let index = self.pop_index(span)?;
         let collection = self.pop(span)?;
         let item = match collection {
             Value::Array(values) => values.borrow().get(index).cloned(),
@@ -768,10 +749,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn set_item(&mut self, span: Span) -> Result<(), RuntimeError> {
         let value = self.pop(span)?;
-        let key = self.pop_identifier(span)?;
-        let Some(index) = key.to_string().parse::<usize>().ok() else {
-            return Err(self.error(RuntimeErrorKind::IndexError("index is too large"), span));
-        };
+        let index = self.pop_index(span)?;
         match self.pop(span)? {
             Value::Array(values) => {
                 let mut values = values.borrow_mut();
@@ -1095,6 +1073,35 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             )),
             other => Err(self.type_error("nonnegative Int identifier", &other, span)),
         }
+    }
+
+    fn pop_count(&mut self, span: Span, expected: &'static str) -> Result<usize, RuntimeError> {
+        let value = self.pop(span)?;
+        let Value::Int(integer) = value else {
+            return Err(self.type_error(expected, &value, span));
+        };
+        integer.to_string().parse::<usize>().map_err(|_| {
+            self.error(
+                RuntimeErrorKind::TypeError {
+                    expected,
+                    found: "invalid Int count",
+                },
+                span,
+            )
+        })
+    }
+
+    fn pop_index(&mut self, span: Span) -> Result<usize, RuntimeError> {
+        let value = self.pop(span)?;
+        let Value::Int(index) = value else {
+            return Err(self.type_error("nonnegative Int index", &value, span));
+        };
+        index.to_string().parse::<usize>().map_err(|_| {
+            self.error(
+                RuntimeErrorKind::IndexError("index is negative or too large"),
+                span,
+            )
+        })
     }
 
     fn pop(&mut self, span: Span) -> Result<Value, RuntimeError> {
