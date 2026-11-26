@@ -1,0 +1,11 @@
+[package]
+name = "star-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+star-common.workspace = true
+
+[lib]
+path = "src/lib.rs"
