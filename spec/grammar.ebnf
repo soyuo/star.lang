@@ -80,7 +80,9 @@ structured_block         = conditional_block
 
 conditional_block        = IF, { statement }, [ ELSE, { statement } ], END ;
 
-loop_block               = LOOP, { statement }, [ WHILE, { statement } ], END ;
+loop_block               = LOOP, { statement }, END
+                         | LOOP, statement, { statement }, WHILE,
+                           { statement }, END ;
 
 for_block                = FOR, { statement }, END ;
 
@@ -91,7 +93,7 @@ async_function_block     = ASYNC_FUNC, { statement }, END ;
 scope_block              = SCOPE_BEGIN, { statement }, SCOPE_END ;
 ```
 
-The loop sequence before `WHILE` is its condition-producing sequence; the optional sequence after `WHILE` is its body. Omitting `WHILE` denotes the condition-free loop described in the control-flow specification. `FOR` iterator and variable inputs, and function identifiers and parameter metadata, are established by preceding instructions as described in their respective specifications; they are not grammar-level operands.
+When present, the non-empty statement sequence before `WHILE` produces the loop condition, and the optional sequence after it is the body. Omitting `WHILE` denotes the condition-free loop described in the control-flow specification. `FOR` iterator and variable inputs, and function identifiers and parameter metadata, are established by preceding instructions as described in their respective specifications; they are not grammar-level operands.
 
 ## Well-formedness rules
 
