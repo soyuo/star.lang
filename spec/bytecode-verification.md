@@ -12,11 +12,11 @@ The caller also supplies granted capabilities. Verification rejects a resource-s
 
 | Intrinsic | Required capabilities |
 |---|---|
-| `IMPORT`, `IMPORT_DYNAMIC` | `fs.read`, `env.read` |
+| `IMPORT`, `IMPORT_DYNAMIC` | Path-dependent: `fs.read` when a module file is read; `env.read` only when resolution consults `STAR_PATH`. The resolver checks these at the point of access. |
 | `SLEEP` | `clock` |
 | `NATIVE_LOAD`, `NATIVE_SYMBOL`, `NATIVE_CALL`, `NATIVE_CLOSE`, `NATIVE_CALLBACK`, `NATIVE_BUFFER` | `ffi` |
 
-The VM must check capabilities again when an operation executes. Passing verification never grants a capability.
+The VM must check capabilities again when an operation executes. Passing verification never grants a capability. Since the opcode alone cannot determine an import's resolution path, verification does not reject imports based on these path-dependent permissions; the module resolver enforces them before accessing the file or environment variable. The current reference VM has no module resolver and reports imports as unsupported without performing either access.
 
 ## Container and table validation
 

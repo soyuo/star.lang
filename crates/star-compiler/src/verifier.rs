@@ -1278,10 +1278,10 @@ fn check_intrinsic_capabilities(
     offset: usize,
 ) -> Result<(), VerificationError> {
     match operation {
-        IrOp::Import | IrOp::ImportDynamic => {
-            require_capability(policy, Capability::FsRead, offset)?;
-            require_capability(policy, Capability::EnvRead, offset)?;
-        }
+        // Import requirements depend on the actual resolution path. The module
+        // resolver checks fs.read on file access and env.read only if it reads
+        // STAR_PATH; an opcode-only pass cannot determine either requirement.
+        IrOp::Import | IrOp::ImportDynamic => {}
         IrOp::Sleep => require_capability(policy, Capability::Clock, offset)?,
         IrOp::NativeLoad
         | IrOp::NativeSymbol

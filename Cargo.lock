@@ -138,7 +138,9 @@ name = "star-interpreter"
 version = "0.1.0"
 dependencies = [
  "num-bigint",
+ "num-traits",
  "star-common",
+ "star-compiler",
  "star-lexer",
  "star-parser",
 ]

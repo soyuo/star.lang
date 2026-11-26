@@ -20,6 +20,9 @@ use crate::{
     BigInt,
 };
 
+mod bytecode_vm;
+pub use bytecode_vm::BytecodeVm;
+
 /// The reason execution stopped.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeErrorKind {
@@ -40,6 +43,8 @@ pub enum RuntimeErrorKind {
     IndexError(&'static str),
     /// Standard input or output failed or contained invalid UTF-8.
     IOError(String),
+    /// A resource-sensitive operation lacked a host-granted capability.
+    PermissionError(&'static str),
     /// Static semantic analysis rejected the program before execution.
     CompileError(String),
     /// The configured function call-depth limit was exceeded.
@@ -63,6 +68,12 @@ impl fmt::Display for RuntimeErrorKind {
             Self::ReferenceError(reason) => write!(formatter, "reference error: {reason}"),
             Self::IndexError(reason) => write!(formatter, "index error: {reason}"),
             Self::IOError(reason) => write!(formatter, "I/O error: {reason}"),
+            Self::PermissionError(capability) => {
+                write!(
+                    formatter,
+                    "permission error: missing {capability} capability"
+                )
+            }
             Self::CompileError(reason) => write!(formatter, "compile error: {reason}"),
             Self::StackOverflow => formatter.write_str("function call-depth limit exceeded"),
             Self::ExecutionLimit => formatter.write_str("execution step limit exceeded"),
