@@ -723,12 +723,16 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         span,
                     ));
                 };
-                if !image.functions.iter().any(|function| {
-                    function.module_index == module_index
-                        && function.id.as_ref() == Some(function_id)
-                }) {
+                if !function_id.is_negative()
+                    && !image.functions.iter().any(|function| {
+                        function.module_index == module_index
+                            && function.id.as_ref() == Some(function_id)
+                    })
+                {
                     return Err(self.runtime.error(
-                        RuntimeErrorKind::ReferenceError("method function does not exist"),
+                        RuntimeErrorKind::CompileError(
+                            "METHOD_DEF references an unknown function".into(),
+                        ),
                         span,
                     ));
                 }
@@ -829,6 +833,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             FieldSet => self.runtime.field_set(span)?,
             MethodCall => {
                 let method_id = self.runtime.pop_identifier(span)?;
+                if method_id.is_zero() {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::ReferenceError("constructor is not an instance method"),
+                        span,
+                    ));
+                }
                 let receiver = self.runtime.pop(span)?;
                 let Value::Object(object) = &receiver else {
                     return Err(self.runtime.type_error("Struct", &receiver, span));
@@ -910,15 +920,17 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     ));
                 }
                 let captures = std::mem::take(self.runtime.capture_vectors.last_mut().unwrap());
-                self.runtime
-                    .stack
-                    .push(Value::Closure(Rc::new(ClosureState {
-                        function: FunctionRef {
-                            module_index,
-                            id: body_id,
-                        },
-                        captures,
-                    })));
+                let function = FunctionRef {
+                    module_index,
+                    id: body_id,
+                };
+                if captures.is_empty() {
+                    self.runtime.stack.push(Value::Function(function));
+                } else {
+                    self.runtime
+                        .stack
+                        .push(Value::Closure(Rc::new(ClosureState { function, captures })));
+                }
             }
             CallValue => {
                 let callable = self.runtime.pop(span)?;

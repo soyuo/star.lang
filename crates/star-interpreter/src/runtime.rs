@@ -7,7 +7,7 @@ use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 use num_bigint::Sign;
-use num_traits::Zero;
+use num_traits::{Signed, Zero};
 use star_common::SourcePosition;
 use star_parser::Span;
 use star_parser::{
@@ -598,13 +598,16 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             ));
         };
         let captures = std::mem::take(capture_vector);
-        self.stack.push(Value::Closure(Rc::new(ClosureState {
-            function: FunctionRef {
-                module_index: 0,
-                id: body_id,
-            },
-            captures,
-        })));
+        let function = FunctionRef {
+            module_index: 0,
+            id: body_id,
+        };
+        if captures.is_empty() {
+            self.stack.push(Value::Function(function));
+        } else {
+            self.stack
+                .push(Value::Closure(Rc::new(ClosureState { function, captures })));
+        }
         Ok(())
     }
 
@@ -676,7 +679,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let struct_id = self.pop_identifier(span)?;
         let Some(descriptor) = self.structs.get_mut(&struct_id) else {
             return Err(self.error(
-                RuntimeErrorKind::ReferenceError("struct does not exist"),
+                RuntimeErrorKind::CompileError("METHOD_DEF references an unknown struct".into()),
                 span,
             ));
         };
@@ -718,14 +721,14 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let struct_id = self.pop_identifier(span)?;
         let Some(interface) = self.interfaces.get(&interface_id) else {
             return Err(self.error(
-                RuntimeErrorKind::ReferenceError("interface does not exist"),
+                RuntimeErrorKind::CompileError("IMPLEMENT references an unknown interface".into()),
                 span,
             ));
         };
         let required_methods = interface.method_ids.clone();
         let Some(descriptor) = self.structs.get_mut(&struct_id) else {
             return Err(self.error(
-                RuntimeErrorKind::ReferenceError("struct does not exist"),
+                RuntimeErrorKind::CompileError("IMPLEMENT references an unknown struct".into()),
                 span,
             ));
         };
@@ -828,6 +831,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn method_call(&mut self, span: Span) -> Result<(), RuntimeError> {
         let method_id = self.pop_identifier(span)?;
+        if method_id.is_zero() {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("constructor is not an instance method"),
+                span,
+            ));
+        }
         let receiver = self.pop(span)?;
         let Value::Object(object) = &receiver else {
             return Err(self.type_error("Struct", &receiver, span));
@@ -983,7 +992,19 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x71) => self.object_new(span),
             InstructionOpcode::Extended(0x72) => self.field_get(span),
             InstructionOpcode::Extended(0x73) => self.field_set(span),
-            InstructionOpcode::Extended(0x74) => self.define_method(span),
+            InstructionOpcode::Extended(0x74) => {
+                if let Some(Value::Int(function_id)) = self.stack.last() {
+                    if !function_id.is_negative() && !self.functions.contains_key(function_id) {
+                        return Err(self.error(
+                            RuntimeErrorKind::CompileError(
+                                "METHOD_DEF references an unknown function".into(),
+                            ),
+                            span,
+                        ));
+                    }
+                }
+                self.define_method(span)
+            }
             InstructionOpcode::Extended(0x75) => self.method_call(span),
             InstructionOpcode::Extended(0x76) => self.define_interface(span),
             InstructionOpcode::Extended(0x77) => self.implement_interface(span),
