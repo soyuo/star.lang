@@ -9,5 +9,8 @@ num-bigint = "0.5"
 star-common.workspace = true
 star-parser.workspace = true
 
+[dev-dependencies]
+star-lexer.workspace = true
+
 [lib]
 path = "src/lib.rs"

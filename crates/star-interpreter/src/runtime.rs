@@ -1,14 +1,24 @@
 //! Reference execution for literals, primitive operations, variables, and I/O.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, Write};
+use std::rc::Rc;
 
 use num_bigint::Sign;
+use star_common::SourcePosition;
 use star_parser::Span;
-use star_parser::{DataLiteral, Instruction, InstructionOpcode, Program, ScopeBlock, Statement};
+use star_parser::{
+    DataLiteral, ForBlock, FunctionBlock, FunctionKind, IfBlock, Instruction, InstructionOpcode,
+    LoopBlock, Program, ScopeBlock, Statement,
+};
 
-use crate::{value::Value, BigInt};
+use crate::{
+    semantic::{self, ResolvedFunction},
+    value::{IteratorState, Value},
+    BigInt,
+};
 
 /// The reason execution stopped.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,8 +36,16 @@ pub enum RuntimeErrorKind {
     DivisionByZero,
     /// A variable operation could not resolve or mutate its binding.
     ReferenceError(&'static str),
+    /// An indexed collection access used an invalid position.
+    IndexError(&'static str),
     /// Standard input or output failed or contained invalid UTF-8.
     IOError(String),
+    /// Static semantic analysis rejected the program before execution.
+    CompileError(String),
+    /// The configured function call-depth limit was exceeded.
+    StackOverflow,
+    /// The configured statement execution limit was exceeded.
+    ExecutionLimit,
     /// The instruction is valid source but not implemented by this execution slice.
     UnsupportedInstruction(InstructionOpcode),
     /// The parsed construct belongs to a later reference-execution slice.
@@ -43,7 +61,11 @@ impl fmt::Display for RuntimeErrorKind {
             }
             Self::DivisionByZero => formatter.write_str("division by zero"),
             Self::ReferenceError(reason) => write!(formatter, "reference error: {reason}"),
+            Self::IndexError(reason) => write!(formatter, "index error: {reason}"),
             Self::IOError(reason) => write!(formatter, "I/O error: {reason}"),
+            Self::CompileError(reason) => write!(formatter, "compile error: {reason}"),
+            Self::StackOverflow => formatter.write_str("function call-depth limit exceeded"),
+            Self::ExecutionLimit => formatter.write_str("execution step limit exceeded"),
             Self::UnsupportedInstruction(opcode) => {
                 write!(formatter, "unsupported instruction: {opcode:?}")
             }
@@ -88,6 +110,21 @@ pub struct Interpreter<R: BufRead, W: Write> {
     output: W,
     stack: Vec<Value>,
     scopes: Vec<HashMap<BigInt, Binding>>,
+    scope_floors: Vec<usize>,
+    frame_stack_bases: Vec<usize>,
+    functions: HashMap<BigInt, ResolvedFunction>,
+    call_depth: usize,
+    call_depth_limit: usize,
+    executed_steps: u64,
+    execution_limit: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ControlFlow {
+    Normal,
+    Break,
+    Continue,
+    Return(Value),
 }
 
 impl<R: BufRead, W: Write> Interpreter<R, W> {
@@ -98,12 +135,66 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             output,
             stack: Vec::new(),
             scopes: vec![HashMap::new()],
+            scope_floors: vec![0],
+            frame_stack_bases: Vec::new(),
+            functions: HashMap::new(),
+            call_depth: 0,
+            call_depth_limit: 512,
+            executed_steps: 0,
+            execution_limit: 10_000_000,
         }
+    }
+
+    /// Sets the maximum number of nested direct calls accepted by this instance.
+    pub fn with_call_depth_limit(mut self, limit: usize) -> Self {
+        self.call_depth_limit = limit.max(1);
+        self
+    }
+
+    /// Sets the maximum number of executed statements accepted by this instance.
+    pub fn with_execution_limit(mut self, limit: u64) -> Self {
+        self.execution_limit = limit.max(1);
+        self
     }
 
     /// Executes supported statements in source order.
     pub fn execute(&mut self, program: &Program) -> Result<(), RuntimeError> {
-        self.execute_statements(&program.statements)
+        self.executed_steps = 0;
+        self.functions = semantic::resolve_functions(program)
+            .map_err(|error| RuntimeError {
+                kind: RuntimeErrorKind::CompileError(error.kind.to_string()),
+                span: error.span,
+            })?
+            .into_iter()
+            .map(|function| (function.id.clone(), function))
+            .collect();
+        match self.execute_statements(&program.statements)? {
+            ControlFlow::Normal => Ok(()),
+            ControlFlow::Break => Err(self.error(
+                RuntimeErrorKind::CompileError("BREAK outside a loop".to_owned()),
+                program
+                    .statements
+                    .last()
+                    .map(statement_span)
+                    .unwrap_or_else(empty_span),
+            )),
+            ControlFlow::Continue => Err(self.error(
+                RuntimeErrorKind::CompileError("CONTINUE outside a loop".to_owned()),
+                program
+                    .statements
+                    .last()
+                    .map(statement_span)
+                    .unwrap_or_else(empty_span),
+            )),
+            ControlFlow::Return(_) => Err(self.error(
+                RuntimeErrorKind::CompileError("RETURN outside a function".to_owned()),
+                program
+                    .statements
+                    .last()
+                    .map(statement_span)
+                    .unwrap_or_else(empty_span),
+            )),
+        }
     }
 
     /// Returns the current operand stack, from bottom to top.
@@ -121,46 +212,315 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         (self.input, self.output)
     }
 
-    fn execute_statements(&mut self, statements: &[Statement]) -> Result<(), RuntimeError> {
+    fn execute_statements(
+        &mut self,
+        statements: &[Statement],
+    ) -> Result<ControlFlow, RuntimeError> {
         for statement in statements {
+            self.advance_step(statement_span(statement))?;
             match statement {
-                Statement::Instruction(instruction) => self.execute_instruction(instruction)?,
+                Statement::Instruction(instruction) => match instruction.opcode {
+                    InstructionOpcode::Extended(0x35) => return Ok(ControlFlow::Break),
+                    InstructionOpcode::Extended(0x36) => return Ok(ControlFlow::Continue),
+                    InstructionOpcode::Extended(0x42) => {
+                        let frame_base =
+                            self.frame_stack_bases.last().copied().ok_or_else(|| {
+                                self.error(
+                                    RuntimeErrorKind::CompileError(
+                                        "RETURN outside a function".to_owned(),
+                                    ),
+                                    instruction.span,
+                                )
+                            })?;
+                        let value = if self.stack.len() > frame_base {
+                            self.pop(instruction.span)?
+                        } else {
+                            Value::Null
+                        };
+                        return Ok(ControlFlow::Return(value));
+                    }
+                    _ => self.execute_instruction(instruction)?,
+                },
                 Statement::DataLiteral(literal) => self.push_literal(literal),
-                Statement::Scope(scope) => self.execute_scope(scope)?,
-                Statement::If(_) => {
-                    return Err(self.error(
-                        RuntimeErrorKind::Unsupported("IF"),
-                        statement_span(statement),
-                    ))
+                Statement::Scope(scope) => {
+                    let flow = self.execute_scope(scope)?;
+                    if flow != ControlFlow::Normal {
+                        return Ok(flow);
+                    }
                 }
-                Statement::Loop(_) => {
-                    return Err(self.error(
-                        RuntimeErrorKind::Unsupported("LOOP"),
-                        statement_span(statement),
-                    ))
+                Statement::If(block) => {
+                    let flow = self.execute_if(block)?;
+                    if flow != ControlFlow::Normal {
+                        return Ok(flow);
+                    }
                 }
-                Statement::For(_) => {
-                    return Err(self.error(
-                        RuntimeErrorKind::Unsupported("FOR"),
-                        statement_span(statement),
-                    ))
+                Statement::Loop(block) => {
+                    let flow = self.execute_loop(block)?;
+                    if flow != ControlFlow::Normal {
+                        return Ok(flow);
+                    }
                 }
-                Statement::Function(_) => {
-                    return Err(self.error(
-                        RuntimeErrorKind::Unsupported("function definition"),
-                        statement_span(statement),
-                    ))
+                Statement::For(block) => {
+                    let flow = self.execute_for(block)?;
+                    if flow != ControlFlow::Normal {
+                        return Ok(flow);
+                    }
                 }
+                Statement::Function(block) => self.consume_function_header(block)?,
             }
         }
-        Ok(())
+        Ok(ControlFlow::Normal)
     }
 
-    fn execute_scope(&mut self, scope: &ScopeBlock) -> Result<(), RuntimeError> {
+    fn execute_scope(&mut self, scope: &ScopeBlock) -> Result<ControlFlow, RuntimeError> {
         self.scopes.push(HashMap::new());
         let result = self.execute_statements(&scope.body);
         self.scopes.pop();
         result
+    }
+
+    fn execute_if(&mut self, block: &IfBlock) -> Result<ControlFlow, RuntimeError> {
+        match self.pop(block.span)? {
+            Value::Bool(true) => self.execute_statements(&block.then_body),
+            Value::Bool(false) => match &block.else_body {
+                Some(body) => self.execute_statements(body),
+                None => Ok(ControlFlow::Normal),
+            },
+            other => Err(self.type_error("Bool", &other, block.span)),
+        }
+    }
+
+    fn execute_loop(&mut self, block: &LoopBlock) -> Result<ControlFlow, RuntimeError> {
+        loop {
+            self.advance_step(block.span)?;
+            if let Some(condition) = &block.condition {
+                match self.execute_statements(condition)? {
+                    ControlFlow::Normal => {}
+                    ControlFlow::Break => return Ok(ControlFlow::Normal),
+                    ControlFlow::Continue => continue,
+                    flow @ ControlFlow::Return(_) => return Ok(flow),
+                }
+                match self.pop(block.span)? {
+                    Value::Bool(false) => return Ok(ControlFlow::Normal),
+                    Value::Bool(true) => {}
+                    other => return Err(self.type_error("Bool", &other, block.span)),
+                }
+            }
+            match self.execute_statements(&block.body)? {
+                ControlFlow::Normal | ControlFlow::Continue => {}
+                ControlFlow::Break => return Ok(ControlFlow::Normal),
+                flow @ ControlFlow::Return(_) => return Ok(flow),
+            }
+        }
+    }
+
+    fn execute_for(&mut self, block: &ForBlock) -> Result<ControlFlow, RuntimeError> {
+        let variable_id = self.pop_identifier(block.span)?;
+        let iterator = match self.pop(block.span)? {
+            Value::Iterator(iterator) => iterator,
+            other => return Err(self.type_error("Iterator", &other, block.span)),
+        };
+        self.scopes.push(HashMap::from([(
+            variable_id.clone(),
+            Binding {
+                value: Value::Null,
+                mutable: true,
+            },
+        )]));
+
+        let result = (|| loop {
+            self.advance_step(block.span)?;
+            let next = {
+                let mut iterator = iterator.borrow_mut();
+                let value = iterator.values.get(iterator.next_index).cloned();
+                if value.is_some() {
+                    iterator.next_index += 1;
+                }
+                value
+            };
+            let Some(value) = next else {
+                return Ok(ControlFlow::Normal);
+            };
+            self.scopes
+                .last_mut()
+                .expect("FOR scope exists")
+                .get_mut(&variable_id)
+                .expect("FOR binding exists")
+                .value = value;
+            match self.execute_statements(&block.body)? {
+                ControlFlow::Normal | ControlFlow::Continue => {}
+                ControlFlow::Break => return Ok(ControlFlow::Normal),
+                flow @ ControlFlow::Return(_) => return Ok(flow),
+            }
+        })();
+        self.scopes.pop();
+        result
+    }
+
+    fn consume_function_header(&mut self, block: &FunctionBlock) -> Result<(), RuntimeError> {
+        let function = self
+            .functions
+            .values()
+            .find(|function| function.span == block.span)
+            .cloned()
+            .ok_or_else(|| {
+                self.error(
+                    RuntimeErrorKind::CompileError(
+                        "function header was not resolved by semantic analysis".to_owned(),
+                    ),
+                    block.span,
+                )
+            })?;
+        let rest_code = self.pop_identifier(block.span)?;
+        let parameter_count = self.pop_identifier(block.span)?;
+        if parameter_count != BigInt::from(function.parameter_ids.len())
+            || rest_code
+                != if function.variadic {
+                    parameter_count.clone()
+                } else {
+                    BigInt::from(0)
+                }
+            || function.kind != block.kind
+        {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("runtime function header mismatch".to_owned()),
+                block.span,
+            ));
+        }
+        for expected in function.parameter_ids.iter().rev() {
+            if self.pop_identifier(block.span)? != *expected {
+                return Err(self.error(
+                    RuntimeErrorKind::CompileError("runtime parameter header mismatch".to_owned()),
+                    block.span,
+                ));
+            }
+        }
+        if self.pop_identifier(block.span)? != function.id {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("runtime function ID mismatch".to_owned()),
+                block.span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn call_function(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let function_id = self.pop_identifier(span)?;
+        let argument_count = self.pop_identifier(span)?;
+        let argument_count = argument_count
+            .to_string()
+            .parse::<usize>()
+            .ok()
+            .ok_or_else(|| {
+                self.error(
+                    RuntimeErrorKind::TypeError {
+                        expected: "representable nonnegative argument count",
+                        found: "Int",
+                    },
+                    span,
+                )
+            })?;
+        if argument_count > self.stack.len() {
+            return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
+        }
+        let mut arguments = Vec::with_capacity(argument_count);
+        for _ in 0..argument_count {
+            arguments.push(self.pop(span)?);
+        }
+        arguments.reverse();
+        let function = self.functions.get(&function_id).cloned().ok_or_else(|| {
+            self.error(
+                RuntimeErrorKind::ReferenceError("function does not exist"),
+                span,
+            )
+        })?;
+        if function.kind == FunctionKind::Asynchronous {
+            return Err(self.error(
+                RuntimeErrorKind::Unsupported("asynchronous function scheduling"),
+                span,
+            ));
+        }
+        let parameter_count = function.parameter_ids.len();
+        let arity_matches = if function.variadic {
+            argument_count >= parameter_count.saturating_sub(1)
+        } else {
+            argument_count == parameter_count
+        };
+        if !arity_matches {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "argument count matching function signature",
+                    found: "wrong argument count",
+                },
+                span,
+            ));
+        }
+        if self.call_depth >= self.call_depth_limit {
+            return Err(self.error(RuntimeErrorKind::StackOverflow, span));
+        }
+
+        let stack_base = self.stack.len();
+        let scope_base = self.scopes.len();
+        let mut local_bindings = HashMap::new();
+        if function.variadic {
+            let fixed_count = parameter_count.saturating_sub(1);
+            for (id, value) in function
+                .parameter_ids
+                .iter()
+                .take(fixed_count)
+                .zip(arguments.iter().take(fixed_count))
+            {
+                local_bindings.insert(
+                    id.clone(),
+                    Binding {
+                        value: value.clone(),
+                        mutable: true,
+                    },
+                );
+            }
+            let rest = arguments.into_iter().skip(fixed_count).collect();
+            local_bindings.insert(
+                function.parameter_ids[fixed_count].clone(),
+                Binding {
+                    value: Value::Array(Rc::new(RefCell::new(rest))),
+                    mutable: true,
+                },
+            );
+        } else {
+            for (id, value) in function.parameter_ids.iter().zip(arguments) {
+                local_bindings.insert(
+                    id.clone(),
+                    Binding {
+                        value,
+                        mutable: true,
+                    },
+                );
+            }
+        }
+        self.scopes.push(local_bindings);
+        self.scope_floors.push(scope_base);
+        self.frame_stack_bases.push(stack_base);
+        self.call_depth += 1;
+        let result = self.execute_statements(&function.body);
+        self.call_depth -= 1;
+        self.frame_stack_bases.pop();
+        self.scope_floors.pop();
+        self.scopes.truncate(scope_base);
+        self.stack.truncate(stack_base);
+        let value = match result? {
+            ControlFlow::Normal => Value::Null,
+            ControlFlow::Return(value) => value,
+            ControlFlow::Break | ControlFlow::Continue => {
+                return Err(self.error(
+                    RuntimeErrorKind::CompileError(
+                        "loop control cannot leave a function frame".to_owned(),
+                    ),
+                    function.span,
+                ));
+            }
+        };
+        self.stack.push(value);
+        Ok(())
     }
 
     fn execute_instruction(&mut self, instruction: &Instruction) -> Result<(), RuntimeError> {
@@ -214,6 +574,26 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 self.stack.push(Value::Bool(false));
                 Ok(())
             }
+            InstructionOpcode::Extended(0x10) => self.to_int(span),
+            InstructionOpcode::Extended(0x14 | 0x16) => self.utf8_encode(span),
+            InstructionOpcode::Extended(0x15) => self.utf8_decode(span),
+            InstructionOpcode::Extended(0x13) => {
+                let value = self.pop(span)?;
+                self.stack.push(Value::String(value.to_string()));
+                Ok(())
+            }
+            InstructionOpcode::Extended(0x1D) => self.to_char(span),
+            InstructionOpcode::Extended(0x1E) => self.to_byte(span),
+            InstructionOpcode::Extended(0x23) => self.less_than(span),
+            InstructionOpcode::Extended(0x41) => self.call_function(span),
+            InstructionOpcode::Extended(0x60) => self.array_new(span),
+            InstructionOpcode::Extended(0x63) => self.get_item(span),
+            InstructionOpcode::Extended(0x64) => self.set_item(span),
+            InstructionOpcode::Extended(0x65) => self.append(span),
+            InstructionOpcode::Extended(0x67) => self.length(span),
+            InstructionOpcode::Extended(0x69) => self.iter(span),
+            InstructionOpcode::Extended(0x6A) => self.next(span),
+            InstructionOpcode::Extended(0x6D) => self.concat(span),
             InstructionOpcode::Extended(0x50) => self.declare(span, true),
             InstructionOpcode::Extended(0x51) => self.declare(span, false),
             InstructionOpcode::Extended(0x52) => self.delete(span),
@@ -224,6 +604,281 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             )),
         }
+    }
+
+    fn to_int(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let integer = match value {
+            Value::Int(value) => value,
+            Value::Byte(value) => BigInt::from(value),
+            Value::Bool(value) => BigInt::from(u8::from(value)),
+            Value::Float(value) if value.is_finite() => {
+                format!("{:.0}", value.trunc()).parse().map_err(|_| {
+                    self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "finite value representable as Int",
+                            found: "Float",
+                        },
+                        span,
+                    )
+                })?
+            }
+            Value::String(value) => value.parse().map_err(|_| {
+                self.error(
+                    RuntimeErrorKind::TypeError {
+                        expected: "ASCII decimal String",
+                        found: "String",
+                    },
+                    span,
+                )
+            })?,
+            other => {
+                return Err(self.type_error(
+                    "Int, Byte, finite Float, Bool, or decimal String",
+                    &other,
+                    span,
+                ))
+            }
+        };
+        self.stack.push(Value::Int(integer));
+        Ok(())
+    }
+
+    fn to_char(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let Value::Int(codepoint) = value else {
+            return Err(self.type_error("Int Unicode scalar value", &value, span));
+        };
+        let codepoint = codepoint.to_string().parse::<u32>().ok();
+        let Some(character) = codepoint.and_then(char::from_u32) else {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "valid Unicode scalar value",
+                    found: "Int",
+                },
+                span,
+            ));
+        };
+        self.stack.push(Value::Char(character));
+        Ok(())
+    }
+
+    fn to_byte(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let Value::Int(integer) = value else {
+            return Err(self.type_error("Int in 0..=255", &value, span));
+        };
+        let Some(byte) = integer.to_string().parse::<u8>().ok() else {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "Int in 0..=255",
+                    found: "Int",
+                },
+                span,
+            ));
+        };
+        self.stack.push(Value::Byte(byte));
+        Ok(())
+    }
+
+    fn utf8_encode(&mut self, span: Span) -> Result<(), RuntimeError> {
+        match self.pop(span)? {
+            Value::String(value) => {
+                self.stack.push(Value::Bytes(value.into_bytes()));
+                Ok(())
+            }
+            other => Err(self.type_error("String", &other, span)),
+        }
+    }
+
+    fn utf8_decode(&mut self, span: Span) -> Result<(), RuntimeError> {
+        match self.pop(span)? {
+            Value::Bytes(value) => match String::from_utf8(value) {
+                Ok(value) => {
+                    self.stack.push(Value::String(value));
+                    Ok(())
+                }
+                Err(_) => Err(self.error(
+                    RuntimeErrorKind::TypeError {
+                        expected: "valid UTF-8 Bytes",
+                        found: "Bytes",
+                    },
+                    span,
+                )),
+            },
+            other => Err(self.type_error("Bytes", &other, span)),
+        }
+    }
+
+    fn less_than(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let right = self.pop(span)?;
+        let left = self.pop(span)?;
+        let result = match (&left, &right) {
+            (Value::Int(left), Value::Int(right)) => left < right,
+            (Value::Int(left), Value::Float(right)) => {
+                left.to_string().parse::<f64>().unwrap_or(f64::INFINITY) < *right
+            }
+            (Value::Float(left), Value::Int(right)) => {
+                *left < right.to_string().parse::<f64>().unwrap_or(f64::INFINITY)
+            }
+            (Value::Float(left), Value::Float(right)) => left < right,
+            _ => return Err(self.type_error("numeric operands", &left, span)),
+        };
+        self.stack.push(Value::Bool(result));
+        Ok(())
+    }
+
+    fn array_new(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let count = self.pop_identifier(span)?;
+        let Some(count) = count.to_string().parse::<usize>().ok() else {
+            return Err(self.type_error(
+                "representable nonnegative Array length",
+                &Value::Int(count),
+                span,
+            ));
+        };
+        if count > self.stack.len() {
+            return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
+        }
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push(self.pop(span)?);
+        }
+        values.reverse();
+        self.stack.push(Value::Array(Rc::new(RefCell::new(values))));
+        Ok(())
+    }
+
+    fn get_item(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let key = self.pop_identifier(span)?;
+        let Some(index) = key.to_string().parse::<usize>().ok() else {
+            return Err(self.error(RuntimeErrorKind::IndexError("index is too large"), span));
+        };
+        let collection = self.pop(span)?;
+        let item = match collection {
+            Value::Array(values) => values.borrow().get(index).cloned(),
+            Value::String(value) => value.chars().nth(index).map(Value::Char),
+            Value::Bytes(value) => value.get(index).copied().map(Value::Byte),
+            other => return Err(self.type_error("Array, String, or Bytes", &other, span)),
+        }
+        .ok_or_else(|| self.error(RuntimeErrorKind::IndexError("index is out of bounds"), span))?;
+        self.stack.push(item);
+        Ok(())
+    }
+
+    fn set_item(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let key = self.pop_identifier(span)?;
+        let Some(index) = key.to_string().parse::<usize>().ok() else {
+            return Err(self.error(RuntimeErrorKind::IndexError("index is too large"), span));
+        };
+        match self.pop(span)? {
+            Value::Array(values) => {
+                let mut values = values.borrow_mut();
+                let Some(slot) = values.get_mut(index) else {
+                    return Err(
+                        self.error(RuntimeErrorKind::IndexError("index is out of bounds"), span)
+                    );
+                };
+                *slot = value;
+                Ok(())
+            }
+            other => Err(self.type_error("mutable Array", &other, span)),
+        }
+    }
+
+    fn append(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        match self.pop(span)? {
+            Value::Array(values) => {
+                values.borrow_mut().push(value);
+                Ok(())
+            }
+            other => Err(self.type_error("mutable Array", &other, span)),
+        }
+    }
+
+    fn length(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let count = match value {
+            Value::Array(values) => values.borrow().len(),
+            Value::String(value) => value.chars().count(),
+            Value::Bytes(value) => value.len(),
+            other => return Err(self.type_error("Array, String, or Bytes", &other, span)),
+        };
+        self.stack.push(Value::Int(BigInt::from(count)));
+        Ok(())
+    }
+
+    fn iter(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let values = match value {
+            Value::Array(values) => values.borrow().clone(),
+            Value::String(value) => value.chars().map(Value::Char).collect(),
+            Value::Bytes(value) => value.into_iter().map(Value::Byte).collect(),
+            other => return Err(self.type_error("Array, String, or Bytes", &other, span)),
+        };
+        self.stack
+            .push(Value::Iterator(Rc::new(RefCell::new(IteratorState {
+                values,
+                next_index: 0,
+            }))));
+        Ok(())
+    }
+
+    fn next(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let iterator = match self.pop(span)? {
+            Value::Iterator(iterator) => iterator,
+            other => return Err(self.type_error("Iterator", &other, span)),
+        };
+        let value = {
+            let mut iterator = iterator.borrow_mut();
+            let value = iterator.values.get(iterator.next_index).cloned();
+            if value.is_some() {
+                iterator.next_index += 1;
+            }
+            value
+        };
+        self.stack.push(value.clone().unwrap_or(Value::Null));
+        self.stack.push(Value::Bool(value.is_some()));
+        Ok(())
+    }
+
+    fn advance_step(&mut self, span: Span) -> Result<(), RuntimeError> {
+        self.executed_steps = self.executed_steps.saturating_add(1);
+        if self.executed_steps > self.execution_limit {
+            return Err(self.error(RuntimeErrorKind::ExecutionLimit, span));
+        }
+        Ok(())
+    }
+
+    fn concat(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let right = self.pop(span)?;
+        let left = self.pop(span)?;
+        let result = match (left, right) {
+            (Value::String(mut left), Value::String(right)) => {
+                left.push_str(&right);
+                Value::String(left)
+            }
+            (Value::Bytes(mut left), Value::Bytes(right)) => {
+                left.extend(right);
+                Value::Bytes(left)
+            }
+            (Value::Array(left), Value::Array(right)) => {
+                let mut values = left.borrow().clone();
+                values.extend(right.borrow().iter().cloned());
+                Value::Array(Rc::new(RefCell::new(values)))
+            }
+            (left, _) => {
+                return Err(self.type_error(
+                    "matching String, Bytes, or Array values",
+                    &left,
+                    span,
+                ));
+            }
+        };
+        self.stack.push(result);
+        Ok(())
     }
 
     fn arithmetic(&mut self, opcode: u8, span: Span) -> Result<(), RuntimeError> {
@@ -318,12 +973,19 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     fn store(&mut self, span: Span) -> Result<(), RuntimeError> {
         let id = self.pop_identifier(span)?;
         let value = self.pop(span)?;
-        if let Some(binding) = self
+        let floor = *self.scope_floors.last().unwrap_or(&0);
+        let index = self
             .scopes
-            .iter_mut()
+            .iter()
+            .enumerate()
+            .skip(floor)
             .rev()
-            .find_map(|scope| scope.get_mut(&id))
-        {
+            .find_map(|(index, scope)| scope.contains_key(&id).then_some(index))
+            .or_else(|| (floor > 0 && self.scopes[0].contains_key(&id)).then_some(0));
+        if let Some(index) = index {
+            let binding = self.scopes[index]
+                .get_mut(&id)
+                .expect("binding index was found above");
             if !binding.mutable {
                 return Err(self.error(
                     RuntimeErrorKind::ReferenceError("cannot update an immutable binding"),
@@ -369,10 +1031,17 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn load(&mut self, span: Span, global: bool) -> Result<(), RuntimeError> {
         let id = self.pop_identifier(span)?;
+        let floor = *self.scope_floors.last().unwrap_or(&0);
         let binding = if global {
             self.scopes.first().and_then(|scope| scope.get(&id))
         } else {
-            self.scopes.iter().rev().find_map(|scope| scope.get(&id))
+            self.scopes
+                .iter()
+                .enumerate()
+                .skip(floor)
+                .rev()
+                .find_map(|(_, scope)| scope.get(&id))
+                .or_else(|| (floor > 0).then(|| self.scopes[0].get(&id)).flatten())
         };
         let Some(binding) = binding else {
             return Err(self.error(
@@ -513,6 +1182,18 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::For(block) => block.span,
         Statement::Function(block) => block.span,
         Statement::Scope(block) => block.span,
+    }
+}
+
+fn empty_span() -> Span {
+    let position = SourcePosition {
+        byte_offset: 0,
+        line: 1,
+        column: 1,
+    };
+    Span {
+        start: position,
+        end: position,
     }
 }
 
