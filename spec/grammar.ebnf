@@ -2,7 +2,7 @@
 
 Status: draft
 
-This document defines token syntax and the nested block structure of Star source programs. `spec/source-format.md` defines UTF-8 validation and character handling. `spec/opcodes.toml` is the authority for which instruction opcodes are assigned.
+This document defines token syntax and the nested block structure of Star source programs. Control-flow behavior and logical branch-target rules are in `spec/control-flow.md`. `spec/source-format.md` defines UTF-8 validation and character handling. `spec/opcodes.toml` is the authority for which instruction opcodes are assigned.
 
 ## Lexical conventions
 
@@ -57,7 +57,7 @@ The names in the grammar below are aliases for extended instructions with these 
 |---|---:|---|
 | `IF` | `0x30` | Begin conditional |
 | `ELSE` | `0x31` | Separate conditional branches |
-| `END` | `0x32` | Close an `IF`, `LOOP`, `FOR`, or function block |
+| `END` | `0x32` | Close an `IF`, `LOOP`, `FOR`, `FUNC`, or `ASYNC_FUNC` block |
 | `LOOP` | `0x33` | Begin loop |
 | `WHILE` | `0x34` | Separate loop condition from loop body |
 | `FOR` | `0x37` | Begin iterator loop |

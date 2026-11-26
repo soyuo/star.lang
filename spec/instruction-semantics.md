@@ -2,7 +2,7 @@
 
 Status: draft
 
-This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`; identifier, scope, module, and import rules are in `spec/identifier-module-semantics.md`. This document does not define `.starc` bytecode.
+This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`; identifier, scope, module, and import rules are in `spec/identifier-module-semantics.md`; block matching and logical branch-target rules are in `spec/control-flow.md`. This document does not define `.starc` bytecode.
 
 ## Notation and common rules
 
@@ -75,11 +75,11 @@ This document specifies operands, stack effects, side effects, and additional fa
 |---|---|---|---|---|
 | `control.if` | `IF` | `condition: Bool -> -` | Starts a conditional block; the compiler emits a branch and consumes the condition once. | `TypeError` for a non-Boolean condition at runtime; `CompileError` for malformed nesting or a statically proven violation. |
 | `control.else` | `ELSE` | `- -> -` | Starts the alternate branch of the matching `IF`. | `CompileError` without one unmatched `IF` or when duplicated. |
-| `control.end` | `END` | `- -> -` | Closes the innermost `IF`, loop, or function block. | `CompileError` when no compatible block is open. |
+| `control.end` | `END` | `- -> -` | Closes the innermost `IF`, `LOOP`, `FOR`, `FUNC`, or `ASYNC_FUNC` block. It does not close a lexical scope. | `CompileError` when no compatible block is open. |
 | `control.loop` | `LOOP` | `- -> -` | Starts a loop; with `WHILE`, condition code runs before each iteration; without it, the loop repeats until control transfer. | `CompileError` for malformed nesting. |
 | `control.while` | `WHILE` | `condition: Bool -> -` | Ends the loop condition sequence; false exits, true enters the body. | `CompileError` outside a matching `LOOP`; `TypeError` for a non-Boolean condition. |
-| `control.break` | `BREAK` | `- -> -` | Transfers control to the end of the innermost loop. | `CompileError` outside a loop. |
-| `control.continue` | `CONTINUE` | `- -> -` | Transfers control to the next condition check or iterator step of the innermost loop. | `CompileError` outside a loop. |
+| `control.break` | `BREAK` | `- -> -` | Transfers control to the end of the innermost loop in the current function. | `CompileError` outside a loop in the current function. |
+| `control.continue` | `CONTINUE` | `- -> -` | Transfers control to the next condition check or iterator step of the innermost loop in the current function. | `CompileError` outside a loop in the current function. |
 | `control.for` | `FOR` | `iterator, variable_id -> loop body` | Iterates the iterator and binds each yielded value to `variable_id` in the loop scope; the compiler emits iteration and exit control flow. | `CompileError` for malformed nesting; `TypeError` for a non-iterator; `ReferenceError` for an invalid binding. |
 
 ## Functions and calls
