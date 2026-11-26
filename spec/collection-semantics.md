@@ -14,11 +14,13 @@ This document defines the runtime behavior shared by the source interpreter and 
 - `NEXT` advances once and returns the next value with `true`; when exhausted, it returns `Null, false` and stays exhausted.
 - `TO_STRING`/`PRINT` use the display rules in `spec/type-semantics.md`: Maps and Sets display only their lengths, and recursive Array/Tuple display marks a value already on the active path as `<cycle>`.
 
+`EQ` compares Arrays and Tuples recursively by element order, Maps by equal key/value associations independent of insertion order, and Sets by equal members independent of insertion order. If the same pair of collection objects is encountered again on the active equality path, that recursive pair compares equal, which makes cyclic structures terminate; scalar values still use their ordinary type-specific equality.
+
 ## Map keys and Set members
 
 Maps and sets use the same immutable key equality and hashing rules. Valid keys are `Null`, `Bool`, `Int`, non-NaN `Float`, `String`, `Char`, `Byte`, `Bytes`, and tuples whose elements are all valid keys. `Array`, `Map`, `Set`, `Iterator`, and tuples containing any invalid key type are rejected with `TypeError`.
 
-Equality is type-specific: for example, `Int(1)` and `Float(1.0)` are different keys. Floats use numeric equality; positive and negative zero are the same key, infinities are valid, and NaN is rejected because it is not equal to itself. Tuples compare recursively by element value. Strings compare by their Unicode scalar sequence and Bytes by their byte sequence. Map and Set equality is independent of insertion order.
+Key equality is type-specific: for example, `Int(1)` and `Float(1.0)` are different keys. Floats use numeric equality; positive and negative zero are the same key, infinities are valid, and NaN is rejected because it is not equal to itself. Tuples compare recursively by element value. Strings compare by their Unicode scalar sequence and Bytes by their byte sequence. Map and Set equality is independent of insertion order.
 
 `MAP_NEW` and `SET_NEW` preserve first insertion order and the original key/member value for iteration. Later duplicate map keys replace the prior value without changing the key's position; duplicate set members are ignored. A non-hashable map key or set member raises `TypeError`.
 

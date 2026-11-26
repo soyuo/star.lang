@@ -7,7 +7,7 @@ use std::{cell::RefCell, rc::Rc};
 use crate::BigInt;
 
 /// A Star value supported by the current reference-execution slice.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     /// Signed arbitrary-precision integer.
     Int(BigInt),
@@ -46,7 +46,8 @@ pub struct MapState {
 
 impl PartialEq for MapState {
     fn eq(&self, other: &Self) -> bool {
-        self.entries == other.entries
+        let mut active = HashSet::new();
+        map_entries_equal(&self.entries, &other.entries, &mut active)
     }
 }
 
@@ -60,6 +61,12 @@ pub struct SetState {
 impl PartialEq for SetState {
     fn eq(&self, other: &Self) -> bool {
         self.members == other.members
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        values_equal(self, other, &mut HashSet::new())
     }
 }
 
@@ -102,10 +109,106 @@ impl RuntimeKey {
 }
 
 /// Internal state carried by a runtime iterator value.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct IteratorState {
     pub(crate) values: Vec<Value>,
     pub(crate) next_index: usize,
+}
+
+impl PartialEq for IteratorState {
+    fn eq(&self, other: &Self) -> bool {
+        self.next_index == other.next_index
+            && values_slice_equal(&self.values, &other.values, &mut HashSet::new())
+    }
+}
+
+type ActiveValuePairs = HashSet<(u8, usize, usize)>;
+
+fn values_equal(left: &Value, right: &Value, active: &mut ActiveValuePairs) -> bool {
+    match (left, right) {
+        (Value::Int(left), Value::Int(right)) => left == right,
+        (Value::Float(left), Value::Float(right)) => left == right,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Char(left), Value::Char(right)) => left == right,
+        (Value::Byte(left), Value::Byte(right)) => left == right,
+        (Value::Bytes(left), Value::Bytes(right)) => left == right,
+        (Value::Null, Value::Null) => true,
+        (Value::Array(left), Value::Array(right)) => {
+            let pair = (0, Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
+            if !active.insert(pair) {
+                return true;
+            }
+            let left = left.borrow();
+            let right = right.borrow();
+            let equal = values_slice_equal(&left, &right, active);
+            active.remove(&pair);
+            equal
+        }
+        (Value::Tuple(left), Value::Tuple(right)) => {
+            let pair = (1, Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
+            if !active.insert(pair) {
+                return true;
+            }
+            let equal = values_slice_equal(left, right, active);
+            active.remove(&pair);
+            equal
+        }
+        (Value::Map(left), Value::Map(right)) => {
+            let pair = (2, Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
+            if !active.insert(pair) {
+                return true;
+            }
+            let left = left.borrow();
+            let right = right.borrow();
+            let equal = map_entries_equal(&left.entries, &right.entries, active);
+            active.remove(&pair);
+            equal
+        }
+        (Value::Set(left), Value::Set(right)) => {
+            let pair = (3, Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
+            if !active.insert(pair) {
+                return true;
+            }
+            let equal = left.borrow().members == right.borrow().members;
+            active.remove(&pair);
+            equal
+        }
+        (Value::Iterator(left), Value::Iterator(right)) => {
+            let pair = (4, Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize);
+            if !active.insert(pair) {
+                return true;
+            }
+            let left = left.borrow();
+            let right = right.borrow();
+            let equal = left.next_index == right.next_index
+                && values_slice_equal(&left.values, &right.values, active);
+            active.remove(&pair);
+            equal
+        }
+        _ => false,
+    }
+}
+
+fn values_slice_equal(left: &[Value], right: &[Value], active: &mut ActiveValuePairs) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| values_equal(left, right, active))
+}
+
+fn map_entries_equal(
+    left: &HashMap<RuntimeKey, Value>,
+    right: &HashMap<RuntimeKey, Value>,
+    active: &mut ActiveValuePairs,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(key, left_value)| {
+            right
+                .get(key)
+                .is_some_and(|right_value| values_equal(left_value, right_value, active))
+        })
 }
 
 impl Value {
@@ -148,11 +251,11 @@ fn fmt_value(
         Value::Char(value) => write!(formatter, "{value}"),
         Value::Byte(value) => write!(formatter, "{value}"),
         Value::Bytes(value) => {
-            formatter.write_str("b\"")?;
+            formatter.write_str("0x")?;
             for byte in value {
                 write!(formatter, "{byte:02x}")?;
             }
-            formatter.write_str("\"")
+            Ok(())
         }
         Value::Array(values) => {
             let identity = (0, Rc::as_ptr(values) as usize);
@@ -196,7 +299,7 @@ fn fmt_value(
         }
         Value::Map(map) => write!(formatter, "Map(len={})", map.borrow().entries.len()),
         Value::Set(set) => write!(formatter, "Set(len={})", set.borrow().members.len()),
-        Value::Iterator(_) => formatter.write_str("<iterator>"),
+        Value::Iterator(_) => formatter.write_str("Iterator"),
         Value::Null => formatter.write_str("null"),
     }
 }
