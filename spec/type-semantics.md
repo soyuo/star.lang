@@ -53,7 +53,7 @@ Conversions are performed only by their conversion instruction. Unsupported sour
 | `TO_BYTE` | Convert an `Int` in `0..255` to `Byte`; values outside that range raise `TypeError`. |
 | `INT_TO_BYTES` | Produce exactly the requested number of big-endian bytes for a nonnegative `Int`; negative values, negative lengths, or insufficient width raise `TypeError`. See `spec/integer-encoding.md`. |
 
-The decimal string grammars use ASCII digits only. They accept an optional leading sign, accept leading zeroes, and do not trim whitespace or accept separators, radix prefixes, `NaN`, or infinity spellings. A decimal `String` that overflows `TO_FLOAT` becomes infinity; `TO_INT` has no precision limit other than available resources.
+The decimal string grammars use ASCII digits only. They accept an optional leading sign, accept leading zeroes, and do not trim whitespace or accept separators, radix prefixes, `NaN`, or infinity spellings. `TO_FLOAT` parses using round-to-nearest, ties-to-even; if rounding produces zero, it preserves the input sign (`-0`, `-0.0`, and negative underflow produce negative zero). A decimal `String` that overflows `TO_FLOAT` becomes infinity; `TO_INT` has no precision limit other than available resources.
 
 ## Truthiness
 
