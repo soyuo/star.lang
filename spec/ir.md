@@ -68,14 +68,14 @@ The terminator set is:
 
 | Terminator | Behavior |
 |---|---|
-| `Jump(target, unwind_scopes)` | Transfers to one block and exits the indicated lexical scopes first. |
+| `Jump(target, unwind_scopes)` | Transfers to one block. `unwind_scopes` equals the source scope depth minus the target block's `entry_scope_depth`; it exits only scopes above the target depth and never exits a scope owned by the target block. |
 | `BranchIfFalse(false_target, true_target)` | Pops one condition; branches on `Bool`. A dynamic non-`Bool` value keeps the specified runtime `TypeError`. |
 | `ForNext(loop_state, body_target, exit_target)` | Requests one iterator item; on success assigns it to the loop binding and enters the body, otherwise exits the loop. Iterator failures propagate. |
 | `ReturnTop(unwind_to_frame_base)` | Returns the top operand above the function frame base, or `Null` if there is none; discards other frame operands and unwinds function scopes. |
 | `Halt` | Ends the module initializer normally. |
 | `Unreachable` | Marks a block with no valid incoming execution path after semantic analysis. |
 
-Compiler-generated operations are `ScopeEnter`, `ScopeExit`, and `ForInit(loop_state)`. `ForInit` consumes the source `Iterator` and variable ID, creates the loop's lexical binding, and records the iterator in hidden IR state. This state is not a Star value and cannot be observed by source instructions. `ScopeExit` ends lookup visibility while preserving any cells retained by closures.
+Compiler-generated operations are `ScopeEnter`, `ScopeExit`, and `ForInit(loop_state)`. `ForInit` consumes the source `Iterator` and variable ID, creates the loop's lexical binding scope, and records the iterator in hidden IR state. The loop body, header, and exit block enter at the depth including this scope. The exit block emits exactly one `ScopeExit` for it, then jumps to the post-loop block at the outer depth. This hidden state is not a Star value and cannot be observed by source instructions. `ScopeExit` ends lookup visibility while preserving any cells retained by closures.
 
 Each instruction and terminator carries the source span that caused it. A generated branch uses the span of its controlling block or `BREAK`/`CONTINUE`; generated scope operations use the span of the corresponding scope or loop. The bytecode emitter must preserve these spans in the later source-location table.
 
@@ -94,8 +94,8 @@ Lowering runs after parsing and successful semantic analysis. It uses the functi
 - **IF / ELSE / END:** the condition-producing source instructions stay in the current block. `IF` ends it with `BranchIfFalse`. Lower the then and optional else arms into separate blocks and join their reachable exits. A missing `ELSE` uses the false target as a direct edge to the join. The condition is consumed once. The join stack must satisfy the semantic analyzer's height and compatible-type rules.
 - **LOOP with WHILE:** create a condition header, body, and exit. The pre-loop edge enters the header. Lower the condition sequence into that header on every iteration, then use `BranchIfFalse` to choose exit or body. The body back-edge targets the condition header; the condition is never cached.
 - **Condition-free `LOOP`:** create a body header and exit. The entry and each normal body completion jump to the header. Normal source exits are `BREAK` and `RETURN`; runtime failures and execution limits may also terminate it.
-- **`FOR`:** lower the source iterator and variable ID already on the evaluation stack with `ForInit`. The source stack order is iterator then variable ID, bottom to top. The loop header ends with `ForNext`; its success edge enters the body and its exhaustion edge enters the exit. Normal completion and `CONTINUE` target the header; `BREAK` targets the exit. The exit block emits `ScopeExit` for the loop binding.
-- **BREAK / CONTINUE:** emit `Jump` to the nearest enclosing loop's exit or continuation target. `unwind_scopes` is the number of lexical scopes crossed, stopping at the current function boundary.
+- **`FOR`:** lower the source iterator and variable ID already on the evaluation stack with `ForInit`. The source stack order is iterator then variable ID, bottom to top. The loop header ends with `ForNext`; its success edge enters the body and its exhaustion edge enters the exit. Normal completion and `CONTINUE` target the header; `BREAK` targets the exit. Both targets retain the `FOR` binding scope; `BREAK` unwinds only body and intervening scopes. The exit block emits the single `ScopeExit` for the loop binding and jumps to the post-loop block.
+- **BREAK / CONTINUE:** emit `Jump` to the nearest enclosing loop's exit or continuation target. Compute `unwind_scopes` from the source and target scope depths; preserve every scope in the target block, including the `FOR` binding scope when targeting its header or exit. Scopes are unwound only once, and a transfer never unwinds across the current function boundary.
 - **RETURN:** terminate the current function with `ReturnTop`; no return edge may cross a function boundary. A source return inside a nested block or loop still exits the function.
 
 Control-flow targets are function-local `BlockId`s, not source opcode values or bytecode addresses. Branch targets are allocated once and every incoming edge is recorded before the function is finalized. The lowerer rejects an unresolved target or a block without exactly one terminator as an internal compiler error.
