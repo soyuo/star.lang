@@ -139,7 +139,7 @@ The bit pattern column for a basic instruction records its source-symbol sequenc
 
 ## Unassigned and pending values
 
-Only entries listed in `spec/opcodes.toml` are assigned source instructions. Gaps within an allocation family and ranges marked reserved are invalid as source opcodes until assigned in that catalog. The exception-handling candidates `0x80?0x86` remain pending: the referenced exception document labels them as VM opcodes, and no source mapping has been approved. They therefore have no source spelling in this document. The `0xFF` page prefix is reserved and is not currently an instruction.
+Only entries listed in `spec/opcodes.toml` are assigned source instructions. Gaps within an allocation family and ranges marked reserved are invalid as source opcodes until assigned in that catalog. The exception-handling candidates `0x80-0x86` remain pending: the referenced exception document labels them as VM opcodes, and no source mapping has been approved. They therefore have no source spelling in this document. The `0xFF` page prefix is reserved and is not currently an instruction.
 
 ## Source and bytecode separation
 
