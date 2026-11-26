@@ -8,6 +8,7 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use star_common::{SourcePosition, Span};
 use star_compiler::{verify_bytecode, Capability, IrOp, VerificationPolicy, VerifiedProgram};
 
+use crate::gc::GcStats;
 use crate::value::{
     binding_cell, BindingCell, ClosureState, FunctionRef, IteratorState, ObjectState, Value,
 };
@@ -43,6 +44,17 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     pub fn with_call_depth_limit(mut self, limit: usize) -> Self {
         self.runtime.call_depth_limit = limit.max(1);
         self
+    }
+
+    /// Sets the number of newly allocated managed objects that triggers collection.
+    pub fn with_gc_threshold(mut self, threshold: usize) -> Self {
+        self.runtime.gc.set_threshold(threshold);
+        self
+    }
+
+    /// Performs a tracing collection of values owned or externally held during execution.
+    pub fn collect_garbage(&mut self) -> GcStats {
+        self.runtime.collect_garbage()
     }
 
     /// Verifies and executes a `.starc` program, returning the module result.
@@ -254,6 +266,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         .error(RuntimeErrorKind::Unsupported("reached compiler TRAP"), span));
                 }
             }
+            self.runtime.collect_if_needed();
         }
     }
 
@@ -510,9 +523,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             let value = if function.rest_parameter_code != 0
                 && position + 1 == function.parameter_ids.len()
             {
-                Value::Array(Rc::new(RefCell::new(
-                    request.arguments[position..].to_vec(),
-                )))
+                self.runtime
+                    .allocate_array(request.arguments[position..].to_vec())
             } else {
                 request.arguments[position].clone()
             };
@@ -769,7 +781,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         span,
                     ));
                 };
-                let object = Value::Object(Rc::new(RefCell::new(ObjectState {
+                let object = self.runtime.allocate_object(ObjectState {
                     struct_id,
                     fields: descriptor
                         .field_ids
@@ -777,7 +789,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         .cloned()
                         .map(|field_id| (field_id, Value::Null))
                         .collect(),
-                })));
+                });
                 if let Some(constructor_id) = descriptor.methods.get(&BigInt::zero()) {
                     let Some(function) = image.functions.iter().find(|function| {
                         function.module_index == module_index
@@ -911,9 +923,11 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if captures.is_empty() {
                     self.runtime.stack.push(Value::Function(function));
                 } else {
-                    self.runtime
-                        .stack
-                        .push(Value::Closure(Rc::new(ClosureState { function, captures })));
+                    let closure = self.runtime.allocate_closure(ClosureState {
+                        function,
+                        captures: RefCell::new(captures),
+                    });
+                    self.runtime.stack.push(closure);
                 }
             }
             CallValue => {
@@ -931,7 +945,9 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 arguments.reverse();
                 let (function, captures) = match callable {
                     Value::Function(function) => (function, Vec::new()),
-                    Value::Closure(closure) => (closure.function.clone(), closure.captures.clone()),
+                    Value::Closure(closure) => {
+                        (closure.function.clone(), closure.captures.borrow().clone())
+                    }
                     other => {
                         return Err(self.runtime.type_error("Function or Closure", &other, span))
                     }

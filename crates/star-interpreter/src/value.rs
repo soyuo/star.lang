@@ -31,7 +31,22 @@ pub struct FunctionRef {
 #[derive(Clone, Debug)]
 pub struct ClosureState {
     pub(crate) function: FunctionRef,
-    pub(crate) captures: Vec<(BigInt, BindingCell)>,
+    pub(crate) captures: RefCell<Vec<(BigInt, BindingCell)>>,
+}
+
+/// Interior tuple storage lets the collector break unreachable cycles while
+/// language-level tuple operations remain immutable.
+#[derive(Debug)]
+pub struct TupleState {
+    pub(crate) values: RefCell<Vec<Value>>,
+}
+
+impl TupleState {
+    pub(crate) fn new(values: Vec<Value>) -> Self {
+        Self {
+            values: RefCell::new(values),
+        }
+    }
 }
 
 /// A nominal object instance with mutable fields addressed by numeric IDs.
@@ -74,8 +89,8 @@ pub enum Value {
     Bytes(Vec<u8>),
     /// Mutable, reference-counted array.
     Array(Rc<RefCell<Vec<Value>>>),
-    /// Immutable tuple.
-    Tuple(Rc<Vec<Value>>),
+    /// Immutable tuple with collector-managed storage.
+    Tuple(Rc<TupleState>),
     /// Mutable insertion-ordered hash map.
     Map(Rc<RefCell<MapState>>),
     /// Mutable insertion-ordered hash set.
@@ -154,6 +169,8 @@ impl RuntimeKey {
             Value::Bytes(value) => Self::Bytes(value.clone()),
             Value::Tuple(values) => Self::Tuple(
                 values
+                    .values
+                    .borrow()
                     .iter()
                     .map(Self::from_value)
                     .collect::<Option<Vec<_>>>()?,
@@ -211,7 +228,9 @@ fn values_equal(left: &Value, right: &Value, active: &mut ActiveValuePairs) -> b
             if !active.insert(pair) {
                 return true;
             }
-            let equal = values_slice_equal(left, right, active);
+            let left_values = left.values.borrow();
+            let right_values = right.values.borrow();
+            let equal = values_slice_equal(&left_values, &right_values, active);
             active.remove(&pair);
             equal
         }
@@ -348,6 +367,7 @@ fn fmt_value(
             if !active.insert(identity) {
                 return formatter.write_str("<cycle>");
             }
+            let values = values.values.borrow();
             let result = (|| {
                 formatter.write_str("(")?;
                 for (index, value) in values.iter().enumerate() {
