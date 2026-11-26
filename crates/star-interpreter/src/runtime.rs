@@ -4,7 +4,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{BufRead, Write};
-use std::rc::Rc;
 
 use num_bigint::Sign;
 use num_traits::Zero;
@@ -16,6 +15,7 @@ use star_parser::{
 };
 
 use crate::{
+    gc::{GcError, GcHeap, GcStats},
     semantic::{self, ResolvedFunction},
     value::{
         binding_cell, BindingCell, ClosureState, FunctionRef, InterfaceDefinition, IteratorState,
@@ -127,6 +127,7 @@ pub struct Interpreter<R: BufRead, W: Write> {
     structs: HashMap<BigInt, StructDefinition>,
     interfaces: HashMap<BigInt, InterfaceDefinition>,
     capture_vectors: Vec<Vec<(BigInt, BindingCell)>>,
+    gc: GcHeap,
     call_depth: usize,
     call_depth_limit: usize,
     executed_steps: u64,
@@ -155,6 +156,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             structs: HashMap::new(),
             interfaces: HashMap::new(),
             capture_vectors: vec![Vec::new()],
+            gc: GcHeap::default(),
             call_depth: 0,
             call_depth_limit: 512,
             executed_steps: 0,
@@ -172,6 +174,54 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     pub fn with_execution_limit(mut self, limit: u64) -> Self {
         self.execution_limit = limit.max(1);
         self
+    }
+
+    /// Sets the number of newly allocated managed objects that triggers collection.
+    pub fn with_gc_threshold(mut self, threshold: usize) -> Self {
+        self.gc.set_threshold(threshold);
+        self
+    }
+
+    /// Performs a tracing collection from interpreter roots and external handles.
+    /// Returns `GcError::BorrowConflict` without modifying the heap if the host
+    /// currently borrows a runtime value.
+    pub fn collect_garbage(&mut self) -> Result<GcStats, GcError> {
+        self.gc
+            .collect(&self.stack, &self.scopes, &self.capture_vectors)
+    }
+
+    fn collect_if_needed(&mut self) {
+        if self.gc.should_collect() {
+            let _ = self.collect_garbage();
+        }
+    }
+
+    fn allocate_array(&mut self, values: Vec<Value>) -> Value {
+        self.gc.allocate_array(values)
+    }
+
+    fn allocate_tuple(&mut self, values: Vec<Value>) -> Value {
+        self.gc.allocate_tuple(values)
+    }
+
+    fn allocate_map(&mut self, value: MapState) -> Value {
+        self.gc.allocate_map(value)
+    }
+
+    fn allocate_set(&mut self, value: SetState) -> Value {
+        self.gc.allocate_set(value)
+    }
+
+    fn allocate_iterator(&mut self, value: IteratorState) -> Value {
+        self.gc.allocate_iterator(value)
+    }
+
+    fn allocate_closure(&mut self, value: ClosureState) -> Value {
+        self.gc.allocate_closure(value)
+    }
+
+    fn allocate_object(&mut self, value: ObjectState) -> Value {
+        self.gc.allocate_object(value)
     }
 
     /// Executes supported statements in source order.
@@ -502,7 +552,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             let rest = arguments.into_iter().skip(fixed_count).collect();
             local_bindings.insert(
                 function.parameter_ids[fixed_count].clone(),
-                binding_cell(Value::Array(Rc::new(RefCell::new(rest))), true),
+                binding_cell(self.allocate_array(rest), true),
             );
         } else {
             for (id, value) in function.parameter_ids.iter().zip(arguments) {
@@ -605,8 +655,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         if captures.is_empty() {
             self.stack.push(Value::Function(function));
         } else {
-            self.stack
-                .push(Value::Closure(Rc::new(ClosureState { function, captures })));
+            let closure = self.allocate_closure(ClosureState {
+                function,
+                captures: RefCell::new(captures),
+            });
+            self.stack.push(closure);
         }
         Ok(())
     }
@@ -624,7 +677,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         arguments.reverse();
         let (function_ref, captures) = match callable {
             Value::Function(function) => (function, Vec::new()),
-            Value::Closure(closure) => (closure.function.clone(), closure.captures.clone()),
+            Value::Closure(closure) => {
+                (closure.function.clone(), closure.captures.borrow().clone())
+            }
             other => return Err(self.type_error("Function or Closure", &other, span)),
         };
         if function_ref.module_index != 0 {
@@ -772,7 +827,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         };
-        let object = Value::Object(Rc::new(RefCell::new(ObjectState {
+        let object = self.allocate_object(ObjectState {
             struct_id: struct_id.clone(),
             fields: descriptor
                 .field_ids
@@ -780,7 +835,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .cloned()
                 .map(|field_id| (field_id, Value::Null))
                 .collect(),
-        })));
+        });
         if let Some(constructor_id) = descriptor.methods.get(&BigInt::from(0)) {
             let Some(function) = self.functions.get(constructor_id).cloned() else {
                 return Err(self.error(
@@ -911,15 +966,15 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let Value::Object(object) = value else {
             return Err(self.type_error("Struct", &value, span));
         };
-        self.stack.push(Value::Object(Rc::new(RefCell::new(
-            object.borrow().clone(),
-        ))));
+        let cloned = object.borrow().clone();
+        let object = self.allocate_object(cloned);
+        self.stack.push(object);
         Ok(())
     }
 
     fn execute_instruction(&mut self, instruction: &Instruction) -> Result<(), RuntimeError> {
         let span = instruction.span;
-        match instruction.opcode {
+        let result = match instruction.opcode {
             InstructionOpcode::Basic(opcode @ 1..=5) => self.arithmetic(opcode, span),
             InstructionOpcode::Basic(6) => {
                 let value = self.pop(span)?;
@@ -1020,7 +1075,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 RuntimeErrorKind::UnsupportedInstruction(instruction.opcode),
                 span,
             )),
+        };
+        if result.is_ok() {
+            self.collect_if_needed();
         }
+        result
     }
 
     fn to_int(&mut self, span: Span) -> Result<(), RuntimeError> {
@@ -1072,7 +1131,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             Value::String(value) => !value.is_empty(),
             Value::Bytes(value) => !value.is_empty(),
             Value::Array(value) => !value.borrow().is_empty(),
-            Value::Tuple(value) => !value.is_empty(),
+            Value::Tuple(value) => !value.values.borrow().is_empty(),
             Value::Map(value) => !value.borrow().entries.is_empty(),
             Value::Set(value) => !value.borrow().members.is_empty(),
             Value::Iterator(_)
@@ -1181,13 +1240,15 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             values.push(self.pop(span)?);
         }
         values.reverse();
-        self.stack.push(Value::Array(Rc::new(RefCell::new(values))));
+        let array = self.allocate_array(values);
+        self.stack.push(array);
         Ok(())
     }
 
     fn tuple_new(&mut self, span: Span) -> Result<(), RuntimeError> {
         let values = self.pop_collection_items(span)?;
-        self.stack.push(Value::Tuple(Rc::new(values)));
+        let tuple = self.allocate_tuple(values);
+        self.stack.push(tuple);
         Ok(())
     }
 
@@ -1230,7 +1291,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
             map.entries.insert(key, value);
         }
-        self.stack.push(Value::Map(Rc::new(RefCell::new(map))));
+        let map = self.allocate_map(map);
+        self.stack.push(map);
         Ok(())
     }
 
@@ -1247,7 +1309,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 set.order.push((key, value));
             }
         }
-        self.stack.push(Value::Set(Rc::new(RefCell::new(set))));
+        let set = self.allocate_set(set);
+        self.stack.push(set);
         Ok(())
     }
 
@@ -1280,6 +1343,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .cloned()
                 .ok_or_else(|| self.index_error(span))?,
             Value::Tuple(values) => values
+                .values
+                .borrow()
                 .get(self.index_from_value(key, span)?)
                 .cloned()
                 .ok_or_else(|| self.index_error(span))?,
@@ -1384,7 +1449,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let collection = self.pop(span)?;
         let found = match collection {
             Value::Array(values) => values.borrow().contains(&needle),
-            Value::Tuple(values) => values.contains(&needle),
+            Value::Tuple(values) => values.values.borrow().contains(&needle),
             Value::String(value) => match needle {
                 Value::String(needle) => value.contains(&needle),
                 Value::Char(needle) => value.contains(needle),
@@ -1434,7 +1499,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let value = self.pop(span)?;
         let count = match value {
             Value::Array(values) => values.borrow().len(),
-            Value::Tuple(values) => values.len(),
+            Value::Tuple(values) => values.values.borrow().len(),
             Value::Map(map) => map.borrow().entries.len(),
             Value::Set(set) => set.borrow().members.len(),
             Value::String(value) => value.chars().count(),
@@ -1455,7 +1520,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let value = self.pop(span)?;
         let values = match value {
             Value::Array(values) => values.borrow().clone(),
-            Value::Tuple(values) => values.as_ref().clone(),
+            Value::Tuple(values) => values.values.borrow().clone(),
             Value::Map(map) => map
                 .borrow()
                 .order
@@ -1478,11 +1543,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 ))
             }
         };
-        self.stack
-            .push(Value::Iterator(Rc::new(RefCell::new(IteratorState {
-                values,
-                next_index: 0,
-            }))));
+        let iterator = self.allocate_iterator(IteratorState {
+            values,
+            next_index: 0,
+        });
+        self.stack.push(iterator);
         Ok(())
     }
 
@@ -1497,13 +1562,14 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 if start > end || end > values.len() {
                     return Err(self.index_error(span));
                 }
-                Value::Array(Rc::new(RefCell::new(values[start..end].to_vec())))
+                self.allocate_array(values[start..end].to_vec())
             }
             Value::Tuple(values) => {
+                let values = values.values.borrow();
                 if start > end || end > values.len() {
                     return Err(self.index_error(span));
                 }
-                Value::Tuple(Rc::new(values[start..end].to_vec()))
+                self.allocate_tuple(values[start..end].to_vec())
             }
             Value::String(value) => {
                 let length = value.chars().count();
@@ -1565,12 +1631,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             (Value::Array(left), Value::Array(right)) => {
                 let mut values = left.borrow().clone();
                 values.extend(right.borrow().iter().cloned());
-                Value::Array(Rc::new(RefCell::new(values)))
+                self.allocate_array(values)
             }
             (Value::Tuple(left), Value::Tuple(right)) => {
-                let mut values = left.as_ref().clone();
-                values.extend(right.iter().cloned());
-                Value::Tuple(Rc::new(values))
+                let mut values = left.values.borrow().clone();
+                values.extend(right.values.borrow().iter().cloned());
+                self.allocate_tuple(values)
             }
             (left, _) => {
                 return Err(self.type_error(

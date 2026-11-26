@@ -5,6 +5,7 @@
 
 pub use num_bigint::BigInt;
 
+pub mod gc;
 pub mod runtime;
 pub mod semantic;
 pub mod value;
