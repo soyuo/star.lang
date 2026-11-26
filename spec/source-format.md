@@ -27,9 +27,9 @@ Unicode lookalikes, typographic quotes, full-width forms, and other visually sim
 
 ### Normal mode
 
-Normal mode accepts the three source characters plus ASCII space (U+0020), horizontal tab (U+0009), carriage return (U+000D), and line feed (U+000A). These four formatting characters are ignored between tokens and do not change program meaning.
+Normal mode accepts the three source characters plus ASCII space (U+0020), horizontal tab (U+0009), carriage return (U+000D), and line feed (U+000A). These four formatting characters are ignored before tokenization, both between tokens and within literals, and do not change program meaning.
 
-Formatting whitespace is not permitted inside a data literal. Any other character is an error; normal mode does not silently discard arbitrary text.
+Formatting whitespace may occur between tokens or inside a data literal and is ignored before tokenization. After whitespace removal, a literal payload must contain only the asterisk and apostrophe characters. Any other character is an error; normal mode does not silently discard arbitrary text.
 
 ### Strict mode
 
