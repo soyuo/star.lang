@@ -47,7 +47,9 @@ The source grammar defines no comment syntax. A comment written with letters or 
 
 ## Source positions
 
-Lexing may ignore normal-mode formatting whitespace, but diagnostics and source maps retain positions in the original UTF-8 file. Implementations should report both the original byte offset and a one-based line and column.
+Lexing may ignore normal-mode formatting whitespace, but diagnostics and source maps retain positions in the original UTF-8 file. Report the original byte offset and a one-based line and byte column.
+
+Byte offsets are zero-based from the beginning of the file. Line and byte-column numbers are one-based; the byte column counts UTF-8 bytes since the start of the current line. Treat CRLF as one line break, and treat a standalone CR or LF as one line break. The first byte after a line break is column 1. For invalid UTF-8, report the offset of the first invalid byte and compute its line and byte column from preceding bytes without replacing or normalizing the input. A BOM is reported at byte offset 0, line 1, column 1.
 
 ## References
 
