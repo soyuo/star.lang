@@ -351,7 +351,7 @@ struct FunctionSignature {
 #[derive(Clone, Debug)]
 struct CallSite {
     function_id: Identifier,
-    argument_count: usize,
+    argument_count: Option<usize>,
     span: Span,
 }
 
@@ -447,7 +447,10 @@ impl Analyzer {
                     span: call.span,
                 });
             };
-            if !accepts_arity(signature, call.argument_count) {
+            if call
+                .argument_count
+                .is_some_and(|count| !accepts_arity(signature, count))
+            {
                 return Err(SemanticError {
                     kind: SemanticErrorKind::InvalidCallArity,
                     span: call.span,
@@ -934,7 +937,7 @@ impl Analyzer {
             }
             7 => state.stack.push(AbstractValue::new(ValueType::Any)),
             8 => self.store(state, span, false, false)?,
-            9 => self.load(state, span, false)?,
+            9 => self.load(state, span, false, false)?,
             10 => {
                 state.stack.pop(span)?;
                 state.stack.pop(span)?;
@@ -1164,7 +1167,7 @@ impl Analyzer {
             0x50 => self.declare(state, span, true)?,
             0x51 => self.declare(state, span, false)?,
             0x52 => self.delete(state, span)?,
-            0x53 => self.load(state, span, true)?,
+            0x53 => self.load(state, span, true, context.in_function)?,
             0x54 => self.store(state, span, true, context.in_function)?,
             0x57 => self.annotate(state, span)?,
             0x60 | 0x62 | 0x6B => {
@@ -1538,6 +1541,7 @@ impl Analyzer {
         state: &mut FlowState,
         span: Span,
         global: bool,
+        in_function: bool,
     ) -> Result<(), SemanticError> {
         let id = pop_identifier(state, span)?;
         let binding = id.as_ref().and_then(|id| {
@@ -1549,6 +1553,12 @@ impl Analyzer {
         });
         if global && binding.is_none() {
             if let Some(id) = id {
+                if !in_function {
+                    return Err(SemanticError {
+                        kind: SemanticErrorKind::UnknownBinding,
+                        span,
+                    });
+                }
                 if !self
                     .global_load_sites
                     .iter()
@@ -1691,7 +1701,7 @@ impl Analyzer {
                     ValueType::Any
                 }
             });
-        if let (Some(function_id), Some(argument_count)) = (function_id, argument_count) {
+        if let Some(function_id) = function_id {
             if !self.call_sites.iter().any(|site| {
                 site.function_id == function_id
                     && site.argument_count == argument_count
@@ -2387,7 +2397,17 @@ fn reset_binding_type(state: &mut FlowState, id: &Identifier) {
 }
 
 fn same_stack(left: &AbstractStack, right: &AbstractStack) -> bool {
-    left.opaque_prefix == right.opaque_prefix && left.values.len() == right.values.len()
+    left.opaque_prefix == right.opaque_prefix
+        && left.values.len() == right.values.len()
+        && left.values.iter().zip(&right.values).all(|(left, right)| {
+            left.value_type == ValueType::Any
+                || right.value_type == ValueType::Any
+                || (left.value_type == right.value_type
+                    && (left.value_type != ValueType::Struct
+                        || left.nominal_id.is_none()
+                        || right.nominal_id.is_none()
+                        || left.nominal_id == right.nominal_id))
+        })
 }
 
 fn join_flows(
