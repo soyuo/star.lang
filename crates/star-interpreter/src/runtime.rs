@@ -7,7 +7,7 @@ use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 use num_bigint::Sign;
-use num_traits::{Signed, Zero};
+use num_traits::Zero;
 use star_common::SourcePosition;
 use star_parser::Span;
 use star_parser::{
@@ -673,10 +673,20 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         Ok(())
     }
 
-    fn define_method(&mut self, span: Span) -> Result<(), RuntimeError> {
+    fn define_method(
+        &mut self,
+        span: Span,
+        function_ids: &HashSet<BigInt>,
+    ) -> Result<(), RuntimeError> {
         let function_id = self.pop_identifier(span)?;
         let method_id = self.pop_identifier(span)?;
         let struct_id = self.pop_identifier(span)?;
+        if !function_ids.contains(&function_id) {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("METHOD_DEF references an unknown function".into()),
+                span,
+            ));
+        }
         let Some(descriptor) = self.structs.get_mut(&struct_id) else {
             return Err(self.error(
                 RuntimeErrorKind::CompileError("METHOD_DEF references an unknown struct".into()),
@@ -993,17 +1003,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x72) => self.field_get(span),
             InstructionOpcode::Extended(0x73) => self.field_set(span),
             InstructionOpcode::Extended(0x74) => {
-                if let Some(Value::Int(function_id)) = self.stack.last() {
-                    if !function_id.is_negative() && !self.functions.contains_key(function_id) {
-                        return Err(self.error(
-                            RuntimeErrorKind::CompileError(
-                                "METHOD_DEF references an unknown function".into(),
-                            ),
-                            span,
-                        ));
-                    }
-                }
-                self.define_method(span)
+                let function_ids = self.functions.keys().cloned().collect();
+                self.define_method(span, &function_ids)
             }
             InstructionOpcode::Extended(0x75) => self.method_call(span),
             InstructionOpcode::Extended(0x76) => self.define_interface(span),

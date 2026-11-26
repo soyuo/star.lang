@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
@@ -714,29 +714,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             StoreGlobal => self.runtime.store_global(span)?,
             StructDef => self.runtime.define_struct(span)?,
             MethodDef => {
-                let Some(Value::Int(function_id)) = self.runtime.stack.last() else {
-                    return Err(self.runtime.error(
-                        RuntimeErrorKind::TypeError {
-                            expected: "nonnegative Int function ID",
-                            found: "other value",
-                        },
-                        span,
-                    ));
-                };
-                if !function_id.is_negative()
-                    && !image.functions.iter().any(|function| {
-                        function.module_index == module_index
-                            && function.id.as_ref() == Some(function_id)
-                    })
-                {
-                    return Err(self.runtime.error(
-                        RuntimeErrorKind::CompileError(
-                            "METHOD_DEF references an unknown function".into(),
-                        ),
-                        span,
-                    ));
-                }
-                self.runtime.define_method(span)?;
+                let function_ids = image
+                    .functions
+                    .iter()
+                    .filter(|function| function.module_index == module_index)
+                    .filter_map(|function| function.id.clone())
+                    .collect::<HashSet<_>>();
+                self.runtime.define_method(span, &function_ids)?;
             }
             InterfaceDef => {
                 let method_count = self
