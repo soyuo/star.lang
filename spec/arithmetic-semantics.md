@@ -6,13 +6,13 @@ This document defines arithmetic, numeric comparison, integer division and remai
 
 ## Numeric operands and results
 
-Arithmetic and ordered numeric comparisons accept `Int` and `Float`. `Byte` is a distinct type and is not an arithmetic operand; convert it explicitly with `TO_INT` or `TO_FLOAT`. `Bool` and numeric-looking `String` values are not arithmetic operands.
+Arithmetic and ordered numeric comparisons accept `Int` and `Float`; `MOD` is the exception and accepts only two `Int` operands. `Byte` is a distinct type and is not an arithmetic operand; convert it explicitly with `TO_INT` or `TO_FLOAT`. `Bool` and numeric-looking `String` values are not arithmetic operands. A statically provable operand-type violation is a `CompileError`; a mismatch discovered at runtime is a `TypeError`. Value-domain failures such as division by zero and a negative shift count use their stated runtime error.
 
 | Operand types | Operation/result type |
 |---|---|
 | `Int`, `Int` | Integer operations return arbitrary-precision `Int`, except negative-exponent `POW` as specified below. |
 | `Float`, `Float` | Floating operations return `Float`. |
-| `Int`, `Float` or `Float`, `Int` | Convert the `Int` using `TO_FLOAT`, then perform the operation as `Float`. |
+| `Int`, `Float` or `Float`, `Int` | For operators that accept mixed operands, convert the `Int` using `TO_FLOAT`, then perform the operation as `Float`; `MOD` rejects mixed operands. |
 
 Mixed operations therefore use the binary64 rounding and overflow rules of `TO_FLOAT`; a large `Int` may round or convert to infinity before the operation. No operator silently converts `Bool`, `Byte`, `Char`, or `String` to a number.
 
@@ -26,7 +26,7 @@ An operation may fail with `OutOfMemoryError` or the configured execution/resour
 
 For `DIV` with two `Int` operands, the quotient is truncated toward zero and the result is `Int`. For `DIV` with at least one `Float`, both operands are treated as `Float` and IEEE 754 binary64 division is used. A divisor equal to integer zero or either floating zero (`+0.0` or `-0.0`) raises `DivisionByZero`; this rule also applies when the numerator is NaN or infinity.
 
-`MOD` accepts only two `Int` operands. Let `q` be the `Int` quotient of `a / b` truncated toward zero; the result is `r = a - q*b`. Thus `|r| < |b|`, and a nonzero remainder has the sign of the dividend. Examples: `-7 MOD 3 = -1`, `7 MOD -3 = 1`, and `-7 MOD -3 = -1`. A zero divisor raises `DivisionByZero`; a `Float` operand raises `TypeError`.
+`MOD` accepts only two `Int` operands. Let `q` be the `Int` quotient of `a / b` truncated toward zero; the result is `r = a - q*b`. Thus `|r| < |b|`, and a nonzero remainder has the sign of the dividend. Examples: `-7 MOD 3 = -1`, `7 MOD -3 = 1`, and `-7 MOD -3 = -1`. A zero divisor raises `DivisionByZero` at runtime; a `Float` operand raises `TypeError` at runtime or `CompileError` when its type is statically known.
 
 ## Floating-point arithmetic
 
@@ -44,4 +44,4 @@ For `DIV` with two `Int` operands, the quotient is truncated toward zero and the
 
 ## Bitwise operations and shifts
 
-`BIT_AND`, `BIT_OR`, `BIT_XOR`, `BIT_NOT`, `SHL`, and `SHR` accept only `Int`. Bitwise operators use infinite-width two's-complement semantics with sign extension: `BIT_NOT(x) = -x - 1`. `SHL(x, n)` for nonnegative `n` is the exact integer `x * 2^n`; it does not wrap. `SHR(x, n)` is arithmetic right shift, equivalent to floor division by `2^n` (so `-7 SHR 1 = -4`). A negative shift count raises `TypeError`. Large left shifts may fail at configured resource limits, but may not return a wrapped result.
+`BIT_AND`, `BIT_OR`, `BIT_XOR`, `BIT_NOT`, `SHL`, and `SHR` accept only `Int`. Bitwise operators use infinite-width two's-complement semantics with sign extension: `BIT_NOT(x) = -x - 1`. `SHL(x, n)` for nonnegative `n` is the exact integer `x * 2^n`; it does not wrap. `SHR(x, n)` is arithmetic right shift, equivalent to floor division by `2^n` (so `-7 SHR 1 = -4`). A negative shift count raises `TypeError` at runtime because it violates the value domain; a non-`Int` count is a `CompileError` when statically known, otherwise `TypeError` at runtime. Large left shifts may fail at configured resource limits, but may not return a wrapped result.
