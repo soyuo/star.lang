@@ -37,7 +37,7 @@ Key equality is type-specific: for example, `Int(1)` and `Float(1.0)` are differ
 
 ## Complexity
 
-Let `n` be the collection size, `k` the slice/search byte or scalar length, and `a`, `b` the concatenated operand sizes.
+Let `n` be the collection size, `k` the slice/search byte or scalar length, `q` the encoded size in bytes of one Map key or Set member (including recursively nested Tuple components), `Q` the total encoded size of all stored keys/members, and `a`, `b` the concatenated operand sizes. Bounds include key conversion and hashing; add the cost of copying a returned heap-sized value where the operation returns one.
 
 | Operation | Expected time | Extra space |
 |---|---:|---:|
@@ -46,9 +46,10 @@ Let `n` be the collection size, `k` the slice/search byte or scalar length, and 
 | Array remove or Array/Tuple membership | `O(n)` | `O(1)` |
 | String index, length, or scalar slice | `O(n)` | slice `O(k)` |
 | Bytes index or length | `O(1)` | `O(1)` |
-| Map/Set lookup, membership, insertion, or replacement | average `O(1)`, worst `O(n)` | average `O(1)` per new key/member |
-| Map/Set removal | average `O(n)` including stable-order maintenance; worst `O(n)` | `O(1)` |
-| Map/Set iteration snapshot | `O(n)` | `O(n)` |
+| Map/Set lookup, membership, insertion, or replacement | average `O(q)`, worst `O(nq)` under hash collisions | `O(q)` temporary; plus `O(q)` retained per new key/member |
+| Map/Set construction with `n` keys/members of size `q` | average `O(nq)`, worst `O(n^2q)` | `O(nq)` |
+| Map/Set removal | expected `O(Q)` and worst `O(Q+nq)`, including stable-order maintenance | `O(1)` |
+| Map/Set iteration snapshot | `O(n+Q)` | `O(n+Q)` |
 | String/Bytes substring membership | worst `O(nk)` | `O(1)` |
 | Array/Tuple/Bytes slice | `O(k)` | `O(k)` |
 | Array/Tuple/String/Bytes concatenation | `O(a+b)` | `O(a+b)` |
