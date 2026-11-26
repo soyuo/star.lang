@@ -45,7 +45,7 @@ Each payload offset must equal the end of the preceding payload; the first paylo
 | `7` | DebugInfo | Optional |
 | `0xFFFFFFFF` | Checksum | Required and last |
 
-Version 1.0 files therefore contain seven sections, or eight when `DebugInfo` is present. A reader rejects a missing required section, a duplicate section, an unknown section marked required, or an unknown section placed after `Checksum`. Unknown optional section IDs below `0xFFFFFFFF` are skipped. The required bit is set for IDs 1-6 and `0xFFFFFFFF`; it is clear for ID 7.
+Version 1.0 files contain the seven defined required sections, or eight defined sections when `DebugInfo` is present. A compatible newer minor version may add unknown optional sections before `Checksum`; a reader skips those only when accepting that minor version. A reader rejects a missing required section, a duplicate section, an unknown section marked required, or an unknown section placed after `Checksum`. The required bit is set for IDs 1-6 and `0xFFFFFFFF`; it is clear for ID 7.
 
 ## Constant pool
 
