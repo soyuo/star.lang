@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+num-bigint = "0.5"
 star-common.workspace = true
 star-parser.workspace = true
 
