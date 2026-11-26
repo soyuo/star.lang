@@ -12,6 +12,7 @@ This document defines the runtime behavior shared by the source interpreter and 
 - `String` is immutable UTF-8 text. Character indexing, slicing, and `LENGTH` count Unicode scalar values, not bytes or grapheme clusters. `Bytes` is immutable and indexes individual bytes.
 - `ITER` snapshots the collection's sequence when the iterator is created. It yields Array/Tuple elements, String characters, Bytes as `Byte`, Map keys, and Set members in the orders above. Mutations after iterator creation do not change that sequence; referenced mutable elements remain shared values.
 - `NEXT` advances once and returns the next value with `true`; when exhausted, it returns `Null, false` and stays exhausted.
+- `TO_STRING`/`PRINT` use the display rules in `spec/type-semantics.md`: Maps and Sets display only their lengths, and recursive Array/Tuple display marks a value already on the active path as `<cycle>`.
 
 ## Map keys and Set members
 

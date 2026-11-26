@@ -131,69 +131,73 @@ impl Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Int(value) => write!(formatter, "{value}"),
-            Self::Float(value) => formatter.write_str(&format_float(*value)),
-            Self::Bool(value) => write!(formatter, "{value}"),
-            Self::String(value) => formatter.write_str(value),
-            Self::Char(value) => write!(formatter, "{value}"),
-            Self::Byte(value) => write!(formatter, "{value}"),
-            Self::Bytes(value) => {
-                formatter.write_str("b\"")?;
-                for byte in value {
-                    write!(formatter, "{byte:02x}")?;
-                }
-                formatter.write_str("\"")
+        fmt_value(self, formatter, &mut HashSet::new())
+    }
+}
+
+fn fmt_value(
+    value: &Value,
+    formatter: &mut fmt::Formatter<'_>,
+    active: &mut HashSet<(u8, usize)>,
+) -> fmt::Result {
+    match value {
+        Value::Int(value) => write!(formatter, "{value}"),
+        Value::Float(value) => formatter.write_str(&format_float(*value)),
+        Value::Bool(value) => write!(formatter, "{value}"),
+        Value::String(value) => formatter.write_str(value),
+        Value::Char(value) => write!(formatter, "{value}"),
+        Value::Byte(value) => write!(formatter, "{value}"),
+        Value::Bytes(value) => {
+            formatter.write_str("b\"")?;
+            for byte in value {
+                write!(formatter, "{byte:02x}")?;
             }
-            Self::Array(values) => {
-                let values = values.borrow();
+            formatter.write_str("\"")
+        }
+        Value::Array(values) => {
+            let identity = (0, Rc::as_ptr(values) as usize);
+            if !active.insert(identity) {
+                return formatter.write_str("<cycle>");
+            }
+            let values = values.borrow();
+            let result = (|| {
                 formatter.write_str("[")?;
                 for (index, value) in values.iter().enumerate() {
                     if index != 0 {
                         formatter.write_str(", ")?;
                     }
-                    write!(formatter, "{value}")?;
+                    fmt_value(value, formatter, active)?;
                 }
                 formatter.write_str("]")
+            })();
+            active.remove(&identity);
+            result
+        }
+        Value::Tuple(values) => {
+            let identity = (1, Rc::as_ptr(values) as usize);
+            if !active.insert(identity) {
+                return formatter.write_str("<cycle>");
             }
-            Self::Tuple(values) => {
+            let result = (|| {
                 formatter.write_str("(")?;
                 for (index, value) in values.iter().enumerate() {
                     if index != 0 {
                         formatter.write_str(", ")?;
                     }
-                    write!(formatter, "{value}")?;
+                    fmt_value(value, formatter, active)?;
                 }
                 if values.len() == 1 {
                     formatter.write_str(",")?;
                 }
                 formatter.write_str(")")
-            }
-            Self::Map(map) => {
-                let map = map.borrow();
-                formatter.write_str("Map{")?;
-                for (index, (key_id, key)) in map.order.iter().enumerate() {
-                    if index != 0 {
-                        formatter.write_str(", ")?;
-                    }
-                    write!(formatter, "{key}: {}", map.entries[key_id])?;
-                }
-                formatter.write_str("}")
-            }
-            Self::Set(set) => {
-                let set = set.borrow();
-                formatter.write_str("Set{")?;
-                for (index, (_, value)) in set.order.iter().enumerate() {
-                    if index != 0 {
-                        formatter.write_str(", ")?;
-                    }
-                    write!(formatter, "{value}")?;
-                }
-                formatter.write_str("}")
-            }
-            Self::Iterator(_) => formatter.write_str("<iterator>"),
-            Self::Null => formatter.write_str("null"),
+            })();
+            active.remove(&identity);
+            result
         }
+        Value::Map(map) => write!(formatter, "Map(len={})", map.borrow().entries.len()),
+        Value::Set(set) => write!(formatter, "Set(len={})", set.borrow().members.len()),
+        Value::Iterator(_) => formatter.write_str("<iterator>"),
+        Value::Null => formatter.write_str("null"),
     }
 }
 
