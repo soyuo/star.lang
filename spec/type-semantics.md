@@ -34,7 +34,7 @@ Every runtime value has exactly one canonical type tag. Type names are case-sens
 
 Functions, closures, and native functions are separate runtime types; all three are callable. An interface is a nominal contract implemented by a `Struct`, not a separate value tag. `OBJECT_IS` checks a struct type ID or interface implementation. `TYPE_OF` reports the canonical tag above, and `TYPE_CHECK` tests one of those exact type names; use `OBJECT_IS` for a specific struct or interface.
 
-`Map` and `Set` key hashability and equality are defined with collection operations; these type tags alone impose no additional key restrictions. Numeric promotion for arithmetic follows `spec/arithmetic-semantics.md`. No conversion happens implicitly except the explicitly specified mixed `Int`/`Float` arithmetic.
+`Map` and `Set` key hashability and equality are defined with collection operations; these type tags alone impose no additional key restrictions. Arithmetic and numeric comparison follow `spec/arithmetic-semantics.md`. No conversion happens implicitly except the explicitly specified mixed `Int`/`Float` operations.
 
 ## Explicit conversions
 

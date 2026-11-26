@@ -2,7 +2,7 @@
 
 Status: draft
 
-This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`; identifier, scope, module, and import rules are in `spec/identifier-module-semantics.md`; block matching and logical branch-target rules are in `spec/control-flow.md`; runtime tags and conversion rules are in `spec/type-semantics.md`. This document does not define `.starc` bytecode.
+This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`; identifier, scope, module, and import rules are in `spec/identifier-module-semantics.md`; block matching and logical branch-target rules are in `spec/control-flow.md`; runtime tags and conversion rules are in `spec/type-semantics.md`; arithmetic and numeric comparison rules are in `spec/arithmetic-semantics.md`. This document does not define `.starc` bytecode.
 
 ## Notation and common rules
 
@@ -17,17 +17,17 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `arith.add` | `ADD` | `left, right -> result` | Adds numeric operands; mixed `Int` and `Float` produces `Float`. | `TypeError` for nonnumeric operands. |
-| `arith.sub` | `SUB` | `left, right -> result` | Computes `left - right`; mixed numeric operands produce `Float`. | `TypeError` for nonnumeric operands. |
-| `arith.mul` | `MUL` | `left, right -> result` | Multiplies numeric operands; mixed numeric operands produce `Float`. | `TypeError` for nonnumeric operands. |
-| `arith.div` | `DIV` | `left, right -> result` | Integer division truncates toward zero; if either operand is `Float`, performs floating-point division. | `DivisionByZero`; `TypeError` for nonnumeric operands. |
-| `arith.mod` | `MOD` | `left, right -> result` | Computes the integer remainder, with the quotient truncated toward zero. | `DivisionByZero`; `TypeError` unless both operands are `Int`. |
+| `arith.add` | `ADD` | `left, right -> result` | Adds `Int`/`Float` operands; two `Int` values return exact `Int`; mixed operands return `Float`. | `TypeError` for other types. |
+| `arith.sub` | `SUB` | `left, right -> result` | Computes `left - right` for `Int`/`Float`; two `Int` values return exact `Int`; mixed operands return `Float`. | `TypeError` for other types. |
+| `arith.mul` | `MUL` | `left, right -> result` | Multiplies `Int`/`Float` operands; two `Int` values return exact `Int`; mixed operands return `Float`. | `TypeError` for other types. |
+| `arith.div` | `DIV` | `left, right -> result` | Two `Int` values divide with quotient truncated toward zero and return `Int`; mixed or `Float` operands return a binary64 `Float`. | `DivisionByZero` for integer or floating zero divisor; `TypeError` for other types. |
+| `arith.mod` | `MOD` | `left, right -> Int` | Computes `a - trunc(a/b)*b`; a nonzero result has the dividend's sign. | `DivisionByZero`; `TypeError` unless both operands are `Int`. |
 | `io.print` | `PRINT` | `value -> -` | Formats one value and writes it to standard output. | `IOError` if output fails. |
 | `io.input` | `INPUT` | `- -> line` | Reads one line from standard input, removes its line terminator, and pushes a UTF-8 `String`; pushes `Null` at end-of-file. | `IOError` for an input failure or invalid UTF-8. |
 | `variable.store` | `STORE` | `value, variable_id -> -` | Stores into the nearest accessible mutable binding; creates the binding in the current scope if none exists. | `ReferenceError` when the binding is immutable or the identifier is invalid. |
 | `variable.load` | `LOAD` | `variable_id -> value` | Reads the nearest binding with that identifier. | `ReferenceError` if no binding exists. |
 | `compare.eq` | `EQ` | `left, right -> Bool` | Pushes whether the values are equal under Star value equality. | None beyond common failures. |
-| `compare.gt` | `GT` | `left, right -> Bool` | Compares numeric operands; mixed numeric operands are compared as `Float`. | `TypeError` for nonnumeric operands. |
+| `compare.gt` | `GT` | `left, right -> Bool` | Compares `Int`/`Float` operands; mixed operands are converted to `Float` first. | `TypeError` for other types. |
 | `logic.not` | `NOT` | `Bool -> Bool` | Pushes the logical negation. | `TypeError` unless the operand is `Bool`. |
 
 ## Types and values
@@ -55,10 +55,10 @@ This document specifies operands, stack effects, side effects, and additional fa
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `arith.pow` | `POW` | `base, exponent -> result` | Raises a numeric base to a numeric exponent; integer results remain `Int` when exact and representable. | `TypeError` for unsupported operands; `DivisionByZero` for zero to a negative exponent. |
-| `arith.neg` | `NEG` | `value -> result` | Negates an `Int` or `Float`. | `TypeError` for other types. |
-| `arith.abs` | `ABS` | `value -> result` | Returns the absolute value of an `Int` or `Float`. | `TypeError` for other types. |
-| `compare.lt` | `LT` | `left, right -> Bool` | Compares numeric operands; mixed numeric operands are compared as `Float`. | `TypeError` for nonnumeric operands. |
+| `arith.pow` | `POW` | `base, exponent -> result` | Raises `Int`/`Float` operands to a power; result type and floating special cases follow `spec/arithmetic-semantics.md`. | `TypeError` for other types; `DivisionByZero` for zero to a negative exponent. |
+| `arith.neg` | `NEG` | `value -> result` | Negates an `Int` exactly or an IEEE 754 binary64 `Float`. | `TypeError` for other types. |
+| `arith.abs` | `ABS` | `value -> result` | Returns exact integer or binary64 floating absolute value. | `TypeError` for other types. |
+| `compare.lt` | `LT` | `left, right -> Bool` | Compares `Int`/`Float` operands; mixed operands are converted to `Float` first. | `TypeError` for other types. |
 | `logic.and` | `AND` | `left: Bool, right: Bool -> Bool` | Computes eager logical AND; both operands are evaluated before the instruction. | `TypeError` unless both operands are `Bool`. |
 | `logic.or` | `OR` | `left: Bool, right: Bool -> Bool` | Computes eager logical OR; both operands are evaluated before the instruction. | `TypeError` unless both operands are `Bool`. |
 | `logic.xor` | `XOR` | `left: Bool, right: Bool -> Bool` | Computes logical exclusive OR. | `TypeError` unless both operands are `Bool`. |
