@@ -1191,8 +1191,13 @@ impl Analyzer {
                 if parameter_count.is_none() {
                     state.stack.make_opaque();
                 }
+                let callable_type = if state.captures.is_empty() {
+                    ValueType::Function
+                } else {
+                    ValueType::Closure
+                };
                 state.captures.clear();
-                state.stack.push(AbstractValue::new(ValueType::Closure));
+                state.stack.push(AbstractValue::new(callable_type));
             }
             0x44 => {
                 let id = pop_identifier(state, span)?;

@@ -89,7 +89,7 @@ This document specifies operands, stack effects, side effects, and additional fa
 | `function.define` | `FUNC` | `function_id, parameter_ids..., parameter_count, rest_parameter_code -> -` | Registers the following `END`-delimited body and its ordered parameter IDs in the defining module; code `0` means fixed arity, otherwise the code equals the parameter count and marks the final ID as variadic rest slot. Header is consumed at compile time. See `spec/function-abi.md`. | `CompileError` for duplicate IDs, mismatched count, invalid rest code, or malformed body. |
 | `function.call` | `CALL` | `arg1..argN, argc, function_id -> result` | Calls the named function in the current module using the ABI's argument order and frame rules; pushes exactly one result. | `ReferenceError` for an unknown function; `TypeError` for invalid arity; `StackOverflow` at the call-depth limit. |
 | `function.return` | `RETURN` | `value? -> caller result` | Returns the top operand above the current frame base, or `Null` when none exists; discards other frame operands. See `spec/function-abi.md`. | `CompileError` when used outside a function. |
-| `function.lambda` | `LAMBDA` | `body_id, parameter_count -> Closure` | Creates a closure from the compiler-registered body and pending shared-cell capture vector, then clears that vector. | `ReferenceError` for an unknown body; `TypeError` for an invalid count. |
+| `function.lambda` | `LAMBDA` | `body_id, parameter_count -> Function or Closure` | Creates a `Function` when the pending capture vector is empty, otherwise creates a closure from the compiler-registered body and captured shared cells; then clears the vector. | `ReferenceError` for an unknown body; `TypeError` for an invalid count. |
 | `function.capture` | `CAPTURE` | `variable_id -> -` | Resolves the nearest lexical binding and appends its shared cell to the pending closure capture vector; does not copy its value. | `CompileError` for duplicate capture IDs or invalid construction context; `ReferenceError` if the binding does not exist. |
 | `function.tail_call` | `TAIL_CALL` | `arg1..argN, argc, function_id -> caller result` | Performs a direct named tail call using the ABI's argument order; reuses the current frame and preserves its caller's return location. | `ReferenceError` for an unknown function; `TypeError` for invalid arity; `StackOverflow` if the replacement frame exceeds stack capacity. |
 | `function.call_value` | `CALL_VALUE` | `arg1..argN, argc, callable -> result` | Calls a `Function`, `Closure`, or `NativeFunction` value using its descriptor and pushes one result. | `TypeError` for a non-callable or invalid arity; `StackOverflow` at the call-depth limit. |
@@ -132,16 +132,18 @@ Collection key rules, iteration order, indexing details, and complexity contract
 
 | ID | Mnemonic | Stack (bottom -> top) | Effect and side effects | Additional failures |
 |---|---|---|---|---|
-| `object.struct_def` | `STRUCT_DEF` | `struct_id, field_ids..., field_count -> -` | Registers a struct descriptor and its ordered fields at compile time. | `CompileError` for duplicate IDs, duplicate fields, or a mismatched count. |
+| `object.struct_def` | `STRUCT_DEF` | `struct_id, field_ids..., field_count -> -` | Registers a struct descriptor and its ordered fields while the module initializer executes. | `CompileError` for duplicate IDs, duplicate fields, or a mismatched count. |
 | `object.new` | `OBJECT_NEW` | `arg1..argN, argc, struct_id -> Object` | Allocates an instance, initializes declared fields, then calls its constructor if present. | `ReferenceError` for an unknown struct; `TypeError` for invalid constructor arity. |
 | `object.field_get` | `FIELD_GET` | `object, field_id -> value` | Reads an instance field. | `ReferenceError` for an unknown field. |
-| `object.field_set` | `FIELD_SET` | `object, field_id, value -> -` | Updates a mutable instance field. | `ReferenceError` for an unknown field; `TypeError` for an incompatible or immutable field. |
-| `object.method_def` | `METHOD_DEF` | `struct_id, method_id, function_id -> -` | Attaches the named function to the struct as a method at compile time. | `CompileError` for unknown or duplicate IDs. |
+| `object.field_set` | `FIELD_SET` | `object, field_id, value -> -` | Updates a declared mutable instance field. All declared fields are mutable in the current runtime. | `ReferenceError` for an unknown field; `TypeError` for a non-object receiver. |
+| `object.method_def` | `METHOD_DEF` | `struct_id, method_id, function_id -> -` | Attaches the function-table function to the struct while the module initializer executes. | `CompileError` for unknown or duplicate IDs. |
 | `object.method_call` | `METHOD_CALL` | `arg1..argN, argc, object, method_id -> result` | Calls the method with the object as its receiver and pushes its result. | `ReferenceError` for an unknown method; `TypeError` for invalid receiver or arity; `StackOverflow` at the call-depth limit. |
-| `object.interface_def` | `INTERFACE_DEF` | `interface_id, method_ids..., method_count -> -` | Registers the required method identifiers at compile time. | `CompileError` for duplicate IDs or a mismatched count. |
+| `object.interface_def` | `INTERFACE_DEF` | `interface_id, method_ids..., method_count -> -` | Registers the required method identifiers while the module initializer executes. | `CompileError` for duplicate IDs or a mismatched count. |
 | `object.implement` | `IMPLEMENT` | `struct_id, interface_id -> -` | Declares that a struct implements an interface and validates required methods. | `CompileError` for unknown IDs or missing methods. |
 | `object.is` | `OBJECT_IS` | `object, type_id -> Bool` | Checks whether the object is an instance of the struct or interface identified by `type_id`. | `ReferenceError` for an unknown type ID. |
 | `object.clone` | `OBJECT_CLONE` | `object -> Object` | Creates a shallow copy with the same struct and field values. | `TypeError` for a non-object. |
+
+Constructor binding, method receivers, interface conformance, closure cells, and current runtime limits are defined in `spec/object-closure-semantics.md`.
 
 ## Modules
 

@@ -17,7 +17,10 @@ use star_parser::{
 
 use crate::{
     semantic::{self, ResolvedFunction},
-    value::{IteratorState, MapState, RuntimeKey, SetState, Value},
+    value::{
+        binding_cell, BindingCell, ClosureState, FunctionRef, InterfaceDefinition, IteratorState,
+        MapState, ObjectState, RuntimeKey, SetState, StructDefinition, Value,
+    },
     BigInt,
 };
 
@@ -107,12 +110,6 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-#[derive(Clone, Debug)]
-struct Binding {
-    value: Value,
-    mutable: bool,
-}
-
 /// An interpreter instance with injectable standard input and output.
 ///
 /// The first environment is the module-global scope. Nested `SCOPE` nodes add
@@ -123,10 +120,13 @@ pub struct Interpreter<R: BufRead, W: Write> {
     input: R,
     output: W,
     stack: Vec<Value>,
-    scopes: Vec<HashMap<BigInt, Binding>>,
+    scopes: Vec<HashMap<BigInt, BindingCell>>,
     scope_floors: Vec<usize>,
     frame_stack_bases: Vec<usize>,
     functions: HashMap<BigInt, ResolvedFunction>,
+    structs: HashMap<BigInt, StructDefinition>,
+    interfaces: HashMap<BigInt, InterfaceDefinition>,
+    capture_vectors: Vec<Vec<(BigInt, BindingCell)>>,
     call_depth: usize,
     call_depth_limit: usize,
     executed_steps: u64,
@@ -152,6 +152,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             scope_floors: vec![0],
             frame_stack_bases: Vec::new(),
             functions: HashMap::new(),
+            structs: HashMap::new(),
+            interfaces: HashMap::new(),
+            capture_vectors: vec![Vec::new()],
             call_depth: 0,
             call_depth_limit: 512,
             executed_steps: 0,
@@ -174,6 +177,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     /// Executes supported statements in source order.
     pub fn execute(&mut self, program: &Program) -> Result<(), RuntimeError> {
         self.executed_steps = 0;
+        self.structs.clear();
+        self.interfaces.clear();
+        self.capture_vectors = vec![Vec::new()];
         self.functions = semantic::resolve_functions(program)
             .map_err(|error| RuntimeError {
                 kind: RuntimeErrorKind::CompileError(error.kind.to_string()),
@@ -217,8 +223,10 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     /// Returns a module-global binding, if one exists.
-    pub fn global(&self, id: &BigInt) -> Option<&Value> {
-        self.scopes[0].get(id).map(|binding| &binding.value)
+    pub fn global(&self, id: &BigInt) -> Option<Value> {
+        self.scopes[0]
+            .get(id)
+            .map(|binding| binding.borrow().value.clone())
     }
 
     /// Returns the injected I/O objects after execution.
@@ -336,10 +344,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         };
         self.scopes.push(HashMap::from([(
             variable_id.clone(),
-            Binding {
-                value: Value::Null,
-                mutable: true,
-            },
+            binding_cell(Value::Null, true),
         )]));
 
         let result = (|| loop {
@@ -360,6 +365,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .expect("FOR scope exists")
                 .get_mut(&variable_id)
                 .expect("FOR binding exists")
+                .borrow_mut()
                 .value = value;
             match self.execute_statements(&block.body)? {
                 ControlFlow::Normal | ControlFlow::Continue => {}
@@ -435,6 +441,19 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             )
         })?;
+        let value = self.invoke_function(function, arguments, Vec::new(), span)?;
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn invoke_function(
+        &mut self,
+        function: ResolvedFunction,
+        arguments: Vec<Value>,
+        captures: Vec<(BigInt, BindingCell)>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let argument_count = arguments.len();
         if function.kind == FunctionKind::Asynchronous {
             return Err(self.error(
                 RuntimeErrorKind::Unsupported("asynchronous function scheduling"),
@@ -462,6 +481,13 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
         let stack_base = self.stack.len();
         let scope_base = self.scopes.len();
+        if !captures.is_empty() {
+            self.scopes.push(
+                captures
+                    .into_iter()
+                    .collect::<HashMap<BigInt, BindingCell>>(),
+            );
+        }
         let mut local_bindings = HashMap::new();
         if function.variadic {
             let fixed_count = parameter_count.saturating_sub(1);
@@ -471,39 +497,26 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .take(fixed_count)
                 .zip(arguments.iter().take(fixed_count))
             {
-                local_bindings.insert(
-                    id.clone(),
-                    Binding {
-                        value: value.clone(),
-                        mutable: true,
-                    },
-                );
+                local_bindings.insert(id.clone(), binding_cell(value.clone(), true));
             }
             let rest = arguments.into_iter().skip(fixed_count).collect();
             local_bindings.insert(
                 function.parameter_ids[fixed_count].clone(),
-                Binding {
-                    value: Value::Array(Rc::new(RefCell::new(rest))),
-                    mutable: true,
-                },
+                binding_cell(Value::Array(Rc::new(RefCell::new(rest))), true),
             );
         } else {
             for (id, value) in function.parameter_ids.iter().zip(arguments) {
-                local_bindings.insert(
-                    id.clone(),
-                    Binding {
-                        value,
-                        mutable: true,
-                    },
-                );
+                local_bindings.insert(id.clone(), binding_cell(value, true));
             }
         }
         self.scopes.push(local_bindings);
         self.scope_floors.push(scope_base);
         self.frame_stack_bases.push(stack_base);
+        self.capture_vectors.push(Vec::new());
         self.call_depth += 1;
         let result = self.execute_statements(&function.body);
         self.call_depth -= 1;
+        self.capture_vectors.pop();
         self.frame_stack_bases.pop();
         self.scope_floors.pop();
         self.scopes.truncate(scope_base);
@@ -520,7 +533,387 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 ));
             }
         };
+        Ok(value)
+    }
+
+    fn capture(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let id = self.pop_identifier(span)?;
+        let floor = *self.scope_floors.last().unwrap_or(&0);
+        let cell = self
+            .scopes
+            .iter()
+            .enumerate()
+            .skip(floor)
+            .rev()
+            .find_map(|(_, scope)| scope.get(&id).cloned())
+            .or_else(|| {
+                (floor > 0)
+                    .then(|| self.scopes[0].get(&id).cloned())
+                    .flatten()
+            });
+        let Some(cell) = cell else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("captured binding does not exist"),
+                span,
+            ));
+        };
+        let Some(captures) = self.capture_vectors.last_mut() else {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("CAPTURE outside an execution frame".into()),
+                span,
+            ));
+        };
+        if captures.iter().any(|(captured_id, _)| captured_id == &id) {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("duplicate closure capture ID".into()),
+                span,
+            ));
+        }
+        captures.push((id, cell));
+        Ok(())
+    }
+
+    fn lambda(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let parameter_count = self.pop_count(span, "nonnegative parameter count")?;
+        let body_id = self.pop_identifier(span)?;
+        let Some(function) = self.functions.get(&body_id) else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("lambda body function does not exist"),
+                span,
+            ));
+        };
+        if function.parameter_ids.len() != parameter_count {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "parameter count matching lambda body",
+                    found: "wrong parameter count",
+                },
+                span,
+            ));
+        }
+        let Some(capture_vector) = self.capture_vectors.last_mut() else {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("LAMBDA outside an execution frame".into()),
+                span,
+            ));
+        };
+        let captures = std::mem::take(capture_vector);
+        let function = FunctionRef {
+            module_index: 0,
+            id: body_id,
+        };
+        if captures.is_empty() {
+            self.stack.push(Value::Function(function));
+        } else {
+            self.stack
+                .push(Value::Closure(Rc::new(ClosureState { function, captures })));
+        }
+        Ok(())
+    }
+
+    fn call_value(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let callable = self.pop(span)?;
+        let argument_count = self.pop_count(span, "representable nonnegative argument count")?;
+        if argument_count > self.stack.len() {
+            return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
+        }
+        let mut arguments = Vec::with_capacity(argument_count);
+        for _ in 0..argument_count {
+            arguments.push(self.pop(span)?);
+        }
+        arguments.reverse();
+        let (function_ref, captures) = match callable {
+            Value::Function(function) => (function, Vec::new()),
+            Value::Closure(closure) => (closure.function.clone(), closure.captures.clone()),
+            other => return Err(self.type_error("Function or Closure", &other, span)),
+        };
+        if function_ref.module_index != 0 {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("function belongs to another module"),
+                span,
+            ));
+        }
+        let Some(function) = self.functions.get(&function_ref.id).cloned() else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("function does not exist"),
+                span,
+            ));
+        };
+        let result = self.invoke_function(function, arguments, captures, span)?;
+        self.stack.push(result);
+        Ok(())
+    }
+
+    fn define_struct(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let field_count = self.pop_count(span, "nonnegative field count")?;
+        let mut field_ids = Vec::with_capacity(field_count);
+        for _ in 0..field_count {
+            field_ids.push(self.pop_identifier(span)?);
+        }
+        field_ids.reverse();
+        let struct_id = self.pop_identifier(span)?;
+        let unique: HashSet<_> = field_ids.iter().cloned().collect();
+        if unique.len() != field_ids.len()
+            || self.structs.contains_key(&struct_id)
+            || self.interfaces.contains_key(&struct_id)
+        {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("duplicate struct or field ID".into()),
+                span,
+            ));
+        }
+        self.structs.insert(
+            struct_id,
+            StructDefinition {
+                field_ids,
+                methods: HashMap::new(),
+                interfaces: HashSet::new(),
+            },
+        );
+        Ok(())
+    }
+
+    fn define_method(
+        &mut self,
+        span: Span,
+        function_ids: &HashSet<BigInt>,
+    ) -> Result<(), RuntimeError> {
+        let function_id = self.pop_identifier(span)?;
+        let method_id = self.pop_identifier(span)?;
+        let struct_id = self.pop_identifier(span)?;
+        if !function_ids.contains(&function_id) {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("METHOD_DEF references an unknown function".into()),
+                span,
+            ));
+        }
+        let Some(descriptor) = self.structs.get_mut(&struct_id) else {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("METHOD_DEF references an unknown struct".into()),
+                span,
+            ));
+        };
+        if descriptor.methods.contains_key(&method_id) {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("duplicate method ID".into()),
+                span,
+            ));
+        }
+        descriptor.methods.insert(method_id, function_id);
+        Ok(())
+    }
+
+    fn define_interface(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let method_count = self.pop_count(span, "nonnegative interface method count")?;
+        let mut method_ids = HashSet::with_capacity(method_count);
+        for _ in 0..method_count {
+            if !method_ids.insert(self.pop_identifier(span)?) {
+                return Err(self.error(
+                    RuntimeErrorKind::CompileError("duplicate interface method ID".into()),
+                    span,
+                ));
+            }
+        }
+        let interface_id = self.pop_identifier(span)?;
+        if self.interfaces.contains_key(&interface_id) || self.structs.contains_key(&interface_id) {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("duplicate interface ID".into()),
+                span,
+            ));
+        }
+        self.interfaces
+            .insert(interface_id, InterfaceDefinition { method_ids });
+        Ok(())
+    }
+
+    fn implement_interface(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let interface_id = self.pop_identifier(span)?;
+        let struct_id = self.pop_identifier(span)?;
+        let Some(interface) = self.interfaces.get(&interface_id) else {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("IMPLEMENT references an unknown interface".into()),
+                span,
+            ));
+        };
+        let required_methods = interface.method_ids.clone();
+        let Some(descriptor) = self.structs.get_mut(&struct_id) else {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("IMPLEMENT references an unknown struct".into()),
+                span,
+            ));
+        };
+        if !required_methods
+            .iter()
+            .all(|method_id| descriptor.methods.contains_key(method_id))
+        {
+            return Err(self.error(
+                RuntimeErrorKind::CompileError("struct is missing an interface method".into()),
+                span,
+            ));
+        }
+        descriptor.interfaces.insert(interface_id);
+        Ok(())
+    }
+
+    fn object_new(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let struct_id = self.pop_identifier(span)?;
+        let argument_count = self.pop_count(span, "representable nonnegative argument count")?;
+        if argument_count > self.stack.len() {
+            return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
+        }
+        let mut arguments = Vec::with_capacity(argument_count);
+        for _ in 0..argument_count {
+            arguments.push(self.pop(span)?);
+        }
+        arguments.reverse();
+        let Some(descriptor) = self.structs.get(&struct_id).cloned() else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("struct does not exist"),
+                span,
+            ));
+        };
+        let object = Value::Object(Rc::new(RefCell::new(ObjectState {
+            struct_id: struct_id.clone(),
+            fields: descriptor
+                .field_ids
+                .iter()
+                .cloned()
+                .map(|field_id| (field_id, Value::Null))
+                .collect(),
+        })));
+        if let Some(constructor_id) = descriptor.methods.get(&BigInt::from(0)) {
+            let Some(function) = self.functions.get(constructor_id).cloned() else {
+                return Err(self.error(
+                    RuntimeErrorKind::ReferenceError("constructor function does not exist"),
+                    span,
+                ));
+            };
+            let mut constructor_args = Vec::with_capacity(argument_count + 1);
+            constructor_args.push(object.clone());
+            constructor_args.extend(arguments);
+            self.invoke_function(function, constructor_args, Vec::new(), span)?;
+        } else if !arguments.is_empty() {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "zero arguments for a struct without a constructor",
+                    found: "nonzero argument count",
+                },
+                span,
+            ));
+        }
+        self.stack.push(object);
+        Ok(())
+    }
+
+    fn field_get(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let field_id = self.pop_identifier(span)?;
+        let value = self.pop(span)?;
+        let Value::Object(object) = value else {
+            return Err(self.type_error("Struct", &value, span));
+        };
+        let Some(value) = object.borrow().fields.get(&field_id).cloned() else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("field does not exist"),
+                span,
+            ));
+        };
         self.stack.push(value);
+        Ok(())
+    }
+
+    fn field_set(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let field_id = self.pop_identifier(span)?;
+        let object_value = self.pop(span)?;
+        let Value::Object(object) = object_value else {
+            return Err(self.type_error("Struct", &object_value, span));
+        };
+        let mut object = object.borrow_mut();
+        let Some(field) = object.fields.get_mut(&field_id) else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("field does not exist"),
+                span,
+            ));
+        };
+        *field = value;
+        Ok(())
+    }
+
+    fn method_call(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let method_id = self.pop_identifier(span)?;
+        if method_id.is_zero() {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("constructor is not an instance method"),
+                span,
+            ));
+        }
+        let receiver = self.pop(span)?;
+        let Value::Object(object) = &receiver else {
+            return Err(self.type_error("Struct", &receiver, span));
+        };
+        let argument_count = self.pop_count(span, "representable nonnegative argument count")?;
+        if argument_count > self.stack.len() {
+            return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
+        }
+        let mut arguments = Vec::with_capacity(argument_count + 1);
+        for _ in 0..argument_count {
+            arguments.push(self.pop(span)?);
+        }
+        arguments.reverse();
+        arguments.insert(0, receiver.clone());
+        let struct_id = object.borrow().struct_id.clone();
+        let function_id = self
+            .structs
+            .get(&struct_id)
+            .and_then(|descriptor| descriptor.methods.get(&method_id))
+            .cloned()
+            .ok_or_else(|| {
+                self.error(
+                    RuntimeErrorKind::ReferenceError("method does not exist"),
+                    span,
+                )
+            })?;
+        let Some(function) = self.functions.get(&function_id).cloned() else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("method function does not exist"),
+                span,
+            ));
+        };
+        let result = self.invoke_function(function, arguments, Vec::new(), span)?;
+        self.stack.push(result);
+        Ok(())
+    }
+
+    fn object_is(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let type_id = self.pop_identifier(span)?;
+        let value = self.pop(span)?;
+        let Value::Object(object) = value else {
+            return Err(self.type_error("Struct", &value, span));
+        };
+        if !self.structs.contains_key(&type_id) && !self.interfaces.contains_key(&type_id) {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("type ID does not exist"),
+                span,
+            ));
+        }
+        let object = object.borrow();
+        let matches = object.struct_id == type_id
+            || self
+                .structs
+                .get(&object.struct_id)
+                .is_some_and(|descriptor| descriptor.interfaces.contains(&type_id));
+        self.stack.push(Value::Bool(matches));
+        Ok(())
+    }
+
+    fn object_clone(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let Value::Object(object) = value else {
+            return Err(self.type_error("Struct", &value, span));
+        };
+        self.stack.push(Value::Object(Rc::new(RefCell::new(
+            object.borrow().clone(),
+        ))));
         Ok(())
     }
 
@@ -588,6 +981,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x1E) => self.to_byte(span),
             InstructionOpcode::Extended(0x23) => self.less_than(span),
             InstructionOpcode::Extended(0x41) => self.call_function(span),
+            InstructionOpcode::Extended(0x43) => self.lambda(span),
+            InstructionOpcode::Extended(0x44) => self.capture(span),
+            InstructionOpcode::Extended(0x46) => self.call_value(span),
             InstructionOpcode::Extended(0x60) => self.array_new(span),
             InstructionOpcode::Extended(0x61) => self.map_new(span),
             InstructionOpcode::Extended(0x62) => self.set_new(span),
@@ -602,6 +998,19 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x6B) => self.tuple_new(span),
             InstructionOpcode::Extended(0x6C) => self.slice(span),
             InstructionOpcode::Extended(0x6D) => self.concat(span),
+            InstructionOpcode::Extended(0x70) => self.define_struct(span),
+            InstructionOpcode::Extended(0x71) => self.object_new(span),
+            InstructionOpcode::Extended(0x72) => self.field_get(span),
+            InstructionOpcode::Extended(0x73) => self.field_set(span),
+            InstructionOpcode::Extended(0x74) => {
+                let function_ids = self.functions.keys().cloned().collect();
+                self.define_method(span, &function_ids)
+            }
+            InstructionOpcode::Extended(0x75) => self.method_call(span),
+            InstructionOpcode::Extended(0x76) => self.define_interface(span),
+            InstructionOpcode::Extended(0x77) => self.implement_interface(span),
+            InstructionOpcode::Extended(0x78) => self.object_is(span),
+            InstructionOpcode::Extended(0x79) => self.object_clone(span),
             InstructionOpcode::Extended(0x50) => self.declare(span, true),
             InstructionOpcode::Extended(0x51) => self.declare(span, false),
             InstructionOpcode::Extended(0x52) => self.delete(span),
@@ -666,7 +1075,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             Value::Tuple(value) => !value.is_empty(),
             Value::Map(value) => !value.borrow().entries.is_empty(),
             Value::Set(value) => !value.borrow().members.is_empty(),
-            Value::Iterator(_) | Value::Char(_) => true,
+            Value::Iterator(_)
+            | Value::Char(_)
+            | Value::Function(_)
+            | Value::Closure(_)
+            | Value::Object(_) => true,
         };
         self.stack.push(Value::Bool(truthy));
         Ok(())
@@ -1274,8 +1687,10 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             .or_else(|| (floor > 0 && self.scopes[0].contains_key(&id)).then_some(0));
         if let Some(index) = index {
             let binding = self.scopes[index]
-                .get_mut(&id)
-                .expect("binding index was found above");
+                .get(&id)
+                .expect("binding index was found above")
+                .clone();
+            let mut binding = binding.borrow_mut();
             if !binding.mutable {
                 return Err(self.error(
                     RuntimeErrorKind::ReferenceError("cannot update an immutable binding"),
@@ -1284,13 +1699,10 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
             binding.value = value;
         } else {
-            self.scopes.last_mut().expect("root scope exists").insert(
-                id,
-                Binding {
-                    value,
-                    mutable: true,
-                },
-            );
+            self.scopes
+                .last_mut()
+                .expect("root scope exists")
+                .insert(id, binding_cell(value, true));
         }
         Ok(())
     }
@@ -1298,23 +1710,17 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     fn store_global(&mut self, span: Span) -> Result<(), RuntimeError> {
         let id = self.pop_identifier(span)?;
         let value = self.pop(span)?;
-        let globals = self.scopes.first_mut().expect("root scope exists");
-        if let Some(binding) = globals.get_mut(&id) {
-            if !binding.mutable {
+        let existing = self.scopes[0].get(&id).cloned();
+        if let Some(binding) = existing {
+            if !binding.borrow().mutable {
                 return Err(self.error(
                     RuntimeErrorKind::ReferenceError("cannot update an immutable global"),
                     span,
                 ));
             }
-            binding.value = value;
+            binding.borrow_mut().value = value;
         } else {
-            globals.insert(
-                id,
-                Binding {
-                    value,
-                    mutable: true,
-                },
-            );
+            self.scopes[0].insert(id, binding_cell(value, true));
         }
         Ok(())
     }
@@ -1339,7 +1745,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         };
-        self.stack.push(binding.value.clone());
+        self.stack.push(binding.borrow().value.clone());
         Ok(())
     }
 
@@ -1353,7 +1759,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         }
-        scope.insert(id, Binding { value, mutable });
+        scope.insert(id, binding_cell(value, mutable));
         Ok(())
     }
 
@@ -1365,7 +1771,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 RuntimeErrorKind::ReferenceError("binding does not exist in this scope"),
                 span,
             )),
-            Some(binding) if !binding.mutable => Err(self.error(
+            Some(binding) if !binding.borrow().mutable => Err(self.error(
                 RuntimeErrorKind::ReferenceError("cannot delete an immutable binding"),
                 span,
             )),

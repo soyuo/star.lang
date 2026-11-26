@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
@@ -8,9 +8,11 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use star_common::{SourcePosition, Span};
 use star_compiler::{verify_bytecode, Capability, IrOp, VerificationPolicy, VerifiedProgram};
 
-use crate::value::{IteratorState, Value};
+use crate::value::{
+    binding_cell, BindingCell, ClosureState, FunctionRef, IteratorState, ObjectState, Value,
+};
 
-use super::{empty_span, Binding, Interpreter, RuntimeError, RuntimeErrorKind};
+use super::{empty_span, Interpreter, RuntimeError, RuntimeErrorKind};
 
 /// Executes verified version 1.0 `.starc` bytecode using the reference runtime.
 ///
@@ -70,7 +72,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     }
 
     /// Returns a module-global binding, if one exists.
-    pub fn global(&self, id: &BigInt) -> Option<&Value> {
+    pub fn global(&self, id: &BigInt) -> Option<Value> {
         self.runtime.global(id)
     }
 
@@ -89,6 +91,10 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         }
         self.runtime.frame_stack_bases.clear();
         self.runtime.functions.clear();
+        self.runtime.structs.clear();
+        self.runtime.interfaces.clear();
+        self.runtime.capture_vectors.clear();
+        self.runtime.capture_vectors.push(Vec::new());
         self.runtime.call_depth = 0;
         self.runtime.executed_steps = 0;
     }
@@ -141,8 +147,33 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     })?;
                     match value {
                         Constant::Value(value) => self.runtime.stack.push(value.clone()),
-                        Constant::FunctionRef | Constant::TypeRef => {
-                            return Err(self.unsupported(span, "function/type constant values"));
+                        Constant::FunctionRef(function_index) => {
+                            let function = image
+                                .functions
+                                .get(*function_index as usize)
+                                .ok_or_else(|| {
+                                    self.runtime.error(
+                                        RuntimeErrorKind::CompileError(
+                                            "function constant index out of range".into(),
+                                        ),
+                                        span,
+                                    )
+                                })?;
+                            let Some(id) = function.id.clone() else {
+                                return Err(self.runtime.error(
+                                    RuntimeErrorKind::ReferenceError(
+                                        "initializer is not a function value",
+                                    ),
+                                    span,
+                                ));
+                            };
+                            self.runtime.stack.push(Value::Function(FunctionRef {
+                                module_index: function.module_index,
+                                id,
+                            }));
+                        }
+                        Constant::TypeRef => {
+                            return Err(self.unsupported(span, "type constant values"));
                         }
                     }
                 }
@@ -155,7 +186,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     })?;
                     self.check_capability(operation, span)?;
                     if let Some(request) =
-                        self.call_intrinsic(operation, span, frame.module_index)?
+                        self.call_intrinsic(operation, span, frame.module_index, image)?
                     {
                         self.enter_function(request, span, image, &mut frames)?;
                     }
@@ -195,12 +226,16 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                             span,
                         ));
                     }
+                    let action = frame.return_action.clone();
                     let value = self.return_frame(unwind as usize, span, frame)?;
                     frames.pop();
                     if frames.is_empty() {
                         return Ok(value);
                     }
-                    self.runtime.stack.push(value);
+                    match action {
+                        ReturnAction::PushResult => self.runtime.stack.push(value),
+                        ReturnAction::PushValue(value) => self.runtime.stack.push(value),
+                    }
                 }
                 Instruction::Halt => {
                     if !frame.initializer {
@@ -371,13 +406,11 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 ));
             }
             let scope = &mut self.runtime.scopes[scope_depth];
-            scope.insert(
-                variable_id,
-                Binding {
-                    value,
-                    mutable: true,
-                },
-            );
+            if let Some(binding) = scope.get(&variable_id) {
+                binding.borrow_mut().value = value;
+            } else {
+                scope.insert(variable_id, binding_cell(value, true));
+            }
             frame.ip = body_target;
         } else {
             frame.loop_states.remove(&loop_id);
@@ -412,6 +445,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.scopes.truncate(frame.scope_floor);
         self.runtime.scope_floors.pop();
         self.runtime.frame_stack_bases.pop();
+        self.runtime.capture_vectors.pop();
         self.runtime.call_depth = self.runtime.call_depth.saturating_sub(1);
         Ok(value)
     }
@@ -462,6 +496,15 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         }
         let scope_floor = self.runtime.scopes.len();
         let stack_base = self.runtime.stack.len();
+        if !request.captures.is_empty() {
+            self.runtime.scopes.push(
+                request
+                    .captures
+                    .iter()
+                    .cloned()
+                    .collect::<HashMap<BigInt, BindingCell>>(),
+            );
+        }
         let mut parameters = HashMap::with_capacity(function.parameter_ids.len());
         for (position, id) in function.parameter_ids.iter().enumerate() {
             let value = if function.rest_parameter_code != 0
@@ -473,17 +516,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             } else {
                 request.arguments[position].clone()
             };
-            parameters.insert(
-                id.clone(),
-                Binding {
-                    value,
-                    mutable: true,
-                },
-            );
+            parameters.insert(id.clone(), binding_cell(value, true));
         }
         self.runtime.scope_floors.push(scope_floor);
         self.runtime.frame_stack_bases.push(stack_base);
         self.runtime.scopes.push(parameters);
+        self.runtime.capture_vectors.push(Vec::new());
         self.runtime.call_depth += 1;
         frames.push(Frame::function(
             function_index,
@@ -491,6 +529,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             stack_base,
             scope_floor,
             self.runtime.scopes.len(),
+            request.return_action,
         ));
         Ok(())
     }
@@ -500,6 +539,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         operation: IrOp,
         span: Span,
         module_index: u32,
+        image: &Image<'_>,
     ) -> Result<Option<CallRequest>, RuntimeError> {
         use IrOp::*;
         match operation {
@@ -672,6 +712,238 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Delete => self.runtime.delete(span)?,
             LoadGlobal => self.runtime.load(span, true)?,
             StoreGlobal => self.runtime.store_global(span)?,
+            StructDef => self.runtime.define_struct(span)?,
+            MethodDef => {
+                let function_ids = image
+                    .functions
+                    .iter()
+                    .filter(|function| function.module_index == module_index)
+                    .filter_map(|function| function.id.clone())
+                    .collect::<HashSet<_>>();
+                self.runtime.define_method(span, &function_ids)?;
+            }
+            InterfaceDef => {
+                let method_count = self
+                    .runtime
+                    .pop_count(span, "nonnegative interface method count")?;
+                let mut method_ids = std::collections::HashSet::with_capacity(method_count);
+                for _ in 0..method_count {
+                    if !method_ids.insert(self.runtime.pop_identifier(span)?) {
+                        return Err(self.runtime.error(
+                            RuntimeErrorKind::CompileError("duplicate interface method ID".into()),
+                            span,
+                        ));
+                    }
+                }
+                let interface_id = self.runtime.pop_identifier(span)?;
+                if self.runtime.interfaces.contains_key(&interface_id)
+                    || self.runtime.structs.contains_key(&interface_id)
+                {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::CompileError("duplicate or cross-kind type ID".into()),
+                        span,
+                    ));
+                }
+                self.runtime.interfaces.insert(
+                    interface_id,
+                    crate::value::InterfaceDefinition { method_ids },
+                );
+            }
+            Implement => self.runtime.implement_interface(span)?,
+            ObjectNew => {
+                let struct_id = self.runtime.pop_identifier(span)?;
+                let count = self
+                    .runtime
+                    .pop_count(span, "nonnegative Int argument count")?;
+                if count > self.runtime.stack.len() {
+                    return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
+                }
+                let mut arguments = Vec::with_capacity(count);
+                for _ in 0..count {
+                    arguments.push(self.runtime.pop(span)?);
+                }
+                arguments.reverse();
+                let Some(descriptor) = self.runtime.structs.get(&struct_id).cloned() else {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::ReferenceError("struct does not exist"),
+                        span,
+                    ));
+                };
+                let object = Value::Object(Rc::new(RefCell::new(ObjectState {
+                    struct_id,
+                    fields: descriptor
+                        .field_ids
+                        .iter()
+                        .cloned()
+                        .map(|field_id| (field_id, Value::Null))
+                        .collect(),
+                })));
+                if let Some(constructor_id) = descriptor.methods.get(&BigInt::zero()) {
+                    let Some(function) = image.functions.iter().find(|function| {
+                        function.module_index == module_index
+                            && function.id.as_ref() == Some(constructor_id)
+                    }) else {
+                        return Err(self.runtime.error(
+                            RuntimeErrorKind::ReferenceError("constructor function does not exist"),
+                            span,
+                        ));
+                    };
+                    if function.asynchronous {
+                        return Err(self.unsupported(span, "async constructor scheduling"));
+                    }
+                    let mut arguments_with_receiver = Vec::with_capacity(count + 1);
+                    arguments_with_receiver.push(object.clone());
+                    arguments_with_receiver.extend(arguments);
+                    return Ok(Some(CallRequest {
+                        module_index,
+                        function_id: constructor_id.clone(),
+                        arguments: arguments_with_receiver,
+                        captures: Vec::new(),
+                        return_action: ReturnAction::PushValue(object),
+                    }));
+                }
+                if !arguments.is_empty() {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "zero arguments for a struct without a constructor",
+                            found: "nonzero argument count",
+                        },
+                        span,
+                    ));
+                }
+                self.runtime.stack.push(object);
+            }
+            FieldGet => self.runtime.field_get(span)?,
+            FieldSet => self.runtime.field_set(span)?,
+            MethodCall => {
+                let method_id = self.runtime.pop_identifier(span)?;
+                if method_id.is_zero() {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::ReferenceError("constructor is not an instance method"),
+                        span,
+                    ));
+                }
+                let receiver = self.runtime.pop(span)?;
+                let Value::Object(object) = &receiver else {
+                    return Err(self.runtime.type_error("Struct", &receiver, span));
+                };
+                let struct_id = object.borrow().struct_id.clone();
+                let count = self
+                    .runtime
+                    .pop_count(span, "nonnegative Int argument count")?;
+                if count > self.runtime.stack.len() {
+                    return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
+                }
+                let mut arguments = Vec::with_capacity(count + 1);
+                for _ in 0..count {
+                    arguments.push(self.runtime.pop(span)?);
+                }
+                arguments.reverse();
+                arguments.insert(0, receiver);
+                let function_id = self
+                    .runtime
+                    .structs
+                    .get(&struct_id)
+                    .and_then(|descriptor| descriptor.methods.get(&method_id))
+                    .cloned()
+                    .ok_or_else(|| {
+                        self.runtime.error(
+                            RuntimeErrorKind::ReferenceError("method does not exist"),
+                            span,
+                        )
+                    })?;
+                let Some(function) = image.functions.iter().find(|function| {
+                    function.module_index == module_index
+                        && function.id.as_ref() == Some(&function_id)
+                }) else {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::ReferenceError("method function does not exist"),
+                        span,
+                    ));
+                };
+                if function.asynchronous {
+                    return Err(self.unsupported(span, "async method scheduling"));
+                }
+                return Ok(Some(CallRequest {
+                    module_index,
+                    function_id,
+                    arguments,
+                    captures: Vec::new(),
+                    return_action: ReturnAction::PushResult,
+                }));
+            }
+            ObjectIs => self.runtime.object_is(span)?,
+            ObjectClone => self.runtime.object_clone(span)?,
+            Capture => self.runtime.capture(span)?,
+            Lambda => {
+                let parameter_count = self
+                    .runtime
+                    .pop_count(span, "nonnegative parameter count")?;
+                let body_id = self.runtime.pop_identifier(span)?;
+                let Some(function) = image.functions.iter().find(|function| {
+                    function.module_index == module_index && function.id.as_ref() == Some(&body_id)
+                }) else {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::ReferenceError("lambda body function does not exist"),
+                        span,
+                    ));
+                };
+                if function.parameter_ids.len() != parameter_count {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "parameter count matching lambda body",
+                            found: "wrong parameter count",
+                        },
+                        span,
+                    ));
+                }
+                if self.runtime.capture_vectors.is_empty() {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::CompileError("LAMBDA outside an execution frame".into()),
+                        span,
+                    ));
+                }
+                let captures = std::mem::take(self.runtime.capture_vectors.last_mut().unwrap());
+                let function = FunctionRef {
+                    module_index,
+                    id: body_id,
+                };
+                if captures.is_empty() {
+                    self.runtime.stack.push(Value::Function(function));
+                } else {
+                    self.runtime
+                        .stack
+                        .push(Value::Closure(Rc::new(ClosureState { function, captures })));
+                }
+            }
+            CallValue => {
+                let callable = self.runtime.pop(span)?;
+                let count = self
+                    .runtime
+                    .pop_count(span, "nonnegative Int argument count")?;
+                if count > self.runtime.stack.len() {
+                    return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
+                }
+                let mut arguments = Vec::with_capacity(count);
+                for _ in 0..count {
+                    arguments.push(self.runtime.pop(span)?);
+                }
+                arguments.reverse();
+                let (function, captures) = match callable {
+                    Value::Function(function) => (function, Vec::new()),
+                    Value::Closure(closure) => (closure.function.clone(), closure.captures.clone()),
+                    other => {
+                        return Err(self.runtime.type_error("Function or Closure", &other, span))
+                    }
+                };
+                return Ok(Some(CallRequest {
+                    module_index: function.module_index,
+                    function_id: function.id,
+                    arguments,
+                    captures,
+                    return_action: ReturnAction::PushResult,
+                }));
+            }
             Call => {
                 let function_id = self.runtime.pop_identifier(span)?;
                 let count = self
@@ -689,6 +961,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     module_index,
                     function_id,
                     arguments,
+                    captures: Vec::new(),
+                    return_action: ReturnAction::PushResult,
                 }));
             }
             Import | ImportDynamic => {
@@ -956,7 +1230,7 @@ fn is_decimal_float(value: &str) -> bool {
 #[derive(Clone, Debug)]
 enum Constant {
     Value(Value),
-    FunctionRef,
+    FunctionRef(u32),
     TypeRef,
 }
 
@@ -1043,6 +1317,7 @@ struct Frame {
     scope_floor: usize,
     base_scope_depth: usize,
     initializer: bool,
+    return_action: ReturnAction,
     loop_states: HashMap<u32, LoopState>,
 }
 
@@ -1056,6 +1331,7 @@ impl Frame {
             scope_floor: 1,
             base_scope_depth: 1,
             initializer: true,
+            return_action: ReturnAction::PushResult,
             loop_states: HashMap::new(),
             function,
         }
@@ -1067,6 +1343,7 @@ impl Frame {
         stack_base: usize,
         scope_floor: usize,
         base_scope_depth: usize,
+        return_action: ReturnAction,
     ) -> Self {
         Self {
             function_index,
@@ -1076,6 +1353,7 @@ impl Frame {
             scope_floor,
             base_scope_depth,
             initializer: false,
+            return_action,
             loop_states: HashMap::new(),
             function,
         }
@@ -1093,6 +1371,14 @@ struct CallRequest {
     module_index: u32,
     function_id: BigInt,
     arguments: Vec<Value>,
+    captures: Vec<(BigInt, BindingCell)>,
+    return_action: ReturnAction,
+}
+
+#[derive(Clone, Debug)]
+enum ReturnAction {
+    PushResult,
+    PushValue(Value),
 }
 
 enum Instruction {
@@ -1197,10 +1483,7 @@ fn parse_constants(bytes: &[u8]) -> Result<Vec<Constant>, String> {
                 let value = char::from_u32(scalar).ok_or("invalid Unicode scalar constant")?;
                 Constant::Value(Value::Char(value))
             }
-            7 => {
-                payload.u32()?;
-                Constant::FunctionRef
-            }
+            7 => Constant::FunctionRef(payload.u32()?),
             8 => {
                 payload.u32()?;
                 Constant::TypeRef
