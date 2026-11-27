@@ -282,6 +282,15 @@ enum GuestTaskStatus {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum GuestTaskStatusKind {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Clone, Debug)]
 struct GuestTask {
     function: ResolvedFunction,
@@ -479,17 +488,28 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     .saturating_add(match &task.status {
                         GuestTaskStatus::Completed(value) => size_of::<Value>()
                             .saturating_add(estimated_unmanaged_payload_bytes(value, 0)),
-                        GuestTaskStatus::Failed(error) => size_of::<RuntimeError>().saturating_add(
-                            error
-                                .stack_trace
-                                .capacity()
-                                .saturating_mul(size_of::<StackTraceFrame>()),
-                        ),
+                        GuestTaskStatus::Failed(error) => estimated_runtime_error_bytes(error),
                         GuestTaskStatus::Pending
                         | GuestTaskStatus::Running
                         | GuestTaskStatus::Cancelled => 0,
                     })
             }))
+    }
+
+    fn task_status_kind_and_copy_bytes(&self, id: u64) -> Option<(GuestTaskStatusKind, usize)> {
+        self.tasks.get(&id).map(|task| match &task.status {
+            GuestTaskStatus::Pending => (GuestTaskStatusKind::Pending, 0),
+            GuestTaskStatus::Running => (GuestTaskStatusKind::Running, 0),
+            GuestTaskStatus::Completed(value) => (
+                GuestTaskStatusKind::Completed,
+                size_of::<Value>().saturating_add(estimated_unmanaged_payload_bytes(value, 0)),
+            ),
+            GuestTaskStatus::Failed(error) => (
+                GuestTaskStatusKind::Failed,
+                estimated_runtime_error_bytes(error),
+            ),
+            GuestTaskStatus::Cancelled => (GuestTaskStatusKind::Cancelled, 0),
+        })
     }
 
     pub(crate) fn call_frame_bookkeeping_growth_bytes(&self) -> usize {
@@ -1157,32 +1177,58 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     fn run_task(&mut self, id: u64, span: Span) -> Result<Value, RuntimeError> {
-        let Some((status, clone_bytes)) = self.tasks.get(&id).map(|task| {
-            let clone_bytes = estimated_function_clone_bytes(&task.function)
-                .saturating_add(task.arguments.capacity().saturating_mul(size_of::<Value>()))
-                .saturating_add(estimate_cloned_value_payloads(&task.arguments))
-                .saturating_add(estimated_capture_clone_bytes(&task.captures));
-            (task.status.clone(), clone_bytes)
-        }) else {
+        let Some((status, clone_bytes)) = self.task_status_kind_and_copy_bytes(id) else {
             return Err(self.error(
                 RuntimeErrorKind::ReferenceError("task does not exist"),
                 span,
             ));
         };
         match status {
-            GuestTaskStatus::Completed(value) => return Ok(value),
-            GuestTaskStatus::Failed(error) => return Err(error),
-            GuestTaskStatus::Cancelled => {
+            GuestTaskStatusKind::Completed => {
+                self.ensure_memory_budget(clone_bytes, span)?;
+                let Some(GuestTaskStatus::Completed(value)) =
+                    self.tasks.get(&id).map(|task| &task.status)
+                else {
+                    return Err(
+                        self.error(RuntimeErrorKind::ReferenceError("task state changed"), span)
+                    );
+                };
+                return Ok(value.clone());
+            }
+            GuestTaskStatusKind::Failed => {
+                self.ensure_memory_budget(clone_bytes, span)?;
+                let Some(GuestTaskStatus::Failed(error)) =
+                    self.tasks.get(&id).map(|task| &task.status)
+                else {
+                    return Err(
+                        self.error(RuntimeErrorKind::ReferenceError("task state changed"), span)
+                    );
+                };
+                return Err(error.clone());
+            }
+            GuestTaskStatusKind::Cancelled => {
                 return Err(self.error(RuntimeErrorKind::TaskCancelled, span))
             }
-            GuestTaskStatus::Running => {
+            GuestTaskStatusKind::Running => {
                 return Err(self.error(
                     RuntimeErrorKind::ReferenceError("task cannot await itself while running"),
                     span,
                 ))
             }
-            GuestTaskStatus::Pending => {}
+            GuestTaskStatusKind::Pending => {}
         }
+        let Some(clone_bytes) = self.tasks.get(&id).map(|task| {
+            let clone_bytes = estimated_function_clone_bytes(&task.function)
+                .saturating_add(task.arguments.capacity().saturating_mul(size_of::<Value>()))
+                .saturating_add(estimate_cloned_value_payloads(&task.arguments))
+                .saturating_add(estimated_capture_clone_bytes(&task.captures));
+            clone_bytes
+        }) else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("task does not exist"),
+                span,
+            ));
+        };
         self.ensure_memory_budget(clone_bytes, span)?;
         let task = self.tasks.get_mut(&id).expect("task checked above");
         task.status = GuestTaskStatus::Running;
@@ -1192,6 +1238,24 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let previous_task = self.current_task_id.replace(id);
         let result = self.invoke_function_body(function, arguments, captures, span);
         self.current_task_id = previous_task;
+        let status_copy_bytes = match &result {
+            Ok(value) => {
+                size_of::<Value>().saturating_add(estimated_unmanaged_payload_bytes(value, 0))
+            }
+            Err(error) => estimated_runtime_error_bytes(error),
+        };
+        if self.ensure_memory_budget(status_copy_bytes, span).is_err() {
+            let error = RuntimeError {
+                kind: RuntimeErrorKind::ResourceLimit("memory"),
+                span,
+                stack_trace: Vec::new(),
+                stack_trace_truncated: true,
+            };
+            if let Some(task) = self.tasks.get_mut(&id) {
+                task.status = GuestTaskStatus::Failed(error.clone());
+            }
+            return Err(error);
+        }
         if let Some(task) = self.tasks.get_mut(&id) {
             task.status = match &result {
                 Ok(value) => GuestTaskStatus::Completed(value.clone()),
@@ -1217,29 +1281,18 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn await_task(&mut self, id: u64, span: Span) -> Result<Value, RuntimeError> {
         loop {
-            let status = self
-                .tasks
-                .get(&id)
-                .map(|task| task.status.clone())
-                .ok_or_else(|| {
-                    self.error(
-                        RuntimeErrorKind::ReferenceError("task does not exist"),
-                        span,
-                    )
-                })?;
+            let Some((status, _)) = self.task_status_kind_and_copy_bytes(id) else {
+                return Err(self.error(
+                    RuntimeErrorKind::ReferenceError("task does not exist"),
+                    span,
+                ));
+            };
             match status {
-                GuestTaskStatus::Completed(value) => return Ok(value),
-                GuestTaskStatus::Failed(error) => return Err(error),
-                GuestTaskStatus::Cancelled => {
-                    return Err(self.error(RuntimeErrorKind::TaskCancelled, span))
-                }
-                GuestTaskStatus::Running => {
-                    return Err(self.error(
-                        RuntimeErrorKind::ReferenceError("task cannot await itself while running"),
-                        span,
-                    ))
-                }
-                GuestTaskStatus::Pending => {
+                GuestTaskStatusKind::Completed
+                | GuestTaskStatusKind::Failed
+                | GuestTaskStatusKind::Cancelled
+                | GuestTaskStatusKind::Running => return self.run_task(id, span),
+                GuestTaskStatusKind::Pending => {
                     if !self.run_next_task(span)? {
                         return self.run_task(id, span);
                     }
@@ -1253,8 +1306,18 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             return Err(self.error(RuntimeErrorKind::PermissionError("task.spawn"), span));
         }
         let callable = self.pop(span)?;
-        let Value::Function(function_ref) = callable else {
-            return Err(self.type_error("Function", &callable, span));
+        let (function_ref, captures) = match callable {
+            Value::Function(function) => (function, Vec::new()),
+            Value::Closure(closure) => {
+                let capture_bytes = {
+                    let captures = closure.captures.borrow();
+                    estimated_capture_clone_bytes(&captures)
+                };
+                self.ensure_memory_budget(capture_bytes, span)?;
+                let captures = closure.captures.borrow().clone();
+                (closure.function.clone(), captures)
+            }
+            other => return Err(self.type_error("Function or Closure", &other, span)),
         };
         if function_ref.module_index != 0 {
             return Err(self.error(
@@ -1272,7 +1335,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     span,
                 )
             })?;
-        let task = self.create_task(function, Vec::new(), Vec::new(), span)?;
+        let task = self.create_task(function, Vec::new(), captures, span)?;
         self.push_value(task, span)
     }
 
@@ -3569,6 +3632,41 @@ fn estimated_unmanaged_payload_bytes(value: &Value, depth: usize) -> usize {
 
 fn estimated_bigint_bytes(value: &BigInt) -> usize {
     usize::try_from(value.bits().saturating_add(7) / 8).unwrap_or(usize::MAX)
+}
+
+fn estimated_runtime_error_bytes(error: &RuntimeError) -> usize {
+    let message_bytes = match &error.kind {
+        RuntimeErrorKind::IOError(message) | RuntimeErrorKind::CompileError(message) => {
+            message.capacity()
+        }
+        RuntimeErrorKind::StackUnderflow
+        | RuntimeErrorKind::TypeError { .. }
+        | RuntimeErrorKind::DivisionByZero
+        | RuntimeErrorKind::ReferenceError(_)
+        | RuntimeErrorKind::IndexError(_)
+        | RuntimeErrorKind::PermissionError(_)
+        | RuntimeErrorKind::StackOverflow
+        | RuntimeErrorKind::TaskCancelled
+        | RuntimeErrorKind::ExecutionLimit
+        | RuntimeErrorKind::ResourceLimit(_)
+        | RuntimeErrorKind::UnsupportedInstruction(_)
+        | RuntimeErrorKind::Unsupported(_) => 0,
+    };
+    size_of::<RuntimeError>()
+        .saturating_add(message_bytes)
+        .saturating_add(
+            error
+                .stack_trace
+                .capacity()
+                .saturating_mul(size_of::<StackTraceFrame>()),
+        )
+        .saturating_add(
+            error
+                .stack_trace
+                .iter()
+                .map(|frame| estimated_bigint_bytes(&frame.function_id))
+                .fold(0usize, usize::saturating_add),
+        )
 }
 
 fn estimated_capture_clone_bytes(captures: &[(BigInt, BindingCell)]) -> usize {
