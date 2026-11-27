@@ -13,7 +13,7 @@ use crate::value::{
     binding_cell, BindingCell, ClosureState, FunctionRef, IteratorState, ObjectState, Value,
 };
 
-use super::{empty_span, Interpreter, RuntimeError, RuntimeErrorKind};
+use super::{empty_span, ffi::NativeCallbackContext, Interpreter, RuntimeError, RuntimeErrorKind};
 
 /// Executes verified version 1.0 `.starc` bytecode using the reference runtime.
 ///
@@ -29,6 +29,12 @@ pub struct BytecodeVm<R: BufRead, W: Write> {
     next_task_id: u64,
     current_task_id: Option<u64>,
     task_memory_bytes: usize,
+}
+
+struct BytecodeCallbackContext<'a, R: BufRead, W: Write> {
+    vm: *mut BytecodeVm<R, W>,
+    image: *const Image<'a>,
+    call_site_offset: usize,
 }
 
 impl<R: BufRead, W: Write> BytecodeVm<R, W> {
@@ -780,7 +786,9 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 })?;
                 self.check_capability(operation, span)?;
                 let module_index = frames[frame_index].module_index;
-                if let Some(request) = self.call_intrinsic(operation, span, module_index, image)? {
+                if let Some(request) =
+                    self.call_intrinsic(operation, span, module_index, image, frames)?
+                {
                     self.enter_function(request, span, instruction_offset, image, frames, false)?;
                 }
             }
@@ -1562,12 +1570,213 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.push_value(Value::Null, span)
     }
 
+    fn execute_native_call(
+        &mut self,
+        image: &Image<'_>,
+        frames: &mut Vec<Frame>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        let mut plan = self.runtime.prepare_native_call(span)?;
+        let stack_base = self.runtime.push_native_callback_roots(&mut plan, span)?;
+        let call_site_offset = frames.last().map_or(0, |frame| frame.ip);
+        let mut callback_data = BytecodeCallbackContext {
+            vm: self as *mut _,
+            image,
+            call_site_offset,
+        };
+        let mut callback_context = NativeCallbackContext::new(
+            (&mut callback_data as *mut BytecodeCallbackContext<'_, R, W>).cast(),
+            invoke_bytecode_callback::<R, W>,
+            preflight_bytecode_callback::<R, W>,
+            span,
+        );
+        let call_result = plan.call(&mut callback_context);
+        self.runtime.stack.truncate(stack_base);
+        self.runtime.finish_native_call(call_result, span)
+    }
+
+    fn invoke_native_callback(
+        &mut self,
+        image: &Image<'_>,
+        call_site_offset: usize,
+        callable: &Value,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let (function_ref_ref, capture_bytes) = match callable {
+            Value::Function(function) => (function, 0),
+            Value::Closure(closure) => {
+                let captures = closure.captures.try_borrow().map_err(|_| {
+                    self.runtime.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "available callback captures",
+                            found: "borrowed Closure",
+                        },
+                        span,
+                    )
+                })?;
+                (
+                    &closure.function,
+                    super::estimated_capture_clone_bytes(&captures),
+                )
+            }
+            _ => {
+                return Err(self.runtime.type_error(
+                    "Function or Closure callback",
+                    callable,
+                    span,
+                ));
+            }
+        };
+        let Some(function_index) = image.functions.iter().position(|function| {
+            function.module_index == function_ref_ref.module_index
+                && function.id.as_ref() == Some(&function_ref_ref.id)
+        }) else {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("callback function does not exist"),
+                span,
+            ));
+        };
+        let function = &image.functions[function_index];
+        if function.asynchronous {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "synchronous native callback",
+                    found: "async Function",
+                },
+                span,
+            ));
+        }
+        self.runtime.ensure_memory_budget(
+            size_of::<FunctionRef>()
+                .saturating_add(super::estimated_bigint_bytes(&function_ref_ref.id))
+                .saturating_add(size_of::<FunctionRecord>())
+                .saturating_add(function_record_payload_bytes(function))
+                .saturating_add(capture_bytes)
+                .saturating_add(arguments.len().saturating_mul(size_of::<Value>()))
+                .saturating_add(super::estimate_cloned_value_payloads(arguments)),
+            span,
+        )?;
+        let function_ref = function_ref_ref.clone();
+        let captures = match callable {
+            Value::Closure(closure) => closure
+                .captures
+                .try_borrow()
+                .map_err(|_| {
+                    self.runtime.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "available callback captures",
+                            found: "borrowed Closure",
+                        },
+                        span,
+                    )
+                })?
+                .clone(),
+            Value::Function(_) => Vec::new(),
+            _ => unreachable!("callable kind was checked above"),
+        };
+        let mut owned_arguments = Vec::new();
+        owned_arguments
+            .try_reserve_exact(arguments.len())
+            .map_err(|_| {
+                self.runtime
+                    .error(RuntimeErrorKind::ResourceLimit("callback arguments"), span)
+            })?;
+        owned_arguments.extend_from_slice(arguments);
+        let request = CallRequest {
+            module_index: function_ref.module_index,
+            function_id: function_ref.id,
+            arguments: owned_arguments,
+            captures,
+            return_action: ReturnAction::PushResult,
+        };
+        let mut callback_frames = Vec::new();
+        let frame_scope = self.runtime.scopes.len();
+        let frame_stack = self.runtime.stack.len();
+        let scope_floors = self.runtime.scope_floors.len();
+        let frame_stack_bases = self.runtime.frame_stack_bases.len();
+        let capture_vectors = self.runtime.capture_vectors.len();
+        let call_depth = self.runtime.call_depth;
+        let trace_length = self.runtime.call_trace.len();
+        let storage_estimates = self.frame_storage_estimates.len();
+        let task_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let enter = self.enter_function(
+                request,
+                span,
+                call_site_offset,
+                image,
+                &mut callback_frames,
+                false,
+            );
+            enter?;
+            self.run_frames(image, &mut callback_frames)
+        }));
+        match task_state {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                self.restore_after_callback(
+                    frame_scope,
+                    frame_stack,
+                    scope_floors,
+                    frame_stack_bases,
+                    capture_vectors,
+                    call_depth,
+                    trace_length,
+                    storage_estimates,
+                );
+                Err(error)
+            }
+            Err(_) => {
+                self.restore_after_callback(
+                    frame_scope,
+                    frame_stack,
+                    scope_floors,
+                    frame_stack_bases,
+                    capture_vectors,
+                    call_depth,
+                    trace_length,
+                    storage_estimates,
+                );
+                Err(self.runtime.error(
+                    RuntimeErrorKind::Unsupported("native callback panicked"),
+                    span,
+                ))
+            }
+        }
+    }
+
+    fn restore_after_callback(
+        &mut self,
+        scope_count: usize,
+        stack_count: usize,
+        scope_floor_count: usize,
+        frame_stack_base_count: usize,
+        capture_vector_count: usize,
+        call_depth: usize,
+        trace_count: usize,
+        storage_estimate_count: usize,
+    ) {
+        self.runtime.stack.truncate(stack_count);
+        self.runtime.scopes.truncate(scope_count);
+        self.runtime.scope_floors.truncate(scope_floor_count);
+        self.runtime
+            .frame_stack_bases
+            .truncate(frame_stack_base_count);
+        self.runtime.capture_vectors.truncate(capture_vector_count);
+        self.runtime.call_depth = call_depth;
+        self.runtime.call_trace.truncate(trace_count);
+        self.frame_storage_estimates
+            .truncate(storage_estimate_count);
+        self.sync_external_memory();
+    }
+
     fn call_intrinsic(
         &mut self,
         operation: IrOp,
         span: Span,
         module_index: u32,
         image: &Image<'_>,
+        frames: &mut Vec<Frame>,
     ) -> Result<Option<CallRequest>, RuntimeError> {
         use IrOp::*;
         match operation {
@@ -2073,12 +2282,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Import | ImportDynamic => {
                 return Err(self.unsupported(span, "module import resolution"))
             }
-            NativeLoad => self.runtime.execute_native_instruction(0xB0, span)?,
-            NativeSymbol => self.runtime.execute_native_instruction(0xB1, span)?,
-            NativeCall => self.runtime.execute_native_instruction(0xB2, span)?,
-            NativeClose => self.runtime.execute_native_instruction(0xB3, span)?,
-            NativeCallback => self.runtime.execute_native_instruction(0xB4, span)?,
-            NativeBuffer => self.runtime.execute_native_instruction(0xB5, span)?,
+            NativeLoad => self.runtime.execute_native_instruction(0xB0, span, None)?,
+            NativeSymbol => self.runtime.execute_native_instruction(0xB1, span, None)?,
+            NativeCall => self.execute_native_call(image, frames, span)?,
+            NativeClose => self.runtime.execute_native_instruction(0xB3, span, None)?,
+            NativeCallback => self.runtime.execute_native_instruction(0xB4, span, None)?,
+            NativeBuffer => self.runtime.execute_native_instruction(0xB5, span, None)?,
             TailCall => return Err(self.unsupported(span, "TAIL_CALL")),
             _ => return Err(self.unsupported(span, "intrinsic runtime feature")),
         }
@@ -3210,4 +3419,26 @@ impl<'a> Cursor<'a> {
             Err(format!("trailing bytes in {section}"))
         }
     }
+}
+
+unsafe fn invoke_bytecode_callback<R: BufRead, W: Write>(
+    data: *mut std::ffi::c_void,
+    callable: &Value,
+    arguments: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    let context = unsafe { &mut *data.cast::<BytecodeCallbackContext<'_, R, W>>() };
+    let vm = unsafe { &mut *context.vm };
+    let image = unsafe { &*context.image };
+    vm.invoke_native_callback(image, context.call_site_offset, callable, arguments, span)
+}
+
+unsafe fn preflight_bytecode_callback<R: BufRead, W: Write>(
+    data: *mut std::ffi::c_void,
+    bytes: usize,
+    span: Span,
+) -> Result<(), RuntimeError> {
+    let context = unsafe { &mut *data.cast::<BytecodeCallbackContext<'_, R, W>>() };
+    let vm = unsafe { &mut *context.vm };
+    vm.runtime.ensure_memory_budget(bytes, span)
 }

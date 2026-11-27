@@ -264,6 +264,27 @@ pub struct Interpreter<R: BufRead, W: Write> {
     pending_channel_message_bytes: usize,
 }
 
+pub(crate) struct NativeCallPlan {
+    function: ffi::NativeFunctionHandle,
+    arguments: Vec<ffi::NativeValue>,
+    callback_roots: Vec<Value>,
+    capabilities: BTreeSet<Capability>,
+}
+
+impl NativeCallPlan {
+    pub(crate) fn call(
+        &self,
+        callback_context: &mut ffi::NativeCallbackContext,
+    ) -> Result<ffi::NativeValue, ffi::NativeCallError> {
+        self.function
+            .call_scoped(&self.arguments, &self.capabilities, Some(callback_context))
+    }
+
+    fn take_callback_roots(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.callback_roots)
+    }
+}
+
 #[derive(Debug)]
 struct GuestChannel {
     capacity: usize,
@@ -2299,7 +2320,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0xAB) => self.acquire_mutex(span),
             InstructionOpcode::Extended(0xAC) => self.release_mutex(span),
             InstructionOpcode::Extended(opcode @ 0xB0..=0xB5) => {
-                self.execute_native_instruction(opcode, span)
+                self.execute_native_instruction(opcode, span, None)
             }
             InstructionOpcode::Basic(_) | InstructionOpcode::Extended(_) => Err(self.error(
                 RuntimeErrorKind::UnsupportedInstruction(instruction.opcode),
@@ -2316,8 +2337,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         &mut self,
         opcode: u8,
         span: Span,
+        callback_context: Option<&mut ffi::NativeCallbackContext>,
     ) -> Result<(), RuntimeError> {
-        use ffi::{NativeBuffer, NativeHandle, NativeLibraryHandle, NativeSignature, NativeValue};
+        use ffi::{NativeBuffer, NativeHandle, NativeLibraryHandle, NativeSignature};
 
         let capabilities = self.host_services.capabilities().clone();
         if !capabilities.contains(&Capability::Ffi) {
@@ -2380,67 +2402,23 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 self.push_value(Value::Handle(NativeHandle::Function(function)), span)
             }
             0xB2 => {
-                let function = self.pop(span)?;
-                let count = self.pop(span)?;
-                let Value::Handle(NativeHandle::Function(function)) = function else {
-                    return Err(self.type_error("native function Handle", &function, span));
-                };
-                let Value::Int(count) = count else {
-                    return Err(self.type_error("Int native argument count", &count, span));
-                };
-                let count = count.to_string().parse::<usize>().map_err(|_| {
-                    self.error(
-                        RuntimeErrorKind::TypeError {
-                            expected: "nonnegative native argument count",
-                            found: "Int",
-                        },
+                let mut plan = self.prepare_native_call(span)?;
+                let stack_base = self.push_native_callback_roots(&mut plan, span)?;
+                let mut source_context;
+                let context = if let Some(context) = callback_context {
+                    context
+                } else {
+                    source_context = ffi::NativeCallbackContext::new(
+                        self as *mut Self as *mut std::ffi::c_void,
+                        invoke_interpreter_callback::<R, W>,
+                        preflight_interpreter_callback::<R, W>,
                         span,
-                    )
-                })?;
-                let expected = function.signature().arguments().len();
-                if count != expected {
-                    return Err(self.error(
-                        RuntimeErrorKind::TypeError {
-                            expected: "argument count matching native signature",
-                            found: "Int",
-                        },
-                        span,
-                    ));
-                }
-                self.ensure_memory_budget(
-                    count.saturating_mul(std::mem::size_of::<NativeValue>()),
-                    span,
-                )?;
-                let mut arguments = Vec::with_capacity(count);
-                for _ in 0..count {
-                    arguments.push(match self.pop(span)? {
-                        Value::Int(value) => NativeValue::Int(value),
-                        Value::Float(value) => NativeValue::Float(value),
-                        Value::Bool(value) => NativeValue::Bool(value),
-                        Value::String(value) => NativeValue::String(value),
-                        Value::Handle(NativeHandle::Buffer(buffer)) => NativeValue::Buffer(buffer),
-                        value => {
-                            return Err(self.type_error(
-                                "C-compatible native argument",
-                                &value,
-                                span,
-                            ))
-                        }
-                    });
-                }
-                arguments.reverse();
-                let result = function
-                    .call(&arguments, &capabilities)
-                    .map_err(|error_value| error(self, error_value, span))?;
-                let result = match result {
-                    NativeValue::Void => Value::Null,
-                    NativeValue::Int(value) => Value::Int(value),
-                    NativeValue::Float(value) => Value::Float(value),
-                    NativeValue::Bool(value) => Value::Bool(value),
-                    NativeValue::String(value) => Value::String(value),
-                    NativeValue::Buffer(value) => Value::Handle(NativeHandle::Buffer(value)),
+                    );
+                    &mut source_context
                 };
-                self.push_value(result, span)
+                let call_result = plan.call(context);
+                self.stack.truncate(stack_base);
+                self.finish_native_call(call_result, span)
             }
             0xB3 => {
                 let library = self.pop(span)?;
@@ -2451,7 +2429,23 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     .close(&capabilities)
                     .map_err(|error_value| error(self, error_value, span))
             }
-            0xB4 => Err(self.error(RuntimeErrorKind::Unsupported("native callbacks"), span)),
+            0xB4 => {
+                let signature = self.pop(span)?;
+                let callable = self.pop(span)?;
+                let Value::String(signature) = signature else {
+                    return Err(self.type_error(
+                        "String native callback signature",
+                        &signature,
+                        span,
+                    ));
+                };
+                let signature = NativeSignature::parse(&signature)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                let callback = ffi::NativeCallbackHandle::new(callable, signature, &capabilities)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                self.ensure_memory_budget(callback.estimated_bytes(), span)?;
+                self.push_value(Value::Handle(NativeHandle::Callback(callback)), span)
+            }
             0xB5 => {
                 let length = self.pop(span)?;
                 let Value::Int(length) = length else {
@@ -2476,6 +2470,265 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             )),
         }
+    }
+
+    pub(crate) fn prepare_native_call(
+        &mut self,
+        span: Span,
+    ) -> Result<NativeCallPlan, RuntimeError> {
+        use ffi::{NativeHandle, NativeValue};
+
+        let function = self.pop(span)?;
+        let count = self.pop(span)?;
+        let Value::Handle(NativeHandle::Function(function)) = function else {
+            return Err(self.type_error("native function Handle", &function, span));
+        };
+        let Value::Int(count) = count else {
+            return Err(self.type_error("Int native argument count", &count, span));
+        };
+        let count = count.to_string().parse::<usize>().map_err(|_| {
+            self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "nonnegative native argument count",
+                    found: "Int",
+                },
+                span,
+            )
+        })?;
+        if count != function.signature().arguments().len() {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "argument count matching native signature",
+                    found: "Int",
+                },
+                span,
+            ));
+        }
+        self.ensure_memory_budget(
+            count
+                .saturating_mul(size_of::<NativeValue>())
+                .saturating_add(count.saturating_mul(size_of::<Value>())),
+            span,
+        )?;
+        let mut arguments = Vec::new();
+        arguments
+            .try_reserve_exact(count)
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("native arguments"), span))?;
+        let mut callback_roots = Vec::new();
+        callback_roots.try_reserve(count).map_err(|_| {
+            self.error(
+                RuntimeErrorKind::ResourceLimit("native callback roots"),
+                span,
+            )
+        })?;
+        for _ in 0..count {
+            let value = self.pop(span)?;
+            arguments.push(match value {
+                Value::Int(value) => NativeValue::Int(value),
+                Value::Float(value) => NativeValue::Float(value),
+                Value::Bool(value) => NativeValue::Bool(value),
+                Value::String(value) => NativeValue::String(value),
+                Value::Handle(NativeHandle::Buffer(buffer)) => NativeValue::Buffer(buffer),
+                Value::Handle(NativeHandle::Callback(callback)) => {
+                    let callable_ref = callback.callable();
+                    let callable_bytes = match callable_ref {
+                        Value::Function(function) => size_of::<FunctionRef>()
+                            .saturating_add(estimated_bigint_bytes(&function.id)),
+                        Value::Closure(closure) => size_of::<FunctionRef>()
+                            .saturating_add(estimated_bigint_bytes(&closure.function.id))
+                            .saturating_add(
+                                closure
+                                    .captures
+                                    .try_borrow()
+                                    .map(|captures| estimated_capture_clone_bytes(&captures))
+                                    .unwrap_or(0),
+                            ),
+                        _ => 0,
+                    };
+                    self.ensure_memory_budget(callable_bytes, span)?;
+                    let callable = callable_ref.clone();
+                    callback_roots.push(callable);
+                    NativeValue::Callback(callback)
+                }
+                value => {
+                    return Err(self.type_error("C-compatible native argument", &value, span));
+                }
+            });
+        }
+        arguments.reverse();
+        callback_roots.reverse();
+        Ok(NativeCallPlan {
+            function,
+            arguments,
+            callback_roots,
+            capabilities: self.host_services.capabilities().clone(),
+        })
+    }
+
+    pub(crate) fn push_native_callback_roots(
+        &mut self,
+        plan: &mut NativeCallPlan,
+        span: Span,
+    ) -> Result<usize, RuntimeError> {
+        let stack_base = self.stack.len();
+        for root in plan.take_callback_roots() {
+            if let Err(error) = self.push_value(root, span) {
+                self.stack.truncate(stack_base);
+                return Err(error);
+            }
+        }
+        Ok(stack_base)
+    }
+
+    pub(crate) fn finish_native_call(
+        &mut self,
+        call_result: Result<ffi::NativeValue, ffi::NativeCallError>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        use ffi::{NativeHandle, NativeValue};
+
+        let result = match call_result {
+            Ok(value) => value,
+            Err(ffi::NativeCallError::Runtime(error)) => return Err(error),
+            Err(ffi::NativeCallError::Ffi(error)) => match error {
+                ffi::FfiError::PermissionDenied => {
+                    return Err(self.error(RuntimeErrorKind::PermissionError("ffi"), span));
+                }
+                ffi::FfiError::Load(message) => {
+                    return Err(self.error(RuntimeErrorKind::IOError(message), span));
+                }
+                ffi::FfiError::Symbol(_) => {
+                    return Err(self.error(
+                        RuntimeErrorKind::ReferenceError("native symbol not found"),
+                        span,
+                    ));
+                }
+                ffi::FfiError::LibraryClosed => {
+                    return Err(self.error(
+                        RuntimeErrorKind::ReferenceError("native library is closed"),
+                        span,
+                    ));
+                }
+                _ => {
+                    return Err(self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "valid native handle, signature, and arguments",
+                            found: "invalid native call",
+                        },
+                        span,
+                    ));
+                }
+            },
+        };
+        let value = match result {
+            NativeValue::Void => Value::Null,
+            NativeValue::Int(value) => Value::Int(value),
+            NativeValue::Float(value) => Value::Float(value),
+            NativeValue::Bool(value) => Value::Bool(value),
+            NativeValue::String(value) => Value::String(value),
+            NativeValue::Buffer(value) => Value::Handle(NativeHandle::Buffer(value)),
+            NativeValue::Callback(value) => Value::Handle(NativeHandle::Callback(value)),
+        };
+        self.push_value(value, span)
+    }
+
+    fn invoke_native_callback(
+        &mut self,
+        callable: &Value,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let (function_ref_ref, capture_bytes) = match callable {
+            Value::Function(function) => (function, 0),
+            Value::Closure(closure) => {
+                let captures = closure.captures.try_borrow().map_err(|_| {
+                    self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "available callback captures",
+                            found: "borrowed Closure",
+                        },
+                        span,
+                    )
+                })?;
+                (&closure.function, estimated_capture_clone_bytes(&captures))
+            }
+            _ => {
+                return Err(self.type_error("Function or Closure callback", callable, span));
+            }
+        };
+        if function_ref_ref.module_index != 0 {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("callback function does not exist"),
+                span,
+            ));
+        }
+        let Some((function_bytes, asynchronous)) =
+            self.functions.get(&function_ref_ref.id).map(|function| {
+                (
+                    estimated_function_clone_bytes(function),
+                    function.kind == FunctionKind::Asynchronous,
+                )
+            })
+        else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("callback function does not exist"),
+                span,
+            ));
+        };
+        if asynchronous {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "synchronous native callback",
+                    found: "async Function",
+                },
+                span,
+            ));
+        }
+        let argument_bytes = arguments
+            .len()
+            .saturating_mul(size_of::<Value>())
+            .saturating_add(estimate_cloned_value_payloads(arguments));
+        self.ensure_memory_budget(
+            size_of::<FunctionRef>()
+                .saturating_add(estimated_bigint_bytes(&function_ref_ref.id))
+                .saturating_add(function_bytes)
+                .saturating_add(capture_bytes)
+                .saturating_add(argument_bytes),
+            span,
+        )?;
+        let function_ref = function_ref_ref.clone();
+        let function = self
+            .functions
+            .get(&function_ref.id)
+            .cloned()
+            .ok_or_else(|| {
+                self.error(
+                    RuntimeErrorKind::ReferenceError("callback function does not exist"),
+                    span,
+                )
+            })?;
+        let captures = match callable {
+            Value::Closure(closure) => closure
+                .captures
+                .try_borrow()
+                .map_err(|_| {
+                    self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "available callback captures",
+                            found: "borrowed Closure",
+                        },
+                        span,
+                    )
+                })?
+                .clone(),
+            _ => Vec::new(),
+        };
+        let mut owned_arguments = Vec::new();
+        owned_arguments
+            .try_reserve_exact(arguments.len())
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("callback arguments"), span))?;
+        owned_arguments.extend_from_slice(arguments);
+        self.invoke_function(function, owned_arguments, captures, span)
     }
 
     fn to_int(&mut self, span: Span) -> Result<(), RuntimeError> {
@@ -3885,4 +4138,23 @@ fn to_float(value: &Value) -> f64 {
         }),
         _ => unreachable!("numeric operands are validated before conversion"),
     }
+}
+
+unsafe fn invoke_interpreter_callback<R: BufRead, W: Write>(
+    data: *mut std::ffi::c_void,
+    callable: &Value,
+    arguments: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    let interpreter = unsafe { &mut *data.cast::<Interpreter<R, W>>() };
+    interpreter.invoke_native_callback(callable, arguments, span)
+}
+
+unsafe fn preflight_interpreter_callback<R: BufRead, W: Write>(
+    data: *mut std::ffi::c_void,
+    bytes: usize,
+    span: Span,
+) -> Result<(), RuntimeError> {
+    let interpreter = unsafe { &mut *data.cast::<Interpreter<R, W>>() };
+    interpreter.ensure_memory_budget(bytes, span)
 }
