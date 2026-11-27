@@ -106,6 +106,8 @@ pub enum Value {
     Object(Rc<RefCell<ObjectState>>),
     /// A capability-gated native library, function, or buffer handle.
     Handle(NativeHandle),
+    /// A stable handle to a scheduled Star task.
+    Task(u64),
     /// Absence of a value.
     Null,
 }
@@ -185,7 +187,8 @@ impl RuntimeKey {
             | Value::Function(_)
             | Value::Closure(_)
             | Value::Object(_)
-            | Value::Handle(_) => return None,
+            | Value::Handle(_)
+            | Value::Task(_) => return None,
         })
     }
 }
@@ -271,6 +274,7 @@ fn values_equal(left: &Value, right: &Value, active: &mut ActiveValuePairs) -> b
             equal
         }
         (Value::Function(left), Value::Function(right)) => left == right,
+        (Value::Task(left), Value::Task(right)) => left == right,
         (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
         (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
         (Value::Handle(left), Value::Handle(right)) => left.same_handle(right),
@@ -319,6 +323,7 @@ impl Value {
             Self::Closure(_) => "Closure",
             Self::Object(_) => "Struct",
             Self::Handle(_) => "Handle",
+            Self::Task(_) => "Task",
             Self::Null => "Null",
         }
     }
@@ -394,6 +399,7 @@ fn fmt_value(
         Value::Set(set) => write!(formatter, "Set(len={})", set.borrow().members.len()),
         Value::Iterator(_) => formatter.write_str("Iterator"),
         Value::Function(function) => write!(formatter, "Function#{}", function.id),
+        Value::Task(id) => write!(formatter, "Task#{id}"),
         Value::Closure(closure) => write!(formatter, "Closure#{}", closure.function.id),
         Value::Object(object) => write!(formatter, "Struct#{}", object.borrow().struct_id),
         Value::Handle(handle) => write!(formatter, "Handle<{}>", handle.kind_name()),

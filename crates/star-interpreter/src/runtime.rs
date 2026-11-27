@@ -2039,7 +2039,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             | Value::Function(_)
             | Value::Closure(_)
             | Value::Object(_)
-            | Value::Handle(_) => true,
+            | Value::Handle(_)
+            | Value::Task(_) => true,
         };
         self.push_value(Value::Bool(truthy), span)?;
         Ok(())
@@ -3196,7 +3197,7 @@ fn estimated_key_clone_bytes(value: &Value, depth: usize) -> usize {
         | Value::Function(_)
         | Value::Closure(_)
         | Value::Object(_) => 0,
-        Value::Handle(_) => 0,
+        Value::Handle(_) | Value::Task(_) => 0,
     }
 }
 
@@ -3222,7 +3223,8 @@ fn estimated_unmanaged_payload_bytes(value: &Value, depth: usize) -> usize {
         | Value::Set(_)
         | Value::Iterator(_)
         | Value::Closure(_)
-        | Value::Object(_) => 0,
+        | Value::Object(_)
+        | Value::Task(_) => 0,
         Value::Handle(handle) => handle.estimated_bytes(),
     }
 }

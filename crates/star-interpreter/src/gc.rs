@@ -804,7 +804,8 @@ impl MemoryEstimator {
             | Value::Char(_)
             | Value::Byte(_)
             | Value::Null
-            | Value::Handle(_) => {}
+            | Value::Handle(_)
+            | Value::Task(_) => {}
         }
         Ok(())
     }
