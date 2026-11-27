@@ -1407,6 +1407,141 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         Ok(())
     }
 
+    fn send_channel(&mut self, image: &Image<'_>, span: Span) -> Result<(), RuntimeError> {
+        let value = self.runtime.pop(span)?;
+        let channel = self.runtime.pop(span)?;
+        let Value::Channel(channel_id) = channel else {
+            return Err(self.runtime.type_error("Channel", &channel, span));
+        };
+        if self.current_task_id.is_none() {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "async task context",
+                    found: "main execution context",
+                },
+                span,
+            ));
+        }
+        let pending = self.runtime.account_pending_channel_value(&value, span)?;
+        let result = loop {
+            match self.runtime.try_send_channel(channel_id, &value, span) {
+                Ok(true) => break Ok(()),
+                Ok(false) => match self.run_next_task(image, span) {
+                    Ok(true) => {
+                        if let Err(error) = self.runtime.check_resource_limits(span) {
+                            break Err(error);
+                        }
+                    }
+                    Ok(false) => break Err(self.runtime.error(RuntimeErrorKind::Deadlock, span)),
+                    Err(error) => break Err(error),
+                },
+                Err(error) => break Err(error),
+            }
+        };
+        self.runtime.release_pending_channel_value(pending);
+        result?;
+        self.runtime.push_value(Value::Null, span)
+    }
+
+    fn receive_channel(&mut self, image: &Image<'_>, span: Span) -> Result<(), RuntimeError> {
+        let channel = self.runtime.pop(span)?;
+        let Value::Channel(channel_id) = channel else {
+            return Err(self.runtime.type_error("Channel", &channel, span));
+        };
+        if self.current_task_id.is_none() {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "async task context",
+                    found: "main execution context",
+                },
+                span,
+            ));
+        }
+        let mut waiting = false;
+        let result = loop {
+            match self.runtime.try_receive_channel(channel_id, span) {
+                Ok(Some(value)) => {
+                    if waiting {
+                        self.runtime.unregister_channel_receiver(channel_id);
+                    }
+                    break Ok(value);
+                }
+                Ok(None) => {
+                    if !waiting {
+                        self.runtime.register_channel_receiver(channel_id, span)?;
+                        waiting = true;
+                    }
+                    match self.run_next_task(image, span) {
+                        Ok(true) => {
+                            if let Err(error) = self.runtime.check_resource_limits(span) {
+                                self.runtime.unregister_channel_receiver(channel_id);
+                                break Err(error);
+                            }
+                        }
+                        Ok(false) => {
+                            self.runtime.unregister_channel_receiver(channel_id);
+                            break Err(self.runtime.error(RuntimeErrorKind::Deadlock, span));
+                        }
+                        Err(error) => {
+                            self.runtime.unregister_channel_receiver(channel_id);
+                            break Err(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    if waiting {
+                        self.runtime.unregister_channel_receiver(channel_id);
+                    }
+                    break Err(error);
+                }
+            }
+        };
+        self.runtime.push_value(result?, span)
+    }
+
+    fn lock_mutex(&mut self, image: &Image<'_>, span: Span) -> Result<(), RuntimeError> {
+        let mutex = self.runtime.pop(span)?;
+        let Value::Mutex(mutex_id) = mutex else {
+            return Err(self.runtime.type_error("Mutex", &mutex, span));
+        };
+        let Some(task_id) = self.current_task_id else {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "async task context",
+                    found: "main execution context",
+                },
+                span,
+            ));
+        };
+        loop {
+            match self.runtime.try_lock_mutex(mutex_id, task_id, span) {
+                Ok(true) => break,
+                Ok(false) => match self.run_next_task(image, span) {
+                    Ok(true) => self.runtime.check_resource_limits(span)?,
+                    Ok(false) => return Err(self.runtime.error(RuntimeErrorKind::Deadlock, span)),
+                    Err(error) => return Err(error),
+                },
+                Err(error) => return Err(error),
+            }
+        }
+        self.runtime.push_value(Value::Null, span)
+    }
+
+    fn unlock_mutex(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let mutex = self.runtime.pop(span)?;
+        let Value::Mutex(mutex_id) = mutex else {
+            return Err(self.runtime.type_error("Mutex", &mutex, span));
+        };
+        let Some(task_id) = self.current_task_id else {
+            return Err(self
+                .runtime
+                .error(RuntimeErrorKind::PermissionError("mutex ownership"), span));
+        };
+        self.runtime
+            .unlock_mutex_for_task(mutex_id, task_id, span)?;
+        self.runtime.push_value(Value::Null, span)
+    }
+
     fn call_intrinsic(
         &mut self,
         operation: IrOp,
@@ -1532,6 +1667,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     "NativeFunction",
                     "Iterator",
                     "Task",
+                    "Channel",
+                    "Mutex",
                     "Error",
                     "Handle",
                     "Module",
@@ -1907,6 +2044,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             }
             Sleep => self.sleep_task(image, span)?,
             Cancel => self.cancel_task(span)?,
+            ChannelNew => self.runtime.create_channel(span)?,
+            ChannelSend => self.send_channel(image, span)?,
+            ChannelRecv => self.receive_channel(image, span)?,
+            MutexNew => self.runtime.create_mutex(span)?,
+            MutexLock => self.lock_mutex(image, span)?,
+            MutexUnlock => self.unlock_mutex(span)?,
             Import | ImportDynamic => {
                 return Err(self.unsupported(span, "module import resolution"))
             }

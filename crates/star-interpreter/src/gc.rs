@@ -805,7 +805,9 @@ impl MemoryEstimator {
             | Value::Byte(_)
             | Value::Null
             | Value::Handle(_)
-            | Value::Task(_) => {}
+            | Value::Task(_)
+            | Value::Channel(_)
+            | Value::Mutex(_) => {}
         }
         Ok(())
     }

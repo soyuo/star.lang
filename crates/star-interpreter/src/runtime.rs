@@ -43,6 +43,7 @@ pub mod strings;
 pub mod worker;
 
 mod bytecode_vm;
+mod guest_concurrency;
 pub use bytecode_vm::BytecodeVm;
 
 /// The reason execution stopped.
@@ -73,6 +74,8 @@ pub enum RuntimeErrorKind {
     StackOverflow,
     /// A task was awaited after cancellation.
     TaskCancelled,
+    /// A cooperative channel or mutex has no runnable task that can unblock it.
+    Deadlock,
     /// The configured statement execution limit was exceeded.
     ExecutionLimit,
     /// A configured runtime memory, operand-stack, or wall-clock ceiling was exceeded.
@@ -103,6 +106,7 @@ impl fmt::Display for RuntimeErrorKind {
             Self::CompileError(reason) => write!(formatter, "compile error: {reason}"),
             Self::StackOverflow => formatter.write_str("function call-depth limit exceeded"),
             Self::TaskCancelled => formatter.write_str("task was cancelled"),
+            Self::Deadlock => formatter.write_str("cooperative scheduler deadlock"),
             Self::ExecutionLimit => formatter.write_str("execution step limit exceeded"),
             Self::ResourceLimit(resource) => write!(formatter, "{resource} limit exceeded"),
             Self::UnsupportedInstruction(opcode) => {
@@ -252,6 +256,23 @@ pub struct Interpreter<R: BufRead, W: Write> {
     ready_tasks: VecDeque<u64>,
     next_task_id: u64,
     current_task_id: Option<u64>,
+    channels: HashMap<u64, GuestChannel>,
+    next_channel_id: u64,
+    mutexes: HashMap<u64, GuestMutex>,
+    next_mutex_id: u64,
+    pending_channel_message_bytes: usize,
+}
+
+#[derive(Debug)]
+struct GuestChannel {
+    capacity: usize,
+    queue: VecDeque<Value>,
+    waiting_receivers: usize,
+}
+
+#[derive(Debug, Default)]
+struct GuestMutex {
+    owner: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -325,6 +346,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             ready_tasks: VecDeque::new(),
             next_task_id: 1,
             current_task_id: None,
+            channels: HashMap::new(),
+            next_channel_id: 1,
+            mutexes: HashMap::new(),
+            next_mutex_id: 1,
+            pending_channel_message_bytes: 0,
         }
     }
 
@@ -419,7 +445,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             .saturating_add(self.external_memory_bytes)
             .saturating_add(self.call_trace_memory_bytes().saturating_mul(2))
             .saturating_add(self.call_frame_bookkeeping_memory_bytes())
-            .saturating_add(self.task_memory_bytes());
+            .saturating_add(self.task_memory_bytes())
+            .saturating_add(self.concurrent_primitive_memory_bytes())
+            .saturating_add(self.pending_channel_message_bytes);
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             self.collect_garbage().map_err(|_| {
                 self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
@@ -439,7 +467,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .saturating_add(self.external_memory_bytes)
                 .saturating_add(self.call_trace_memory_bytes().saturating_mul(2))
                 .saturating_add(self.call_frame_bookkeeping_memory_bytes())
-                .saturating_add(self.task_memory_bytes());
+                .saturating_add(self.task_memory_bytes())
+                .saturating_add(self.concurrent_primitive_memory_bytes())
+                .saturating_add(self.pending_channel_message_bytes);
         }
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             return Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span));
@@ -494,6 +524,28 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                         | GuestTaskStatus::Cancelled => 0,
                     })
             }))
+    }
+
+    fn concurrent_primitive_memory_bytes(&self) -> usize {
+        self.channels
+            .capacity()
+            .saturating_mul(size_of::<(u64, GuestChannel)>())
+            .saturating_add(self.channels.values().fold(0usize, |total, channel| {
+                total
+                    .saturating_add(channel.queue.capacity().saturating_mul(size_of::<Value>()))
+                    .saturating_add(
+                        channel
+                            .queue
+                            .iter()
+                            .map(|value| estimated_unmanaged_payload_bytes(value, 0))
+                            .fold(0usize, usize::saturating_add),
+                    )
+            }))
+            .saturating_add(
+                self.mutexes
+                    .capacity()
+                    .saturating_mul(size_of::<(u64, GuestMutex)>()),
+            )
     }
 
     fn task_status_kind_and_copy_bytes(&self, id: u64) -> Option<(GuestTaskStatusKind, usize)> {
@@ -2216,6 +2268,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 }
             }
             InstructionOpcode::Extended(0xA6) => self.cancel_task(span),
+            InstructionOpcode::Extended(0xA7) => self.create_channel(span),
+            InstructionOpcode::Extended(0xA8) => self.send_channel(span),
+            InstructionOpcode::Extended(0xA9) => self.receive_channel(span),
+            InstructionOpcode::Extended(0xAA) => self.create_mutex(span),
+            InstructionOpcode::Extended(0xAB) => self.acquire_mutex(span),
+            InstructionOpcode::Extended(0xAC) => self.release_mutex(span),
             InstructionOpcode::Extended(opcode @ 0xB0..=0xB5) => {
                 self.execute_native_instruction(opcode, span)
             }
@@ -2454,7 +2512,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             | Value::Closure(_)
             | Value::Object(_)
             | Value::Handle(_)
-            | Value::Task(_) => true,
+            | Value::Task(_)
+            | Value::Channel(_)
+            | Value::Mutex(_) => true,
         };
         self.push_value(Value::Bool(truthy), span)?;
         Ok(())
@@ -3611,7 +3671,7 @@ fn estimated_key_clone_bytes(value: &Value, depth: usize) -> usize {
         | Value::Function(_)
         | Value::Closure(_)
         | Value::Object(_) => 0,
-        Value::Handle(_) | Value::Task(_) => 0,
+        Value::Handle(_) | Value::Task(_) | Value::Channel(_) | Value::Mutex(_) => 0,
     }
 }
 
@@ -3638,7 +3698,9 @@ fn estimated_unmanaged_payload_bytes(value: &Value, depth: usize) -> usize {
         | Value::Iterator(_)
         | Value::Closure(_)
         | Value::Object(_)
-        | Value::Task(_) => 0,
+        | Value::Task(_)
+        | Value::Channel(_)
+        | Value::Mutex(_) => 0,
         Value::Handle(handle) => handle.estimated_bytes(),
     }
 }
@@ -3660,6 +3722,7 @@ fn estimated_runtime_error_bytes(error: &RuntimeError) -> usize {
         | RuntimeErrorKind::PermissionError(_)
         | RuntimeErrorKind::StackOverflow
         | RuntimeErrorKind::TaskCancelled
+        | RuntimeErrorKind::Deadlock
         | RuntimeErrorKind::ExecutionLimit
         | RuntimeErrorKind::ResourceLimit(_)
         | RuntimeErrorKind::UnsupportedInstruction(_)

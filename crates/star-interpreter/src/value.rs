@@ -108,6 +108,10 @@ pub enum Value {
     Handle(NativeHandle),
     /// A stable handle to a scheduled Star task.
     Task(u64),
+    /// A stable handle to a cooperative message channel.
+    Channel(u64),
+    /// A stable handle to a cooperative task-owned mutex.
+    Mutex(u64),
     /// Absence of a value.
     Null,
 }
@@ -188,7 +192,9 @@ impl RuntimeKey {
             | Value::Closure(_)
             | Value::Object(_)
             | Value::Handle(_)
-            | Value::Task(_) => return None,
+            | Value::Task(_)
+            | Value::Channel(_)
+            | Value::Mutex(_) => return None,
         })
     }
 }
@@ -275,6 +281,8 @@ fn values_equal(left: &Value, right: &Value, active: &mut ActiveValuePairs) -> b
         }
         (Value::Function(left), Value::Function(right)) => left == right,
         (Value::Task(left), Value::Task(right)) => left == right,
+        (Value::Channel(left), Value::Channel(right)) => left == right,
+        (Value::Mutex(left), Value::Mutex(right)) => left == right,
         (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
         (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
         (Value::Handle(left), Value::Handle(right)) => left.same_handle(right),
@@ -324,6 +332,8 @@ impl Value {
             Self::Object(_) => "Struct",
             Self::Handle(_) => "Handle",
             Self::Task(_) => "Task",
+            Self::Channel(_) => "Channel",
+            Self::Mutex(_) => "Mutex",
             Self::Null => "Null",
         }
     }
@@ -400,6 +410,8 @@ fn fmt_value(
         Value::Iterator(_) => formatter.write_str("Iterator"),
         Value::Function(function) => write!(formatter, "Function#{}", function.id),
         Value::Task(id) => write!(formatter, "Task#{id}"),
+        Value::Channel(id) => write!(formatter, "Channel#{id}"),
+        Value::Mutex(id) => write!(formatter, "Mutex#{id}"),
         Value::Closure(closure) => write!(formatter, "Closure#{}", closure.function.id),
         Value::Object(object) => write!(formatter, "Struct#{}", object.borrow().struct_id),
         Value::Handle(handle) => write!(formatter, "Handle<{}>", handle.kind_name()),
