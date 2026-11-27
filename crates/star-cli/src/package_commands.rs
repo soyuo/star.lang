@@ -124,6 +124,7 @@ fn remove(project: &Path, arguments: &[String]) -> Result<(), PackageError> {
 
 fn install(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError> {
     let existing = read_lock(project)?;
+    let write_new_lock = existing.is_none();
     let (lock, packages) = if let Some(existing) = existing.as_ref() {
         let resolved = resolve_dependencies_from_lock(project, registry, existing)?;
         if !same_lock(existing, &resolved.0) {
@@ -134,17 +135,19 @@ fn install(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError>
         }
         resolved
     } else {
-        let resolved = resolve_dependencies(project, registry)?;
-        write_lock(project, &resolved.0)?;
-        resolved
+        resolve_dependencies(project, registry)?
     };
-    install_packages(project, &lock, &packages)
+    install_packages(project, &lock, &packages)?;
+    if write_new_lock {
+        write_lock(project, &lock)?;
+    }
+    Ok(())
 }
 
 fn update(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError> {
     let (lock, packages) = resolve_dependencies(project, registry)?;
-    write_lock(project, &lock)?;
-    install_packages(project, &lock, &packages)
+    install_packages(project, &lock, &packages)?;
+    write_lock(project, &lock)
 }
 
 fn same_lock(left: &star_package::Lockfile, right: &star_package::Lockfile) -> bool {
@@ -263,6 +266,7 @@ fn publish(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError>
 }
 
 fn audit(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError> {
+    let project_root = project.canonicalize()?;
     let Some(existing) = read_lock(project)? else {
         return Err(PackageError::Invalid(
             "star.lock is missing; run `star install`".into(),
@@ -303,7 +307,7 @@ fn audit(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError> {
             )));
         }
         if !package.locked.source.starts_with("path+") {
-            let installed = project
+            let installed = project_root
                 .join("deps")
                 .join(&locked.name)
                 .join(&locked.version);
@@ -313,7 +317,19 @@ fn audit(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError> {
                     locked.name, locked.version
                 )));
             }
-            if source_checksum(&installed)? != locked.checksum {
+            let canonical_installed = installed.canonicalize().map_err(|_| {
+                PackageError::Invalid(format!(
+                    "installed package `{}@{}` cannot be resolved",
+                    locked.name, locked.version
+                ))
+            })?;
+            if !canonical_installed.starts_with(&project_root) {
+                return Err(PackageError::Invalid(format!(
+                    "installed package `{}@{}` escapes the project",
+                    locked.name, locked.version
+                )));
+            }
+            if source_checksum(&canonical_installed)? != locked.checksum {
                 return Err(PackageError::Invalid(format!(
                     "installed package `{}@{}` failed checksum verification",
                     locked.name, locked.version
