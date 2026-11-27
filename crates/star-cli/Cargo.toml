@@ -9,4 +9,7 @@ name = "star"
 path = "src/main.rs"
 
 [dependencies]
+star-compiler.workspace = true
+star-lexer.workspace = true
+star-parser.workspace = true
 star-interpreter.workspace = true
