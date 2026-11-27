@@ -545,7 +545,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     }
                     _ => self.execute_instruction(instruction)?,
                 },
-                Statement::DataLiteral(literal) => self.push_literal(literal),
+                Statement::DataLiteral(literal) => self.push_literal(literal)?,
                 Statement::Scope(scope) => {
                     let flow = self.execute_scope(scope)?;
                     if flow != ControlFlow::Normal {
@@ -1277,6 +1277,26 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let Value::Object(object) = value else {
             return Err(self.type_error("Struct", &value, span));
         };
+        let clone_bytes = {
+            let object = object.borrow();
+            let field_bytes = object
+                .fields
+                .capacity()
+                .saturating_mul(size_of::<(BigInt, Value)>());
+            let owned_payload_bytes = object.fields.iter().fold(
+                estimated_bigint_bytes(&object.struct_id),
+                |total, (id, value)| {
+                    total
+                        .saturating_add(estimated_bigint_bytes(id))
+                        .saturating_add(estimated_unmanaged_payload_bytes(value, 0))
+                },
+            );
+            size_of::<crate::value::ObjectState>()
+                .saturating_add(2 * size_of::<usize>())
+                .saturating_add(field_bytes)
+                .saturating_add(owned_payload_bytes)
+        };
+        self.ensure_memory_budget(clone_bytes, span)?;
         let cloned = object.borrow().clone();
         let object = self.allocate_object(cloned);
         self.stack.push(object);
@@ -1737,8 +1757,55 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
             Value::Map(map) => {
                 let key_value = key;
+                let key_clone_bytes = estimated_key_clone_bytes(&key_value, 0);
+                let key_value_bytes = estimated_unmanaged_payload_bytes(&key_value, 0);
+                let value_bytes = estimated_unmanaged_payload_bytes(&value, 0);
+                self.ensure_memory_budget(
+                    key_clone_bytes
+                        .saturating_add(key_value_bytes)
+                        .saturating_add(value_bytes),
+                    span,
+                )?;
                 let key = RuntimeKey::from_value(&key_value)
                     .ok_or_else(|| self.type_error("hashable Map key", &key_value, span))?;
+                let (is_new_key, growth_bytes) = {
+                    let map = map.borrow();
+                    let is_new_key = !map.entries.contains_key(&key);
+                    let order_growth = if is_new_key && map.order.len() == map.order.capacity() {
+                        map.order
+                            .capacity()
+                            .max(1)
+                            .saturating_mul(2)
+                            .max(4)
+                            .saturating_sub(map.order.capacity())
+                            .saturating_mul(size_of::<(RuntimeKey, Value)>())
+                    } else {
+                        0
+                    };
+                    let entries_growth =
+                        if is_new_key && map.entries.len() == map.entries.capacity() {
+                            map.entries
+                                .capacity()
+                                .max(1)
+                                .saturating_mul(2)
+                                .max(4)
+                                .saturating_sub(map.entries.capacity())
+                                .saturating_mul(size_of::<(RuntimeKey, Value)>())
+                        } else {
+                            0
+                        };
+                    (is_new_key, order_growth.saturating_add(entries_growth))
+                };
+                if is_new_key {
+                    self.ensure_memory_budget(
+                        key_clone_bytes
+                            .saturating_mul(2)
+                            .saturating_add(key_value_bytes)
+                            .saturating_add(value_bytes)
+                            .saturating_add(growth_bytes),
+                        span,
+                    )?;
+                }
                 let mut map = map.borrow_mut();
                 if !map.entries.contains_key(&key) {
                     map.order.push((key.clone(), key_value));
@@ -1835,6 +1902,24 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let value = self.pop(span)?;
         match self.pop(span)? {
             Value::Array(values) => {
+                let growth_bytes = {
+                    let values = values.borrow();
+                    if values.len() == values.capacity() {
+                        values
+                            .capacity()
+                            .max(1)
+                            .saturating_mul(2)
+                            .max(4)
+                            .saturating_sub(values.capacity())
+                            .saturating_mul(size_of::<Value>())
+                    } else {
+                        0
+                    }
+                };
+                self.ensure_memory_budget(
+                    growth_bytes.saturating_add(estimated_unmanaged_payload_bytes(&value, 0)),
+                    span,
+                )?;
                 values.borrow_mut().push(value);
                 Ok(())
             }
@@ -1865,6 +1950,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn iter(&mut self, span: Span) -> Result<(), RuntimeError> {
         let value = self.pop(span)?;
+        self.ensure_memory_budget(estimated_iterator_storage(&value), span)?;
         let values = match value {
             Value::Array(values) => values.borrow().clone(),
             Value::Tuple(values) => values.values.borrow().clone(),
@@ -1905,30 +1991,53 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let (start, end) = self.slice_bounds(start_value, end_value, span)?;
         let sliced = match collection {
             Value::Array(values) => {
-                let values = values.borrow();
-                if start > end || end > values.len() {
-                    return Err(self.index_error(span));
-                }
-                self.allocate_array(values[start..end].to_vec())
+                let allocation_bytes = {
+                    let values = values.borrow();
+                    if start > end || end > values.len() {
+                        return Err(self.index_error(span));
+                    }
+                    end.saturating_sub(start)
+                        .saturating_mul(size_of::<Value>())
+                        .saturating_add(estimate_cloned_value_payloads(&values[start..end]))
+                };
+                self.ensure_memory_budget(allocation_bytes, span)?;
+                self.allocate_array(values.borrow()[start..end].to_vec())
             }
             Value::Tuple(values) => {
-                let values = values.values.borrow();
-                if start > end || end > values.len() {
-                    return Err(self.index_error(span));
-                }
-                self.allocate_tuple(values[start..end].to_vec())
+                let allocation_bytes = {
+                    let values = values.values.borrow();
+                    if start > end || end > values.len() {
+                        return Err(self.index_error(span));
+                    }
+                    end.saturating_sub(start)
+                        .saturating_mul(size_of::<Value>())
+                        .saturating_add(estimate_cloned_value_payloads(&values[start..end]))
+                };
+                self.ensure_memory_budget(allocation_bytes, span)?;
+                self.allocate_tuple(values.values.borrow()[start..end].to_vec())
             }
             Value::String(value) => {
                 let length = value.chars().count();
                 if start > end || end > length {
                     return Err(self.index_error(span));
                 }
+                let result_bytes = value
+                    .chars()
+                    .skip(start)
+                    .take(end - start)
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+                self.ensure_memory_budget(value.capacity().saturating_add(result_bytes), span)?;
                 Value::String(value.chars().skip(start).take(end - start).collect())
             }
             Value::Bytes(value) => {
                 if start > end || end > value.len() {
                     return Err(self.index_error(span));
                 }
+                self.ensure_memory_budget(
+                    value.capacity().saturating_add(end.saturating_sub(start)),
+                    span,
+                )?;
                 Value::Bytes(value[start..end].to_vec())
             }
             other => return Err(self.type_error("Array, Tuple, String, or Bytes", &other, span)),
@@ -2323,7 +2432,18 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             .ok_or_else(|| self.error(RuntimeErrorKind::StackUnderflow, span))
     }
 
-    fn push_literal(&mut self, literal: &DataLiteral) {
+    fn push_literal(&mut self, literal: &DataLiteral) -> Result<(), RuntimeError> {
+        let significant_bits = literal
+            .bits
+            .iter()
+            .position(|bit| *bit == 1)
+            .map_or(0, |first_one| literal.bits.len() - first_one);
+        let payload_bytes = significant_bits
+            .saturating_add(63)
+            .checked_div(64)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(size_of::<u64>());
+        self.ensure_memory_budget(payload_bytes, literal.span)?;
         let mut value = BigInt::from(0);
         for bit in &literal.bits {
             value <<= 1usize;
@@ -2332,6 +2452,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
         }
         self.stack.push(Value::Int(value));
+        Ok(())
     }
 
     fn read_input_line(&mut self, span: Span) -> Result<Option<Vec<u8>>, RuntimeError> {
@@ -2497,6 +2618,58 @@ fn estimate_cloned_value_payloads(values: &[Value]) -> usize {
     values.iter().fold(0usize, |total, value| {
         total.saturating_add(estimated_unmanaged_payload_bytes(value, 0))
     })
+}
+
+fn estimated_iterator_storage(value: &Value) -> usize {
+    let (values_bytes, payload_bytes) = match value {
+        Value::Array(values) => {
+            let values = values.borrow();
+            (
+                values.capacity().saturating_mul(size_of::<Value>()),
+                estimate_cloned_value_payloads(&values),
+            )
+        }
+        Value::Tuple(values) => {
+            let values = values.values.borrow();
+            (
+                values.capacity().saturating_mul(size_of::<Value>()),
+                estimate_cloned_value_payloads(&values),
+            )
+        }
+        Value::Map(map) => {
+            let map = map.borrow();
+            let payload_bytes = map.order.iter().fold(0usize, |total, (_, value)| {
+                total.saturating_add(estimated_unmanaged_payload_bytes(value, 0))
+            });
+            (
+                map.order.len().saturating_mul(size_of::<Value>()),
+                payload_bytes,
+            )
+        }
+        Value::Set(set) => {
+            let set = set.borrow();
+            let payload_bytes = set.order.iter().fold(0usize, |total, (_, value)| {
+                total.saturating_add(estimated_unmanaged_payload_bytes(value, 0))
+            });
+            (
+                set.order.len().saturating_mul(size_of::<Value>()),
+                payload_bytes,
+            )
+        }
+        Value::String(value) => (
+            value.len().saturating_mul(size_of::<Value>()),
+            value.capacity(),
+        ),
+        Value::Bytes(value) => (
+            value.len().saturating_mul(size_of::<Value>()),
+            value.capacity(),
+        ),
+        _ => return 0,
+    };
+    values_bytes
+        .saturating_add(payload_bytes)
+        .saturating_add(size_of::<IteratorState>())
+        .saturating_add(2 * size_of::<usize>())
 }
 
 fn empty_span() -> Span {

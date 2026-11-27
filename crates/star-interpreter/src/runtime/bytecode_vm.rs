@@ -1400,6 +1400,11 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             let Value::Int(value) = value else {
                 return Err(self.runtime.type_error("Int", &value, span));
             };
+            let payload_bytes = super::estimated_bigint_bytes(&value);
+            self.runtime.ensure_memory_budget(
+                payload_bytes.saturating_add(payload_bytes.saturating_add(1)),
+                span,
+            )?;
             self.runtime.stack.push(Value::Int(!value));
             return Ok(());
         }
@@ -1413,6 +1418,15 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Value::Int(value) => value,
             other => return Err(self.runtime.type_error("Int", &other, span)),
         };
+        let operand_bytes = super::estimated_bigint_bytes(&left)
+            .saturating_add(super::estimated_bigint_bytes(&right));
+        if matches!(operation, IrOp::BitAnd | IrOp::BitOr | IrOp::BitXor) {
+            let result_bits = left.bits().max(right.bits()).saturating_add(1);
+            let result_bytes =
+                usize::try_from(result_bits.saturating_add(7) / 8).unwrap_or(usize::MAX);
+            self.runtime
+                .ensure_memory_budget(operand_bytes.saturating_add(result_bytes), span)?;
+        }
         let result = match operation {
             IrOp::BitAnd => &left & &right,
             IrOp::BitOr => &left | &right,
@@ -1433,6 +1447,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 let limit = self.policy.limits.max_file_bytes.saturating_mul(8);
                 if count > limit {
                     if operation == IrOp::Shr {
+                        self.runtime.ensure_memory_budget(operand_bytes, span)?;
                         self.runtime.stack.push(Value::Int(if left.is_negative() {
                             BigInt::from(-1)
                         } else {
@@ -1443,8 +1458,16 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     return Err(self.runtime.error(RuntimeErrorKind::ExecutionLimit, span));
                 }
                 if operation == IrOp::Shl {
+                    let result_bits = left
+                        .bits()
+                        .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                    let result_bytes =
+                        usize::try_from(result_bits.saturating_add(7) / 8).unwrap_or(usize::MAX);
+                    self.runtime
+                        .ensure_memory_budget(operand_bytes.saturating_add(result_bytes), span)?;
                     &left << count
                 } else {
+                    self.runtime.ensure_memory_budget(operand_bytes, span)?;
                     &left >> count
                 }
             }
