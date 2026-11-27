@@ -1,0 +1,49 @@
+version = 1
+title = "Star algorithm-solving profile"
+input_encoding = "UTF-8"
+output_comparison = "byte-for-byte"
+expected_exit_code = 0
+time_limit_ms = 30000
+memory_limit_bytes = 268435456
+
+[[case]]
+id = "array-sum"
+category = "arrays"
+input = "array-sum.in"
+expected_output = "array-sum.out"
+
+[[case]]
+id = "map-distinct"
+category = "hash-maps"
+input = "map-distinct.in"
+expected_output = "map-distinct.out"
+
+[[case]]
+id = "graph-bfs"
+category = "graphs"
+input = "graph-bfs.in"
+expected_output = "graph-bfs.out"
+
+[[case]]
+id = "fibonacci-dp"
+category = "dynamic-programming"
+input = "fibonacci-dp.in"
+expected_output = "fibonacci-dp.out"
+
+[[case]]
+id = "sort-search"
+category = "sorting-searching"
+input = "sort-search.in"
+expected_output = "sort-search.out"
+
+[[case]]
+id = "string-lengths"
+category = "strings"
+input = "string-lengths.in"
+expected_output = "string-lengths.out"
+
+[[case]]
+id = "empty-input"
+category = "input-eof"
+input = "empty-input.in"
+expected_output = "empty-input.out"
