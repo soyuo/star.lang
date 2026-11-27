@@ -140,6 +140,17 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.stack()
     }
 
+    /// Returns the highest successfully preflighted guest-memory estimate
+    /// observed during the most recent execution.
+    pub fn peak_memory_estimate_bytes(&self) -> usize {
+        self.runtime.peak_memory_estimate_bytes()
+    }
+
+    /// Returns the number of bytecode instructions executed in the most recent run.
+    pub fn executed_steps(&self) -> u64 {
+        self.runtime.executed_steps()
+    }
+
     /// Returns a module-global binding, if one exists.
     pub fn global(&self, id: &BigInt) -> Option<Value> {
         self.runtime.global(id)

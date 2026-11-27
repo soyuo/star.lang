@@ -252,6 +252,7 @@ pub struct Interpreter<R: BufRead, W: Write> {
     external_memory_bytes: usize,
     execution_started: Option<Instant>,
     executed_steps: u64,
+    peak_memory_estimate_bytes: usize,
     tasks: HashMap<u64, GuestTask>,
     ready_tasks: VecDeque<u64>,
     next_task_id: u64,
@@ -371,6 +372,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             external_memory_bytes: 0,
             execution_started: None,
             executed_steps: 0,
+            peak_memory_estimate_bytes: 0,
             tasks: HashMap::new(),
             ready_tasks: VecDeque::new(),
             next_task_id: 1,
@@ -440,7 +442,20 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn begin_execution(&mut self) {
         self.executed_steps = 0;
+        self.peak_memory_estimate_bytes = 0;
         self.execution_started = Some(Instant::now());
+    }
+
+    /// Returns the highest successfully preflighted guest-memory estimate
+    /// observed during the most recent execution.
+    pub fn peak_memory_estimate_bytes(&self) -> usize {
+        self.peak_memory_estimate_bytes
+    }
+
+    /// Returns the number of source statements or bytecode instructions
+    /// executed in the most recent run.
+    pub fn executed_steps(&self) -> u64 {
+        self.executed_steps
     }
 
     fn check_resource_limits(&mut self, span: Span) -> Result<(), RuntimeError> {
@@ -501,9 +516,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .saturating_add(self.concurrent_primitive_memory_bytes())
                 .saturating_add(self.pending_channel_message_bytes);
         }
-        if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
+        let projected = estimated.saturating_add(additional);
+        if projected > self.limits.max_memory_bytes {
             return Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span));
         }
+        self.peak_memory_estimate_bytes = self.peak_memory_estimate_bytes.max(projected);
         Ok(())
     }
 
