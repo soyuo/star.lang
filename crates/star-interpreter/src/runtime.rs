@@ -1306,35 +1306,48 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             return Err(self.error(RuntimeErrorKind::PermissionError("task.spawn"), span));
         }
         let callable = self.pop(span)?;
-        let (function_ref, captures) = match callable {
-            Value::Function(function) => (function, Vec::new()),
+        let (module_index, function_id, capture_bytes) = match &callable {
+            Value::Function(function_ref) => (function_ref.module_index, &function_ref.id, 0usize),
             Value::Closure(closure) => {
                 let capture_bytes = {
                     let captures = closure.captures.borrow();
                     estimated_capture_clone_bytes(&captures)
                 };
-                self.ensure_memory_budget(capture_bytes, span)?;
-                let captures = closure.captures.borrow().clone();
-                (closure.function.clone(), captures)
+                (
+                    closure.function.module_index,
+                    &closure.function.id,
+                    capture_bytes,
+                )
             }
-            other => return Err(self.type_error("Function or Closure", &other, span)),
+            other => return Err(self.type_error("Function or Closure", other, span)),
         };
-        if function_ref.module_index != 0 {
+        if module_index != 0 {
             return Err(self.error(
                 RuntimeErrorKind::ReferenceError("function belongs to another module"),
                 span,
             ));
         }
-        let function = self
+        let function_clone_bytes = self
             .functions
-            .get(&function_ref.id)
-            .cloned()
+            .get(function_id)
+            .map(estimated_function_clone_bytes)
             .ok_or_else(|| {
                 self.error(
                     RuntimeErrorKind::ReferenceError("function does not exist"),
                     span,
                 )
             })?;
+        self.ensure_memory_budget(function_clone_bytes.saturating_add(capture_bytes), span)?;
+        let function = self.functions.get(function_id).cloned().ok_or_else(|| {
+            self.error(
+                RuntimeErrorKind::ReferenceError("function does not exist"),
+                span,
+            )
+        })?;
+        let captures = match &callable {
+            Value::Closure(closure) => closure.captures.borrow().clone(),
+            _ => Vec::new(),
+        };
         let task = self.create_task(function, Vec::new(), captures, span)?;
         self.push_value(task, span)
     }
