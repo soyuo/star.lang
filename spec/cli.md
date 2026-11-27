@@ -3,9 +3,10 @@
 Status: draft
 
 The `star` CLI provides source checking and building, single-program execution,
-online-judge fixture execution, process-level timing, and source encoding and
-formatting tools. It preserves guest standard input and output for `run`;
-diagnostics are written to stderr.
+online-judge fixture execution, process-level timing, source encoding and
+formatting, an interactive source REPL, and verified bytecode disassembly. It
+preserves guest standard input and output for `run`; diagnostics are written to
+stderr.
 
 ## Commands
 
@@ -22,6 +23,8 @@ diagnostics are written to stderr.
 | `star minify <file.star> [--write]` | Validates source and removes formatting whitespace. `--write` replaces the input file. |
 | `star encode (--int N | --float N | --string TEXT | --file PATH | --opcode NAME)` | Emits a valid Star source representation for the selected value or ordinary assigned opcode. |
 | `star decode <source-file>` | Decodes one value or ordinary instruction token produced by `star encode`. |
+| `star disasm <file.starc>` | Verifies the complete bytecode file before listing functions, code offsets, VM instructions, and operands. Intrinsic IDs are shown separately from direct VM opcode names. |
+| `star repl` | Starts a persistent source-interpreter session. Incomplete instructions and blocks continue on the next line; `help`, `reset`, and `exit` are REPL commands. Globals, function/type definitions, and operand-stack values persist between submissions. |
 | `star help` | Prints command usage and stable exit codes. |
 
 `check`, `build`, and `run` accept `--strict` for source whitespace handling.
@@ -38,6 +41,9 @@ statistics do not apply. Resource defaults and accounting are defined in
 
 The exact source-tooling formats and round-trip behavior are defined in
 `spec/source-tools.md`.
+
+REPL persistence, line continuation, reset behavior, and disassembly output
+contracts are defined in `spec/repl-disassembly.md`.
 
 `star test` returns exit code 7 when any fixture fails. Fixture infrastructure
 and file-access failures use the I/O exit code. The manifest supplies the

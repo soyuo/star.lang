@@ -798,6 +798,19 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     /// Executes supported statements in source order.
     pub fn execute(&mut self, program: &Program) -> Result<(), RuntimeError> {
+        self.execute_with_mode(program, false)
+    }
+
+    /// Executes one REPL submission while preserving module globals and definitions.
+    pub fn execute_repl(&mut self, program: &Program) -> Result<(), RuntimeError> {
+        self.execute_with_mode(program, true)
+    }
+
+    fn execute_with_mode(
+        &mut self,
+        program: &Program,
+        preserve_definitions: bool,
+    ) -> Result<(), RuntimeError> {
         self.begin_execution();
         let stack_base = self.stack.len();
         let scope_base = self.scopes.len();
@@ -806,7 +819,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let capture_base = self.capture_vectors.len();
         let trace_base = self.call_trace.len();
         let call_depth_base = self.call_depth;
-        let result = self.execute_program(program);
+        let result = self.execute_program(program, preserve_definitions);
         if result.is_err() {
             self.stack.truncate(stack_base);
             self.scopes.truncate(scope_base);
@@ -825,20 +838,74 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         }
     }
 
-    fn execute_program(&mut self, program: &Program) -> Result<(), RuntimeError> {
+    /// Reads one raw interactive line through the same buffered input used by `INPUT`.
+    pub fn read_repl_line(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, stdio::InputError> {
+        self.input.read_line_bytes(max_bytes)
+    }
+
+    /// Clears guest session state while retaining host I/O, capabilities, and limits.
+    pub fn reset_repl_session(&mut self) -> Result<(), String> {
+        self.stack.clear();
+        self.scopes.clear();
+        self.scopes.push(HashMap::new());
+        self.scope_floors.clear();
+        self.scope_floors.push(0);
+        self.frame_stack_bases.clear();
+        self.functions.clear();
         self.structs.clear();
         self.interfaces.clear();
-        self.capture_vectors = vec![Vec::new()];
-        self.functions = semantic::resolve_functions(program)
-            .map_err(|error| {
-                self.error(
-                    RuntimeErrorKind::CompileError(error.kind.to_string()),
-                    error.span,
-                )
-            })?
-            .into_iter()
-            .map(|function| (function.id.clone(), function))
-            .collect();
+        self.capture_vectors.clear();
+        self.capture_vectors.push(Vec::new());
+        self.call_depth = 0;
+        self.call_trace.clear();
+        self.external_memory_bytes = 0;
+        self.execution_started = None;
+        self.executed_steps = 0;
+        self.peak_memory_estimate_bytes = 0;
+        self.tasks.clear();
+        self.ready_tasks.clear();
+        self.next_task_id = 1;
+        self.current_task_id = None;
+        self.channels.clear();
+        self.next_channel_id = 1;
+        self.next_channel_waiter_id = 1;
+        self.mutexes.clear();
+        self.next_mutex_id = 1;
+        self.pending_channel_message_bytes = 0;
+        self.collect_garbage()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn execute_program(
+        &mut self,
+        program: &Program,
+        preserve_definitions: bool,
+    ) -> Result<(), RuntimeError> {
+        if !preserve_definitions {
+            self.structs.clear();
+            self.interfaces.clear();
+            self.capture_vectors = vec![Vec::new()];
+        }
+        let resolved_functions = semantic::resolve_functions(program).map_err(|error| {
+            self.error(
+                RuntimeErrorKind::CompileError(error.kind.to_string()),
+                error.span,
+            )
+        })?;
+        if preserve_definitions {
+            for function in resolved_functions {
+                self.functions.insert(function.id.clone(), function);
+            }
+        } else {
+            self.functions = resolved_functions
+                .into_iter()
+                .map(|function| (function.id.clone(), function))
+                .collect();
+        }
         self.check_resource_limits(
             program
                 .statements

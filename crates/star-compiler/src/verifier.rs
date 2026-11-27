@@ -666,6 +666,7 @@ struct FunctionRecord {
     module_index: u32,
     id: Option<BigInt>,
     initializer: bool,
+    asynchronous: bool,
     parameter_ids: Vec<BigInt>,
     rest_parameter_code: u32,
     max_stack: u32,
@@ -798,6 +799,7 @@ fn parse_functions(
             module_index,
             id,
             initializer,
+            asynchronous,
             parameter_ids,
             rest_parameter_code,
             max_stack,
@@ -1570,6 +1572,118 @@ pub fn verify_bytecode<'a>(
         required_stack_depth,
         function_stack_depths,
     })
+}
+
+/// Verifies a `.starc` v1.0 file and returns a human-readable instruction listing.
+///
+/// Offsets are relative to the Code section and each function. VM opcodes and
+/// intrinsic IDs are printed in separate columns so their namespaces cannot be
+/// confused. Output is capped to keep disassembling hostile files bounded.
+pub fn disassemble_bytecode(
+    bytes: &[u8],
+    policy: &VerificationPolicy,
+) -> Result<String, VerificationError> {
+    const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+    verify_bytecode(bytes, policy)?;
+    let (sections, _) = parse_container(bytes, &policy.limits)?;
+    let mut table_budget = 0_u64;
+    let constants = parse_constants(bytes, sections[&1], &policy.limits, &mut table_budget)?;
+    let (modules, _) = parse_modules(
+        bytes,
+        sections[&2],
+        &constants,
+        &policy.limits,
+        &mut table_budget,
+    )?;
+    let functions = parse_functions(
+        bytes,
+        sections[&3],
+        sections[&4],
+        &modules,
+        &constants,
+        &policy.limits,
+        &mut table_budget,
+    )?;
+    let (decoded, _) = decode_functions(bytes, sections[&4], &functions, &constants, policy)?;
+
+    let mut output = String::new();
+    for (index, (function, decoded)) in functions.iter().zip(decoded.iter()).enumerate() {
+        let label = if function.initializer {
+            "initializer"
+        } else {
+            "function"
+        };
+        append_disassembly_line(
+            &mut output,
+            format!(
+                "function #{index} {label} async={} code=0x{:X}..0x{:X} max_stack={}:",
+                function.asynchronous,
+                function.code_offset,
+                function.code_offset.saturating_add(function.code_length),
+                function.max_stack,
+            ),
+            MAX_OUTPUT_BYTES,
+        )?;
+        for instruction in &decoded.instructions {
+            let text = match &instruction.kind {
+                InstructionKind::PushConst(index) => format!("0x01 PUSH_CONST {index}"),
+                InstructionKind::Intrinsic(operation) => format!(
+                    "0xE0 INTRINSIC id=0x{:04X} ({operation:?})",
+                    operation.intrinsic_id()
+                ),
+                InstructionKind::Jump {
+                    target,
+                    unwind_scopes,
+                } => format!("0xE1 JUMP target=0x{target:X} unwind_scopes={unwind_scopes}"),
+                InstructionKind::BranchIfFalse {
+                    false_target,
+                    true_target,
+                } => format!("0xE2 BRANCH_IF_FALSE false=0x{false_target:X} true=0x{true_target:X}"),
+                InstructionKind::ForInit { loop_state } => {
+                    format!("0xE3 FOR_INIT loop_state={loop_state}")
+                }
+                InstructionKind::ForNext {
+                    loop_state,
+                    body_target,
+                    exit_target,
+                } => format!(
+                    "0xE4 FOR_NEXT loop_state={loop_state} body=0x{body_target:X} exit=0x{exit_target:X}"
+                ),
+                InstructionKind::ScopeEnter => "0xE5 SCOPE_ENTER".to_owned(),
+                InstructionKind::ScopeExit => "0xE6 SCOPE_EXIT".to_owned(),
+                InstructionKind::ReturnTop {
+                    unwind_to_frame_base,
+                } => format!("0xE7 RETURN_TOP unwind={unwind_to_frame_base}"),
+                InstructionKind::Trap => "0xE8 TRAP".to_owned(),
+                InstructionKind::Rethrow => "0xE9 RETHROW".to_owned(),
+                InstructionKind::Halt => "0xFF HALT".to_owned(),
+            };
+            append_disassembly_line(
+                &mut output,
+                format!("  +0x{:08X}  {text}", instruction.offset),
+                MAX_OUTPUT_BYTES,
+            )?;
+        }
+    }
+    Ok(output)
+}
+
+fn append_disassembly_line(
+    output: &mut String,
+    line: String,
+    max_bytes: usize,
+) -> Result<(), VerificationError> {
+    let required = output.len().saturating_add(line.len()).saturating_add(1);
+    if required > max_bytes {
+        return Err(failure(None, "disassembly output exceeds 64 MiB"));
+    }
+    output
+        .try_reserve(line.len().saturating_add(1))
+        .map_err(|_| failure(None, "unable to allocate disassembly output"))?;
+    output.push_str(&line);
+    output.push('\n');
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
