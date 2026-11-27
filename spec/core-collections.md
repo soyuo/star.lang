@@ -11,8 +11,12 @@ The interpreter also exposes `star_interpreter::runtime::collections` primitives
 | `Stack<T>` | LIFO; `try_push`, `pop`, `peek`; iteration is bottom to top | `pop` and `peek` return `None` | push amortized `O(1)`; pop/peek `O(1)` |
 | `Queue<T>` | FIFO; `try_enqueue`, `dequeue`, `front`; iteration is oldest to newest | `dequeue` and `front` return `None` | enqueue/dequeue/front `O(1)` amortized or better |
 | `Deque<T>` | Double-ended; `try_push_front`, `try_push_back`, `pop_front`, `pop_back`, `front`, `back`; iteration is front to back | pops and peeks return `None` | end operations `O(1)` amortized or better |
+| `MinPriorityQueue<T>` | Smallest value first; equal values are removed in insertion order | `pop` and `peek` return `None` | push/pop `O(log n)`; peek `O(1)` |
+| `MaxPriorityQueue<T>` | Largest value first; equal values are removed in insertion order | `pop` and `peek` return `None` | push/pop `O(log n)`; peek `O(1)` |
 
 Push/enqueue operations reserve before mutation and return `TryReserveError` if allocation cannot be reserved. Removal and peek on an empty structure are non-errors. Iteration preserves the order stated above; values are never sorted implicitly.
+
+The module also provides `sort` (ascending, unstable), `stable_sort` (ascending, preserving the relative order of equal values), `binary_search`, `lower_bound`, and `upper_bound` over sorted slices. They use the element type's total `Ord` order. `binary_search` returns the first equal index or the lower-bound insertion point; `lower_bound` finds the first element not less than the target; `upper_bound` finds the first element greater than the target. Sorting takes `O(n log n)` time; unstable sort uses `O(log n)` stack space while stable sort may use `O(n)` auxiliary space. Searches take `O(log n)` time and `O(1)` extra space.
 
 ## Star standard-library boundary
 
