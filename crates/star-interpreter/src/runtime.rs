@@ -1,7 +1,7 @@
 //! Reference execution for literals, primitive operations, variables, and I/O.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
@@ -9,7 +9,7 @@ use std::mem::size_of;
 use std::time::{Duration, Instant};
 
 use num_bigint::Sign;
-use num_traits::Zero;
+use num_traits::{ToPrimitive, Zero};
 use star_common::SourcePosition;
 use star_compiler::Capability;
 use star_parser::Span;
@@ -71,6 +71,8 @@ pub enum RuntimeErrorKind {
     CompileError(String),
     /// The configured function call-depth limit was exceeded.
     StackOverflow,
+    /// A task was awaited after cancellation.
+    TaskCancelled,
     /// The configured statement execution limit was exceeded.
     ExecutionLimit,
     /// A configured runtime memory, operand-stack, or wall-clock ceiling was exceeded.
@@ -100,6 +102,7 @@ impl fmt::Display for RuntimeErrorKind {
             }
             Self::CompileError(reason) => write!(formatter, "compile error: {reason}"),
             Self::StackOverflow => formatter.write_str("function call-depth limit exceeded"),
+            Self::TaskCancelled => formatter.write_str("task was cancelled"),
             Self::ExecutionLimit => formatter.write_str("execution step limit exceeded"),
             Self::ResourceLimit(resource) => write!(formatter, "{resource} limit exceeded"),
             Self::UnsupportedInstruction(opcode) => {
@@ -224,8 +227,8 @@ impl std::error::Error for RuntimeError {}
 ///
 /// The first environment is the module-global scope. Nested `SCOPE` nodes add
 /// temporary lexical environments; ordinary reads and stores walk outward.
-/// This execution slice runs synchronous named functions. Calling an
-/// `ASYNC_FUNC` returns `Unsupported` until task scheduling is implemented.
+/// Source `ASYNC_FUNC` calls create cooperative tasks that run when scheduled
+/// or awaited; bytecode task scheduling belongs to `BytecodeVm`.
 pub struct Interpreter<R: BufRead, W: Write> {
     input: StandardInput<R>,
     output: BufferedOutput<W>,
@@ -245,6 +248,10 @@ pub struct Interpreter<R: BufRead, W: Write> {
     external_memory_bytes: usize,
     execution_started: Option<Instant>,
     executed_steps: u64,
+    tasks: HashMap<u64, GuestTask>,
+    ready_tasks: VecDeque<u64>,
+    next_task_id: u64,
+    current_task_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -264,6 +271,23 @@ struct ExecutionSnapshot {
     capture_lengths: Vec<usize>,
     call_depth: usize,
     call_trace_depth: usize,
+}
+
+#[derive(Clone, Debug)]
+enum GuestTaskStatus {
+    Pending,
+    Running,
+    Completed(Value),
+    Failed(RuntimeError),
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+struct GuestTask {
+    function: ResolvedFunction,
+    arguments: Vec<Value>,
+    captures: Vec<(BigInt, BindingCell)>,
+    status: GuestTaskStatus,
 }
 
 impl<R: BufRead, W: Write> Interpreter<R, W> {
@@ -288,6 +312,10 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             external_memory_bytes: 0,
             execution_started: None,
             executed_steps: 0,
+            tasks: HashMap::new(),
+            ready_tasks: VecDeque::new(),
+            next_task_id: 1,
+            current_task_id: None,
         }
     }
 
@@ -381,7 +409,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         estimated = estimated
             .saturating_add(self.external_memory_bytes)
             .saturating_add(self.call_trace_memory_bytes().saturating_mul(2))
-            .saturating_add(self.call_frame_bookkeeping_memory_bytes());
+            .saturating_add(self.call_frame_bookkeeping_memory_bytes())
+            .saturating_add(self.task_memory_bytes());
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             self.collect_garbage().map_err(|_| {
                 self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
@@ -400,7 +429,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             estimated = estimated
                 .saturating_add(self.external_memory_bytes)
                 .saturating_add(self.call_trace_memory_bytes().saturating_mul(2))
-                .saturating_add(self.call_frame_bookkeeping_memory_bytes());
+                .saturating_add(self.call_frame_bookkeeping_memory_bytes())
+                .saturating_add(self.task_memory_bytes());
         }
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             return Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span));
@@ -433,6 +463,33 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     .capacity()
                     .saturating_mul(size_of::<usize>()),
             )
+    }
+
+    fn task_memory_bytes(&self) -> usize {
+        self.tasks
+            .capacity()
+            .saturating_mul(size_of::<(u64, GuestTask)>())
+            .saturating_add(self.ready_tasks.capacity().saturating_mul(size_of::<u64>()))
+            .saturating_add(self.tasks.values().fold(0usize, |total, task| {
+                total
+                    .saturating_add(estimated_function_clone_bytes(&task.function))
+                    .saturating_add(task.arguments.capacity().saturating_mul(size_of::<Value>()))
+                    .saturating_add(estimate_cloned_value_payloads(&task.arguments))
+                    .saturating_add(estimated_capture_clone_bytes(&task.captures))
+                    .saturating_add(match &task.status {
+                        GuestTaskStatus::Completed(value) => size_of::<Value>()
+                            .saturating_add(estimated_unmanaged_payload_bytes(value, 0)),
+                        GuestTaskStatus::Failed(error) => size_of::<RuntimeError>().saturating_add(
+                            error
+                                .stack_trace
+                                .capacity()
+                                .saturating_mul(size_of::<StackTraceFrame>()),
+                        ),
+                        GuestTaskStatus::Pending
+                        | GuestTaskStatus::Running
+                        | GuestTaskStatus::Cancelled => 0,
+                    })
+            }))
     }
 
     pub(crate) fn call_frame_bookkeeping_growth_bytes(&self) -> usize {
@@ -1036,6 +1093,218 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         Ok(())
     }
 
+    fn create_task(
+        &mut self,
+        function: ResolvedFunction,
+        arguments: Vec<Value>,
+        captures: Vec<(BigInt, BindingCell)>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let parameter_count = function.parameter_ids.len();
+        let arity_matches = if function.variadic {
+            arguments.len() >= parameter_count.saturating_sub(1)
+        } else {
+            arguments.len() == parameter_count
+        };
+        if !arity_matches {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "argument count matching function signature",
+                    found: "wrong argument count",
+                },
+                span,
+            ));
+        }
+        let Some(next_id) = self.next_task_id.checked_add(1) else {
+            return Err(self.error(RuntimeErrorKind::ResourceLimit("task identifiers"), span));
+        };
+        let task_bytes = estimated_function_clone_bytes(&function)
+            .saturating_add(arguments.capacity().saturating_mul(size_of::<Value>()))
+            .saturating_add(estimate_cloned_value_payloads(&arguments))
+            .saturating_add(estimated_capture_clone_bytes(&captures))
+            .saturating_add(size_of::<GuestTask>())
+            .saturating_add(size_of::<u64>() * 2)
+            .saturating_add(
+                projected_capacity_after_push(self.tasks.len(), self.tasks.capacity())
+                    .saturating_sub(self.tasks.capacity())
+                    .saturating_mul(size_of::<(u64, GuestTask)>()),
+            )
+            .saturating_add(
+                projected_capacity_after_push(self.ready_tasks.len(), self.ready_tasks.capacity())
+                    .saturating_sub(self.ready_tasks.capacity())
+                    .saturating_mul(size_of::<u64>()),
+            );
+        self.ensure_memory_budget(task_bytes, span)?;
+        self.tasks
+            .try_reserve(1)
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("task registry"), span))?;
+        self.ready_tasks
+            .try_reserve(1)
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("task queue"), span))?;
+        let id = self.next_task_id;
+        self.next_task_id = next_id;
+        self.tasks.insert(
+            id,
+            GuestTask {
+                function,
+                arguments,
+                captures,
+                status: GuestTaskStatus::Pending,
+            },
+        );
+        self.ready_tasks.push_back(id);
+        Ok(Value::Task(id))
+    }
+
+    fn run_task(&mut self, id: u64, span: Span) -> Result<Value, RuntimeError> {
+        let Some((status, clone_bytes)) = self.tasks.get(&id).map(|task| {
+            let clone_bytes = estimated_function_clone_bytes(&task.function)
+                .saturating_add(task.arguments.capacity().saturating_mul(size_of::<Value>()))
+                .saturating_add(estimate_cloned_value_payloads(&task.arguments))
+                .saturating_add(estimated_capture_clone_bytes(&task.captures));
+            (task.status.clone(), clone_bytes)
+        }) else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("task does not exist"),
+                span,
+            ));
+        };
+        match status {
+            GuestTaskStatus::Completed(value) => return Ok(value),
+            GuestTaskStatus::Failed(error) => return Err(error),
+            GuestTaskStatus::Cancelled => {
+                return Err(self.error(RuntimeErrorKind::TaskCancelled, span))
+            }
+            GuestTaskStatus::Running => {
+                return Err(self.error(
+                    RuntimeErrorKind::ReferenceError("task cannot await itself while running"),
+                    span,
+                ))
+            }
+            GuestTaskStatus::Pending => {}
+        }
+        self.ensure_memory_budget(clone_bytes, span)?;
+        let task = self.tasks.get_mut(&id).expect("task checked above");
+        task.status = GuestTaskStatus::Running;
+        let function = task.function.clone();
+        let arguments = task.arguments.clone();
+        let captures = task.captures.clone();
+        let previous_task = self.current_task_id.replace(id);
+        let result = self.invoke_function_body(function, arguments, captures, span);
+        self.current_task_id = previous_task;
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.status = match &result {
+                Ok(value) => GuestTaskStatus::Completed(value.clone()),
+                Err(error) => GuestTaskStatus::Failed(error.clone()),
+            };
+        }
+        result
+    }
+
+    fn run_next_task(&mut self, span: Span) -> Result<bool, RuntimeError> {
+        while let Some(id) = self.ready_tasks.pop_front() {
+            let pending = self
+                .tasks
+                .get(&id)
+                .is_some_and(|task| matches!(task.status, GuestTaskStatus::Pending));
+            if pending {
+                let _ = self.run_task(id, span);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn await_task(&mut self, id: u64, span: Span) -> Result<Value, RuntimeError> {
+        loop {
+            let status = self
+                .tasks
+                .get(&id)
+                .map(|task| task.status.clone())
+                .ok_or_else(|| {
+                    self.error(
+                        RuntimeErrorKind::ReferenceError("task does not exist"),
+                        span,
+                    )
+                })?;
+            match status {
+                GuestTaskStatus::Completed(value) => return Ok(value),
+                GuestTaskStatus::Failed(error) => return Err(error),
+                GuestTaskStatus::Cancelled => {
+                    return Err(self.error(RuntimeErrorKind::TaskCancelled, span))
+                }
+                GuestTaskStatus::Running => {
+                    return Err(self.error(
+                        RuntimeErrorKind::ReferenceError("task cannot await itself while running"),
+                        span,
+                    ))
+                }
+                GuestTaskStatus::Pending => {
+                    if !self.run_next_task(span)? {
+                        return self.run_task(id, span);
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn_task(&mut self, span: Span) -> Result<(), RuntimeError> {
+        if !self.host_services.task_creation_enabled() {
+            return Err(self.error(RuntimeErrorKind::PermissionError("task.spawn"), span));
+        }
+        let callable = self.pop(span)?;
+        let Value::Function(function_ref) = callable else {
+            return Err(self.type_error("Function", &callable, span));
+        };
+        if function_ref.module_index != 0 {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("function belongs to another module"),
+                span,
+            ));
+        }
+        let function = self
+            .functions
+            .get(&function_ref.id)
+            .cloned()
+            .ok_or_else(|| {
+                self.error(
+                    RuntimeErrorKind::ReferenceError("function does not exist"),
+                    span,
+                )
+            })?;
+        let task = self.create_task(function, Vec::new(), Vec::new(), span)?;
+        self.push_value(task, span)
+    }
+
+    fn await_instruction(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let Value::Task(id) = value else {
+            return Err(self.type_error("Task", &value, span));
+        };
+        let result = self.await_task(id, span)?;
+        self.push_value(result, span)
+    }
+
+    fn cancel_task(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let Value::Task(id) = value else {
+            return Err(self.type_error("Task", &value, span));
+        };
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("task does not exist"),
+                span,
+            ));
+        };
+        let accepted = if matches!(task.status, GuestTaskStatus::Pending) {
+            task.status = GuestTaskStatus::Cancelled;
+            true
+        } else {
+            false
+        };
+        self.push_value(Value::Bool(accepted), span)
+    }
+
     fn invoke_function(
         &mut self,
         function: ResolvedFunction,
@@ -1043,13 +1312,20 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         captures: Vec<(BigInt, BindingCell)>,
         span: Span,
     ) -> Result<Value, RuntimeError> {
-        let argument_count = arguments.len();
         if function.kind == FunctionKind::Asynchronous {
-            return Err(self.error(
-                RuntimeErrorKind::Unsupported("asynchronous function scheduling"),
-                span,
-            ));
+            return self.create_task(function, arguments, captures, span);
         }
+        self.invoke_function_body(function, arguments, captures, span)
+    }
+
+    fn invoke_function_body(
+        &mut self,
+        function: ResolvedFunction,
+        arguments: Vec<Value>,
+        captures: Vec<(BigInt, BindingCell)>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let argument_count = arguments.len();
         let parameter_count = function.parameter_ids.len();
         let arity_matches = if function.variadic {
             argument_count >= parameter_count.saturating_sub(1)
@@ -1802,6 +2078,68 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x52) => self.delete(span),
             InstructionOpcode::Extended(0x53) => self.load(span, true),
             InstructionOpcode::Extended(0x54) => self.store_global(span),
+            InstructionOpcode::Extended(0xA1 | 0xA5) => self.await_instruction(span),
+            InstructionOpcode::Extended(0xA2) => self.spawn_task(span),
+            InstructionOpcode::Extended(0xA3) => {
+                if self.current_task_id.is_none() {
+                    Err(self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "async task context",
+                            found: "main execution context",
+                        },
+                        span,
+                    ))
+                } else {
+                    self.run_next_task(span).map(|_| ())
+                }
+            }
+            InstructionOpcode::Extended(0xA4) => {
+                if self.current_task_id.is_none() {
+                    Err(self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "async task context",
+                            found: "main execution context",
+                        },
+                        span,
+                    ))
+                } else {
+                    let value = self.pop(span)?;
+                    let Value::Int(milliseconds) = value else {
+                        return Err(self.type_error("nonnegative Int milliseconds", &value, span));
+                    };
+                    let milliseconds = milliseconds.to_u64().ok_or_else(|| {
+                        self.error(
+                            RuntimeErrorKind::TypeError {
+                                expected: "nonnegative representable Int milliseconds",
+                                found: "Int",
+                            },
+                            span,
+                        )
+                    })?;
+                    let duration = Duration::from_millis(milliseconds);
+                    if self.execution_started.is_some_and(|started| {
+                        started.elapsed().saturating_add(duration) >= self.limits.max_execution_time
+                    }) {
+                        return Err(
+                            self.error(RuntimeErrorKind::ResourceLimit("execution time"), span)
+                        );
+                    }
+                    let Some(deadline) = Instant::now().checked_add(duration) else {
+                        return Err(
+                            self.error(RuntimeErrorKind::ResourceLimit("execution time"), span)
+                        );
+                    };
+                    while Instant::now() < deadline {
+                        if !self.run_next_task(span)? {
+                            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                            break;
+                        }
+                        self.check_resource_limits(span)?;
+                    }
+                    self.push_value(Value::Null, span)
+                }
+            }
+            InstructionOpcode::Extended(0xA6) => self.cancel_task(span),
             InstructionOpcode::Extended(opcode @ 0xB0..=0xB5) => {
                 self.execute_native_instruction(opcode, span)
             }
