@@ -14,7 +14,12 @@ module.exports = grammar({
         $.extended_instruction,
         $.data_literal,
       ),
-    basic_instruction: ($) => seq(repeat1('*'), "'"),
+    basic_instruction: ($) =>
+      choice(
+        ...Array.from({ length: 12 }, (_, count) =>
+          seq(...Array.from({ length: count + 1 }, () => '*'), "'"),
+        ),
+      ),
     extended_instruction: ($) => eightBits($),
     data_literal: ($) => seq('"', repeat1($._bit), '"'),
     _bit: ($) => choice('*', "'"),

@@ -18,7 +18,7 @@
     },
     "basic": {
       "name": "keyword.operator.star",
-      "match": "\\*(?:[ \\t\\r\\n]*\\*)*[ \\t\\r\\n]*'"
+      "match": "\\*(?:[ \\t\\r\\n]*\\*){0,11}[ \\t\\r\\n]*'"
     }
   }
 }
