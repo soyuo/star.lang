@@ -764,10 +764,10 @@ fn run_oj_suite(options: TestOptions) -> u8 {
             return EXIT_IO;
         }
     };
-    if status.success() {
-        EXIT_OK
-    } else {
-        EXIT_TEST_FAILURE
+    match status.code() {
+        Some(0) => EXIT_OK,
+        Some(1) => EXIT_TEST_FAILURE,
+        _ => EXIT_IO,
     }
 }
 

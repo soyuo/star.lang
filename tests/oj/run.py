@@ -7,7 +7,10 @@ import argparse
 import re
 import subprocess
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
 from pathlib import Path
 
 
@@ -74,6 +77,9 @@ def main() -> int:
     parser.add_argument("--solutions", type=Path, required=True)
     parser.add_argument("--star-cli", default="star")
     arguments = parser.parse_args()
+    if tomllib is None:
+        print("OJ suite requires Python 3.11 or newer (tomllib is unavailable)", file=sys.stderr)
+        return 3
 
     root = Path(__file__).resolve().parent
     solution_root = arguments.solutions.resolve()
@@ -98,16 +104,23 @@ def main() -> int:
             )
             for case in cases
         }
+        fixture_data = {
+            case["id"]: (
+                confined_file(root, case["input"]).read_bytes(),
+                confined_file(root, case["expected_output"]).read_bytes(),
+            )
+            for case in cases
+        }
+        empty_input = confined_file(root, empty_case["input"]).read_bytes()
+        empty_expected = confined_file(root, empty_case["expected_output"]).read_bytes()
     except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError) as error:
         print(f"OJ suite configuration error: {error}", file=sys.stderr)
-        return 2
+        return 3
 
     failed = False
-    empty_input = (root / empty_case["input"]).read_bytes()
-    empty_expected = (root / empty_case["expected_output"]).read_bytes()
+    infrastructure_failed = False
     for case in cases:
-        case_input = (root / case["input"]).read_bytes()
-        expected = (root / case["expected_output"]).read_bytes()
+        case_input, expected = fixture_data[case["id"]]
         source_path, bytecode_path = pairs[case["id"]]
         source = run_engine(
             arguments.star_cli, source_path, case_input, memory_bytes, time_limit_ms
@@ -122,6 +135,13 @@ def main() -> int:
             arguments.star_cli, bytecode_path, empty_input, memory_bytes, time_limit_ms
         )
         outcomes = (source, bytecode, source_empty, bytecode_empty)
+        if any(
+            result is not None
+            and result.returncode == 127
+            and result.stderr.startswith(b"could not start Star CLI")
+            for result in outcomes
+        ):
+            infrastructure_failed = True
         passed = all(result is not None for result in outcomes)
         if passed:
             passed = all(
@@ -158,6 +178,8 @@ def main() -> int:
                 if result is not None and result.stderr:
                     details = result.stderr.decode("utf-8", "replace")
                     print(f"  {engine} stderr: {details}", file=sys.stderr)
+    if infrastructure_failed:
+        return 3
     return 1 if failed else 0
 
 
