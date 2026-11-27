@@ -52,6 +52,7 @@ Usage:
   star encode (--int N | --float N | --string TEXT | --file PATH | --opcode NAME)
   star decode <encoded-source.star>
   star disasm <file.starc>
+  star lsp
   star repl
   star help
 
@@ -125,6 +126,13 @@ fn run(args: Vec<String>) -> u8 {
             print!("{HELP}");
             EXIT_OK
         }
+        "lsp" if args.len() == 1 => match star_lsp::run() {
+            Ok(()) => EXIT_OK,
+            Err(error) => {
+                eprintln!("star: language server failed: {error}");
+                EXIT_IO
+            }
+        },
         "new" => match parse_new_options(&args[1..]) {
             Ok((directory, name)) => create_project(&directory, &name, true),
             Err(message) => {

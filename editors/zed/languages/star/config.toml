@@ -1,0 +1,5 @@
+name = "Star"
+grammar = "star"
+path_suffixes = ["star"]
+tab_size = 4
+hard_tabs = false

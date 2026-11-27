@@ -1,0 +1,18 @@
+{
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for the Star language",
+    "authors": [{ "name": "soyuo" }],
+    "links": { "repository": "https://github.com/soyuo/star.lang" }
+  },
+  "grammars": [
+    {
+      "name": "star",
+      "camelcase": "Star",
+      "scope": "source.star",
+      "path": ".",
+      "file-types": ["star"]
+    }
+  ]
+}

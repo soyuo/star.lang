@@ -60,6 +60,18 @@ pub enum InstructionOpcode {
 }
 
 impl InstructionOpcode {
+    /// Returns every assigned source opcode in canonical catalog order.
+    pub fn assigned_opcodes() -> impl Iterator<Item = Self> {
+        catalog::BASIC_OPCODE_MNEMONICS
+            .iter()
+            .map(|(ordinal, _)| Self::Basic(*ordinal))
+            .chain(
+                catalog::EXTENDED_OPCODE_MNEMONICS
+                    .iter()
+                    .map(|(opcode, _)| Self::Extended(*opcode)),
+            )
+    }
+
     /// Resolves an assigned mnemonic, case-insensitively, from the canonical catalog.
     pub fn from_mnemonic(mnemonic: &str) -> Option<Self> {
         catalog::BASIC_OPCODE_MNEMONICS

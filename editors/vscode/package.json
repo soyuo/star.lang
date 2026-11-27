@@ -1,0 +1,49 @@
+{
+  "name": "star-language-support",
+  "displayName": "Star Language Support",
+  "description": "Syntax and language-server support for Star source files",
+  "version": "0.1.0",
+  "publisher": "soyuo",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:star"],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "star",
+        "aliases": ["Star", "star"],
+        "extensions": [".star"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "star",
+        "scopeName": "source.star",
+        "path": "./syntaxes/star.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Star Language Server",
+      "properties": {
+        "star.languageServer.path": {
+          "type": "string",
+          "default": "star",
+          "description": "Executable path for Star (which provides the `star lsp` command) or star-lsp."
+        },
+        "star.languageServer.args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["lsp"],
+          "description": "Arguments used to start the configured language-server executable."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

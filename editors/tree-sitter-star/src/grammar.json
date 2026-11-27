@@ -1,0 +1,136 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/grammar.schema.json",
+  "name": "star",
+  "rules": {
+    "source_file": {
+      "type": "REPEAT",
+      "content": {
+        "type": "SYMBOL",
+        "name": "statement"
+      }
+    },
+    "statement": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "basic_instruction"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "extended_instruction"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "data_literal"
+        }
+      ]
+    },
+    "basic_instruction": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "REPEAT1",
+          "content": {
+            "type": "STRING",
+            "value": "*"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "'"
+        }
+      ]
+    },
+    "extended_instruction": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "'"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_bit"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_bit"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_bit"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_bit"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_bit"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_bit"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_bit"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_bit"
+        },
+        {
+          "type": "STRING",
+          "value": "\""
+        }
+      ]
+    },
+    "data_literal": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "\""
+        },
+        {
+          "type": "REPEAT1",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_bit"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "\""
+        }
+      ]
+    },
+    "_bit": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "*"
+        },
+        {
+          "type": "STRING",
+          "value": "'"
+        }
+      ]
+    }
+  },
+  "extras": [
+    {
+      "type": "PATTERN",
+      "value": "[ \\t\\r\\n]+"
+    }
+  ],
+  "conflicts": [],
+  "precedences": [],
+  "externals": [],
+  "inline": [],
+  "supertypes": [],
+  "reserved": {}
+}

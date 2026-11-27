@@ -1,0 +1,13 @@
+{
+  "name": "tree-sitter-star",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the Star language",
+  "main": "bindings/node",
+  "license": "MIT",
+  "scripts": {
+    "generate": "tree-sitter generate"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.25.10"
+  }
+}
