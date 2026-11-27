@@ -22,9 +22,12 @@ star-compiler = { path = "crates/star-compiler" }
 cap-std = "4.0.3"
 httparse = "1.10"
 http = "1.4"
+libffi = "5.2.0"
+libloading = "0.9.1"
 num-bigint = "0.5"
 num-traits = "0.2"
 serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
 sha2 = "0.11.2"
+tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
 ureq = { version = "=3.5.2", default-features = false, features = ["rustls"] }
 star-interpreter = { path = "crates/star-interpreter" }
