@@ -90,13 +90,15 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 self.runtime
                     .error(RuntimeErrorKind::CompileError(message), empty_span())
             })?;
-            let result = self.execute_image(&image)?;
-            self.runtime.output.flush().map_err(|error| {
-                self.runtime
-                    .error(RuntimeErrorKind::IOError(error.to_string()), empty_span())
-            })?;
-            Ok(result)
+            self.execute_image(&image)
         })();
+        let result = match (result, self.runtime.output.flush()) {
+            (Err(error), _) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(self
+                .runtime
+                .error(RuntimeErrorKind::IOError(error.to_string()), empty_span())),
+        };
         self.runtime.set_external_memory_bytes(0);
         if result.is_err() {
             self.cleanup_after_error();
@@ -114,7 +116,18 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.global(id)
     }
 
+    /// Returns the injected I/O objects after successfully flushing output.
+    /// On failure, returns the input, buffered output, and error so callers can retry.
+    pub fn try_into_io(
+        self,
+    ) -> Result<(R, W), (R, super::stdio::BufferedOutput<W>, std::io::Error)> {
+        self.runtime.try_into_io()
+    }
+
     /// Returns the injected I/O objects after execution.
+    ///
+    /// This compatibility method discards any bytes still buffered if flushing
+    /// fails. Use [`Self::try_into_io`] when output delivery must be checked.
     pub fn into_io(self) -> (R, W) {
         self.runtime.into_io()
     }
