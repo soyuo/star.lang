@@ -28,6 +28,7 @@ use crate::{
     BigInt,
 };
 
+pub mod collections;
 pub mod stdio;
 
 mod bytecode_vm;
