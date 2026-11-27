@@ -340,7 +340,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 self.limits.max_memory_bytes,
             )
             .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span))?;
-        estimated = estimated.saturating_add(self.external_memory_bytes);
+        estimated = estimated
+            .saturating_add(self.external_memory_bytes)
+            .saturating_add(self.call_trace_memory_bytes());
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             self.collect_garbage().map_err(|_| {
                 self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
@@ -356,7 +358,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .map_err(|_| {
                     self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
                 })?;
-            estimated = estimated.saturating_add(self.external_memory_bytes);
+            estimated = estimated
+                .saturating_add(self.external_memory_bytes)
+                .saturating_add(self.call_trace_memory_bytes());
         }
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             return Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span));
@@ -366,6 +370,18 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     pub(crate) fn set_external_memory_bytes(&mut self, bytes: usize) {
         self.external_memory_bytes = bytes;
+    }
+
+    fn call_trace_memory_bytes(&self) -> usize {
+        self.call_trace
+            .capacity()
+            .saturating_mul(size_of::<StackTraceFrame>())
+            .saturating_add(
+                self.call_trace
+                    .iter()
+                    .map(|frame| estimated_bigint_bytes(&frame.function_id))
+                    .fold(0usize, usize::saturating_add),
+            )
     }
 
     pub(crate) fn push_value(&mut self, value: Value, span: Span) -> Result<(), RuntimeError> {
@@ -958,15 +974,35 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         } else {
             0
         };
+        let next_trace_len = self.call_trace.len().saturating_add(1);
+        let trace_capacity = if next_trace_len <= self.call_trace.capacity() {
+            self.call_trace.capacity()
+        } else {
+            self.call_trace
+                .capacity()
+                .saturating_mul(2)
+                .max(next_trace_len)
+                .min(self.limits.max_call_depth.max(1))
+        };
+        let trace_capacity_growth = trace_capacity
+            .saturating_sub(self.call_trace.capacity())
+            .saturating_mul(size_of::<StackTraceFrame>());
         self.ensure_memory_budget(
             argument_storage_bytes
                 .saturating_add(capture_storage_bytes)
                 .saturating_add(capture_scope_bytes)
                 .saturating_add(parameter_storage_bytes)
                 .saturating_add(rest_vector_bytes)
-                .saturating_add(3 * size_of::<usize>()),
+                .saturating_add(3 * size_of::<usize>())
+                .saturating_add(trace_capacity_growth)
+                .saturating_add(estimated_bigint_bytes(&function.id)),
             span,
         )?;
+        if trace_capacity > self.call_trace.capacity() {
+            self.call_trace
+                .try_reserve_exact(trace_capacity.saturating_sub(self.call_trace.len()))
+                .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("call trace"), span))?;
+        }
 
         let stack_base = self.stack.len();
         let scope_base = self.scopes.len();

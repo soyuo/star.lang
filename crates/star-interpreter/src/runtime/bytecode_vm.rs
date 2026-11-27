@@ -252,10 +252,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     }
 
     fn update_external_frame_memory(&mut self, frames: &Vec<Frame>) {
-        self.runtime.set_external_memory_bytes(
-            frame_storage_bytes(frames, frames.capacity())
-                .saturating_add(call_trace_storage_bytes(&self.runtime.call_trace)),
-        );
+        self.runtime
+            .set_external_memory_bytes(frame_storage_bytes(frames, frames.capacity()));
     }
 
     fn execute_instruction(
@@ -2020,18 +2018,6 @@ fn frame_storage_bytes(frames: &[Frame], capacity: usize) -> usize {
                 .saturating_add(return_payload)
         },
     )
-}
-
-fn call_trace_storage_bytes(trace: &Vec<crate::runtime::StackTraceFrame>) -> usize {
-    trace
-        .capacity()
-        .saturating_mul(size_of::<crate::runtime::StackTraceFrame>())
-        .saturating_add(
-            trace
-                .iter()
-                .map(|frame| super::estimated_bigint_bytes(&frame.function_id))
-                .fold(0usize, usize::saturating_add),
-        )
 }
 
 #[derive(Clone, Debug)]
