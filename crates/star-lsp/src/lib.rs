@@ -242,10 +242,10 @@ impl Document {
         let normalized = match normalize_source(document.text.as_bytes(), LexMode::Normal) {
             Ok(normalized) => normalized,
             Err(error) => {
-                document.diagnostics.push(diagnostic(
-                    span_for_position(error.position),
+                document.diagnostics.push(invalid_source_diagnostic(
+                    &document.text,
+                    error.position.byte_offset,
                     format!("{error}"),
-                    "source",
                 ));
                 return document;
             }
@@ -284,15 +284,58 @@ fn diagnostic(span: Span, message: String, code: &str) -> Value {
     })
 }
 
-fn span_for_position(position: star_common::SourcePosition) -> Span {
-    Span {
-        start: position,
-        end: star_common::SourcePosition {
-            byte_offset: position.byte_offset.saturating_add(1),
-            line: position.line,
-            column: position.column.saturating_add(1),
+fn invalid_source_diagnostic(text: &str, byte_offset: usize, message: String) -> Value {
+    let byte_offset = byte_offset.min(text.len());
+    let (line, character) = utf16_position_at_byte(text, byte_offset);
+    let invalid_char = text
+        .get(byte_offset..)
+        .and_then(|suffix| suffix.chars().next());
+    let (end_line, end_character) = match invalid_char {
+        Some('\r' | '\n') => (line.saturating_add(1), 0),
+        Some(character_value) => (
+            line,
+            character.saturating_add(character_value.len_utf16() as u32),
+        ),
+        None => (line, character.saturating_add(1)),
+    };
+    json!({
+        "range": {
+            "start": { "line": line, "character": character },
+            "end": { "line": end_line, "character": end_character }
         },
+        "severity": 1,
+        "code": "source",
+        "source": "star",
+        "message": message
+    })
+}
+
+fn utf16_position_at_byte(text: &str, byte_offset: usize) -> (u32, u32) {
+    let prefix = text.get(..byte_offset).unwrap_or(text);
+    let mut line = 0u32;
+    let mut character = 0u32;
+    let mut previous_was_cr = false;
+    for current in prefix.chars() {
+        match current {
+            '\r' => {
+                line = line.saturating_add(1);
+                character = 0;
+                previous_was_cr = true;
+            }
+            '\n' => {
+                if !previous_was_cr {
+                    line = line.saturating_add(1);
+                }
+                character = 0;
+                previous_was_cr = false;
+            }
+            _ => {
+                character = character.saturating_add(current.len_utf16() as u32);
+                previous_was_cr = false;
+            }
+        }
     }
+    (line, character)
 }
 
 fn range_json(span: Span) -> Value {
