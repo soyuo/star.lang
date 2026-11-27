@@ -32,6 +32,7 @@ use crate::{
 
 pub mod collections;
 pub mod concurrency;
+pub mod ffi;
 pub mod host;
 pub mod json;
 pub mod math;
@@ -1801,6 +1802,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x52) => self.delete(span),
             InstructionOpcode::Extended(0x53) => self.load(span, true),
             InstructionOpcode::Extended(0x54) => self.store_global(span),
+            InstructionOpcode::Extended(opcode @ 0xB0..=0xB5) => {
+                self.execute_native_instruction(opcode, span)
+            }
             InstructionOpcode::Basic(_) | InstructionOpcode::Extended(_) => Err(self.error(
                 RuntimeErrorKind::UnsupportedInstruction(instruction.opcode),
                 span,
@@ -1810,6 +1814,168 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             self.collect_if_needed();
         }
         result
+    }
+
+    fn execute_native_instruction(&mut self, opcode: u8, span: Span) -> Result<(), RuntimeError> {
+        use ffi::{NativeBuffer, NativeHandle, NativeLibraryHandle, NativeSignature, NativeValue};
+
+        let capabilities = self.host_services.capabilities().clone();
+        if !capabilities.contains(&Capability::Ffi) {
+            return Err(self.error(RuntimeErrorKind::PermissionError("ffi"), span));
+        }
+        let error = |this: &Self, error: ffi::FfiError, span| match error {
+            ffi::FfiError::PermissionDenied => {
+                this.error(RuntimeErrorKind::PermissionError("ffi"), span)
+            }
+            ffi::FfiError::Load(message) => this.error(RuntimeErrorKind::IOError(message), span),
+            ffi::FfiError::Symbol(_) => this.error(
+                RuntimeErrorKind::ReferenceError("native symbol not found"),
+                span,
+            ),
+            ffi::FfiError::LibraryClosed => this.error(
+                RuntimeErrorKind::ReferenceError("native library is closed"),
+                span,
+            ),
+            _ => this.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "valid native handle, signature, and arguments",
+                    found: "invalid native call",
+                },
+                span,
+            ),
+        };
+
+        match opcode {
+            0xB0 => {
+                let path = self.pop(span)?;
+                let Value::String(path) = path else {
+                    return Err(self.type_error("String native library path", &path, span));
+                };
+                let library = NativeLibraryHandle::load(path, &capabilities)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                self.push_value(Value::Handle(NativeHandle::Library(library)), span)
+            }
+            0xB1 => {
+                let signature = self.pop(span)?;
+                let name = self.pop(span)?;
+                let library = self.pop(span)?;
+                let Value::String(signature) = signature else {
+                    return Err(self.type_error(
+                        "String native function signature",
+                        &signature,
+                        span,
+                    ));
+                };
+                let Value::String(name) = name else {
+                    return Err(self.type_error("String native symbol name", &name, span));
+                };
+                let Value::Handle(NativeHandle::Library(library)) = library else {
+                    return Err(self.type_error("native library Handle", &library, span));
+                };
+                let signature = NativeSignature::parse(&signature)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                let function = library
+                    .symbol(&name, signature, &capabilities)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                self.push_value(Value::Handle(NativeHandle::Function(function)), span)
+            }
+            0xB2 => {
+                let function = self.pop(span)?;
+                let count = self.pop(span)?;
+                let Value::Handle(NativeHandle::Function(function)) = function else {
+                    return Err(self.type_error("native function Handle", &function, span));
+                };
+                let Value::Int(count) = count else {
+                    return Err(self.type_error("Int native argument count", &count, span));
+                };
+                let count = count.to_string().parse::<usize>().map_err(|_| {
+                    self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "nonnegative native argument count",
+                            found: "Int",
+                        },
+                        span,
+                    )
+                })?;
+                let expected = function.signature().arguments().len();
+                if count != expected {
+                    return Err(self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "argument count matching native signature",
+                            found: "Int",
+                        },
+                        span,
+                    ));
+                }
+                self.ensure_memory_budget(
+                    count.saturating_mul(std::mem::size_of::<NativeValue>()),
+                    span,
+                )?;
+                let mut arguments = Vec::with_capacity(count);
+                for _ in 0..count {
+                    arguments.push(match self.pop(span)? {
+                        Value::Int(value) => NativeValue::Int(value),
+                        Value::Float(value) => NativeValue::Float(value),
+                        Value::Bool(value) => NativeValue::Bool(value),
+                        Value::String(value) => NativeValue::String(value),
+                        Value::Handle(NativeHandle::Buffer(buffer)) => NativeValue::Buffer(buffer),
+                        value => {
+                            return Err(self.type_error(
+                                "C-compatible native argument",
+                                &value,
+                                span,
+                            ))
+                        }
+                    });
+                }
+                arguments.reverse();
+                let result = function
+                    .call(&arguments, &capabilities)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                let result = match result {
+                    NativeValue::Void => Value::Null,
+                    NativeValue::Int(value) => Value::Int(value),
+                    NativeValue::Float(value) => Value::Float(value),
+                    NativeValue::Bool(value) => Value::Bool(value),
+                    NativeValue::String(value) => Value::String(value),
+                    NativeValue::Buffer(value) => Value::Handle(NativeHandle::Buffer(value)),
+                };
+                self.push_value(result, span)
+            }
+            0xB3 => {
+                let library = self.pop(span)?;
+                let Value::Handle(NativeHandle::Library(library)) = library else {
+                    return Err(self.type_error("native library Handle", &library, span));
+                };
+                library
+                    .close(&capabilities)
+                    .map_err(|error_value| error(self, error_value, span))
+            }
+            0xB4 => Err(self.error(RuntimeErrorKind::Unsupported("native callbacks"), span)),
+            0xB5 => {
+                let length = self.pop(span)?;
+                let Value::Int(length) = length else {
+                    return Err(self.type_error("nonnegative Int buffer length", &length, span));
+                };
+                let length = length.to_string().parse::<usize>().map_err(|_| {
+                    self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "nonnegative Int buffer length",
+                            found: "Int",
+                        },
+                        span,
+                    )
+                })?;
+                self.ensure_memory_budget(length, span)?;
+                let buffer = NativeBuffer::new(length, self.limits.max_memory_bytes)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                self.push_value(Value::Handle(NativeHandle::Buffer(buffer)), span)
+            }
+            _ => Err(self.error(
+                RuntimeErrorKind::UnsupportedInstruction(InstructionOpcode::Extended(opcode)),
+                span,
+            )),
+        }
     }
 
     fn to_int(&mut self, span: Span) -> Result<(), RuntimeError> {
@@ -1868,7 +2034,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             | Value::Char(_)
             | Value::Function(_)
             | Value::Closure(_)
-            | Value::Object(_) => true,
+            | Value::Object(_)
+            | Value::Handle(_) => true,
         };
         self.push_value(Value::Bool(truthy), span)?;
         Ok(())
@@ -3025,6 +3192,7 @@ fn estimated_key_clone_bytes(value: &Value, depth: usize) -> usize {
         | Value::Function(_)
         | Value::Closure(_)
         | Value::Object(_) => 0,
+        Value::Handle(_) => 0,
     }
 }
 
@@ -3051,6 +3219,7 @@ fn estimated_unmanaged_payload_bytes(value: &Value, depth: usize) -> usize {
         | Value::Iterator(_)
         | Value::Closure(_)
         | Value::Object(_) => 0,
+        Value::Handle(handle) => handle.estimated_bytes(),
     }
 }
 

@@ -204,9 +204,11 @@ fn value_to_json(
             active.pop();
             Ok(JsonValue::Array(converted?))
         }
-        Value::Iterator(_) | Value::Function(_) | Value::Closure(_) | Value::Object(_) => {
-            Err(WorkerError::NonSerializable(value.type_name()))
-        }
+        Value::Iterator(_)
+        | Value::Function(_)
+        | Value::Closure(_)
+        | Value::Object(_)
+        | Value::Handle(_) => Err(WorkerError::NonSerializable(value.type_name())),
     }
 }
 
