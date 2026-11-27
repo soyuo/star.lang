@@ -31,6 +31,7 @@ use crate::{
 };
 
 pub mod collections;
+pub mod concurrency;
 pub mod host;
 pub mod json;
 pub mod math;
@@ -38,6 +39,7 @@ pub mod network;
 pub mod path;
 pub mod stdio;
 pub mod strings;
+pub mod worker;
 
 mod bytecode_vm;
 pub use bytecode_vm::BytecodeVm;
