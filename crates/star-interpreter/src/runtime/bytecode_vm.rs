@@ -842,6 +842,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         };
         self.runtime.ensure_memory_budget(
             function_copy_bytes
+                .saturating_add(super::estimated_bigint_bytes(&request.function_id))
                 .saturating_add(argument_storage_bytes)
                 .saturating_add(capture_storage_bytes)
                 .saturating_add(capture_scope_bytes)
@@ -1326,7 +1327,18 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 let (function, captures) = match callable {
                     Value::Function(function) => (function, Vec::new()),
                     Value::Closure(closure) => {
-                        (closure.function.clone(), closure.captures.borrow().clone())
+                        let captures = closure.captures.borrow();
+                        self.runtime.ensure_memory_budget(
+                            super::estimated_capture_clone_bytes(&captures)
+                                .saturating_add(size_of::<FunctionRef>())
+                                .saturating_add(super::estimated_bigint_bytes(&closure.function.id))
+                                .saturating_add(
+                                    arguments.capacity().saturating_mul(size_of::<Value>()),
+                                )
+                                .saturating_add(super::estimate_cloned_value_payloads(&arguments)),
+                            span,
+                        )?;
+                        (closure.function.clone(), captures.clone())
                     }
                     other => {
                         return Err(self.runtime.type_error("Function or Closure", &other, span))

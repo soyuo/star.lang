@@ -840,6 +840,22 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             arguments.push(self.pop(span)?);
         }
         arguments.reverse();
+        let function_copy_bytes = self.functions.get(&function_id).map_or_else(
+            || {
+                Err(self.error(
+                    RuntimeErrorKind::ReferenceError("function does not exist"),
+                    span,
+                ))
+            },
+            |function| Ok(estimated_function_clone_bytes(function)),
+        )?;
+        self.ensure_memory_budget(
+            function_copy_bytes
+                .saturating_add(estimated_bigint_bytes(&function_id))
+                .saturating_add(arguments.capacity().saturating_mul(size_of::<Value>()))
+                .saturating_add(estimate_cloned_value_payloads(&arguments)),
+            span,
+        )?;
         let function = self.functions.get(&function_id).cloned().ok_or_else(|| {
             self.error(
                 RuntimeErrorKind::ReferenceError("function does not exist"),
@@ -1099,7 +1115,16 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let (function_ref, captures) = match callable {
             Value::Function(function) => (function, Vec::new()),
             Value::Closure(closure) => {
-                (closure.function.clone(), closure.captures.borrow().clone())
+                let captures = closure.captures.borrow();
+                self.ensure_memory_budget(
+                    estimated_capture_clone_bytes(&captures)
+                        .saturating_add(size_of::<FunctionRef>())
+                        .saturating_add(estimated_bigint_bytes(&closure.function.id))
+                        .saturating_add(arguments.capacity().saturating_mul(size_of::<Value>()))
+                        .saturating_add(estimate_cloned_value_payloads(&arguments)),
+                    span,
+                )?;
+                (closure.function.clone(), captures.clone())
             }
             other => return Err(self.type_error("Function or Closure", &other, span)),
         };
@@ -1109,6 +1134,25 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         }
+        let Some(function_copy_bytes) = self
+            .functions
+            .get(&function_ref.id)
+            .map(estimated_function_clone_bytes)
+        else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("function does not exist"),
+                span,
+            ));
+        };
+        self.ensure_memory_budget(
+            function_copy_bytes
+                .saturating_add(size_of::<FunctionRef>())
+                .saturating_add(estimated_bigint_bytes(&function_ref.id))
+                .saturating_add(estimated_capture_clone_bytes(&captures))
+                .saturating_add(arguments.capacity().saturating_mul(size_of::<Value>()))
+                .saturating_add(estimate_cloned_value_payloads(&arguments)),
+            span,
+        )?;
         let Some(function) = self.functions.get(&function_ref.id).cloned() else {
             return Err(self.error(
                 RuntimeErrorKind::ReferenceError("function does not exist"),
@@ -1258,6 +1302,22 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .collect(),
         });
         if let Some(constructor_id) = descriptor.methods.get(&BigInt::from(0)) {
+            let Some(function_copy_bytes) = self
+                .functions
+                .get(constructor_id)
+                .map(estimated_function_clone_bytes)
+            else {
+                return Err(self.error(
+                    RuntimeErrorKind::ReferenceError("constructor function does not exist"),
+                    span,
+                ));
+            };
+            self.ensure_memory_budget(
+                function_copy_bytes
+                    .saturating_add(arguments.capacity().saturating_mul(size_of::<Value>()))
+                    .saturating_add(estimate_cloned_value_payloads(&arguments)),
+                span,
+            )?;
             let Some(function) = self.functions.get(constructor_id).cloned() else {
                 return Err(self.error(
                     RuntimeErrorKind::ReferenceError("constructor function does not exist"),
@@ -1368,6 +1428,22 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     span,
                 )
             })?;
+        let Some(function_copy_bytes) = self
+            .functions
+            .get(&function_id)
+            .map(estimated_function_clone_bytes)
+        else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("method function does not exist"),
+                span,
+            ));
+        };
+        self.ensure_memory_budget(
+            function_copy_bytes
+                .saturating_add(arguments.capacity().saturating_mul(size_of::<Value>()))
+                .saturating_add(estimate_cloned_value_payloads(&arguments)),
+            span,
+        )?;
         let Some(function) = self.functions.get(&function_id).cloned() else {
             return Err(self.error(
                 RuntimeErrorKind::ReferenceError("method function does not exist"),
@@ -2794,6 +2870,36 @@ fn estimated_unmanaged_payload_bytes(value: &Value, depth: usize) -> usize {
 
 fn estimated_bigint_bytes(value: &BigInt) -> usize {
     usize::try_from(value.bits().saturating_add(7) / 8).unwrap_or(usize::MAX)
+}
+
+fn estimated_capture_clone_bytes(captures: &[(BigInt, BindingCell)]) -> usize {
+    captures
+        .len()
+        .saturating_mul(size_of::<(BigInt, BindingCell)>())
+        .saturating_add(
+            captures
+                .iter()
+                .map(|(id, _)| estimated_bigint_bytes(id))
+                .fold(0usize, usize::saturating_add),
+        )
+}
+
+fn estimated_function_clone_bytes(function: &ResolvedFunction) -> usize {
+    size_of::<ResolvedFunction>()
+        .saturating_add(
+            function
+                .parameter_ids
+                .capacity()
+                .saturating_mul(size_of::<BigInt>()),
+        )
+        .saturating_add(estimated_bigint_bytes(&function.id))
+        .saturating_add(
+            function
+                .parameter_ids
+                .iter()
+                .map(estimated_bigint_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
 }
 
 fn estimate_cloned_value_payloads(values: &[Value]) -> usize {
