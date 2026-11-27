@@ -31,6 +31,7 @@ use crate::{
 pub mod collections;
 pub mod math;
 pub mod stdio;
+pub mod strings;
 
 mod bytecode_vm;
 pub use bytecode_vm::BytecodeVm;
