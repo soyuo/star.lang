@@ -9,6 +9,8 @@ name = "star"
 path = "src/main.rs"
 
 [dependencies]
+num-bigint.workspace = true
+star-common.workspace = true
 star-compiler.workspace = true
 star-lexer.workspace = true
 star-parser.workspace = true

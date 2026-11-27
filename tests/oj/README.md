@@ -20,6 +20,12 @@ Each algorithm input contains multiple cases in one process. Numeric and string 
 The pack contains problem fixtures, not reference solutions. Provide a directory containing one paired source and bytecode solution per problem, named `<case-id>.star` and `<case-id>.starc`. From the repository root, run the parity harness with Python 3.11 or newer:
 
 ```sh
+star test --suite oj --solutions path/to/solutions
+```
+
+The default solution directory is `tests/oj/solutions`. A fixture failure returns the stable CLI exit code `7`. The CLI locates the repository runner from the current directory or its parents. The direct runner invocation remains available for explicit engine paths:
+
+```sh
 python tests/oj/run.py --solutions path/to/solutions --star-cli target/release/star
 ```
 
