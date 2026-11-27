@@ -3,8 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use star_package::{
-    install_tree, read_lock, resolve_dependencies, source_checksum, write_deterministic_package,
-    write_lock, Dependency, DependencySource, LocalRegistry, Manifest, PackageError,
+    install_tree, read_lock, resolve_dependencies, resolve_dependencies_from_lock, source_checksum,
+    write_deterministic_package, write_lock, Dependency, DependencySource, LocalRegistry, Manifest,
+    PackageError,
 };
 
 const EXIT_OK: u8 = 0;
@@ -16,11 +17,12 @@ pub fn run(command: &str, arguments: &[String]) -> u8 {
         Ok(path) => path,
         Err(error) => return report(error),
     };
-    let registry = LocalRegistry::new(registry_path());
+    let registry = local_registry();
     let result = match command {
         "add" => add(&project, arguments),
         "remove" => remove(&project, arguments),
-        "install" | "update" => install(&project, &registry),
+        "install" => install(&project, &registry),
+        "update" => update(&project, &registry),
         "search" => search(&registry, arguments),
         "package" => package(&project),
         "publish" => publish(&project, &registry),
@@ -40,6 +42,10 @@ pub fn run(command: &str, arguments: &[String]) -> u8 {
         }
         Err(error) => report(error),
     }
+}
+
+pub fn local_registry() -> LocalRegistry {
+    LocalRegistry::new(registry_path())
 }
 
 fn registry_path() -> PathBuf {
@@ -117,17 +123,60 @@ fn remove(project: &Path, arguments: &[String]) -> Result<(), PackageError> {
 }
 
 fn install(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError> {
+    let existing = read_lock(project)?;
+    let (lock, packages) = if let Some(existing) = existing.as_ref() {
+        let resolved = resolve_dependencies_from_lock(project, registry, existing)?;
+        if !same_lock(existing, &resolved.0) {
+            return Err(PackageError::Invalid(
+                "star.lock does not match the manifest or dependency sources; run `star update`"
+                    .into(),
+            ));
+        }
+        resolved
+    } else {
+        let resolved = resolve_dependencies(project, registry)?;
+        write_lock(project, &resolved.0)?;
+        resolved
+    };
+    install_packages(project, &lock, &packages)
+}
+
+fn update(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError> {
     let (lock, packages) = resolve_dependencies(project, registry)?;
     write_lock(project, &lock)?;
+    install_packages(project, &lock, &packages)
+}
+
+fn same_lock(left: &star_package::Lockfile, right: &star_package::Lockfile) -> bool {
+    let mut left = left.packages.clone();
+    let mut right = right.packages.clone();
+    left.sort_by(|a, b| (&a.name, &a.version, &a.source).cmp(&(&b.name, &b.version, &b.source)));
+    right.sort_by(|a, b| (&a.name, &a.version, &a.source).cmp(&(&b.name, &b.version, &b.source)));
+    left == right
+}
+
+fn install_packages(
+    project: &Path,
+    lock: &star_package::Lockfile,
+    packages: &[star_package::ResolvedPackage],
+) -> Result<(), PackageError> {
+    let project_root = project.canonicalize()?;
     for package in packages {
         if package.locked.source.starts_with("path+") {
             continue;
         }
-        let destination = project
-            .join("deps")
-            .join(&package.locked.name)
-            .join(&package.locked.version);
-        if destination.exists() {
+        let parent =
+            ensure_project_directory(&project_root, Path::new("deps").join(&package.locked.name))?;
+        let destination = parent.join(&package.locked.version);
+        if fs::symlink_metadata(&destination).is_ok() {
+            let canonical = destination.canonicalize().map_err(|_| {
+                PackageError::Invalid("installed dependency path is not accessible".into())
+            })?;
+            if !canonical.starts_with(&project_root) {
+                return Err(PackageError::Invalid(
+                    "installed dependency path escapes the project".into(),
+                ));
+            }
             if source_checksum(&destination)? != package.locked.checksum {
                 return Err(PackageError::Invalid(format!(
                     "installed dependency `{}` checksum does not match star.lock",
@@ -140,6 +189,41 @@ fn install(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError>
     }
     println!("installed {} package(s)", lock.packages.len());
     Ok(())
+}
+
+fn ensure_project_directory(
+    project_root: &Path,
+    relative: PathBuf,
+) -> Result<PathBuf, PackageError> {
+    let mut current = project_root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(PackageError::Invalid("invalid install directory".into()));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() || metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(PackageError::Invalid(
+                    "install path component is not a directory".into(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(error) => return Err(PackageError::Io(error)),
+        }
+        current = current.canonicalize()?;
+        if !current.starts_with(project_root) {
+            return Err(PackageError::Invalid(
+                "install path escapes the project".into(),
+            ));
+        }
+        if !current.is_dir() {
+            return Err(PackageError::Invalid(
+                "install path component is not a directory".into(),
+            ));
+        }
+    }
+    Ok(current)
 }
 
 fn search(registry: &LocalRegistry, arguments: &[String]) -> Result<(), PackageError> {
@@ -184,8 +268,8 @@ fn audit(project: &Path, registry: &LocalRegistry) -> Result<(), PackageError> {
             "star.lock is missing; run `star install`".into(),
         ));
     };
-    let (resolved, packages) = resolve_dependencies(project, registry)?;
-    if existing.packages.len() != resolved.packages.len() {
+    let (resolved, packages) = resolve_dependencies_from_lock(project, registry, &existing)?;
+    if !same_lock(&existing, &resolved) {
         return Err(PackageError::Invalid(
             "star.lock does not match the manifest; run `star update`".into(),
         ));

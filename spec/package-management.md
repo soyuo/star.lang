@@ -27,9 +27,10 @@ filesystem = false
 network = false
 process = false
 ffi = false
+environment = false
 ```
 
-Package names use ASCII letters, digits, `_`, and `-`; versions use semantic versioning; paths are relative to the declaring package and cannot traverse parent directories. Dependencies are a version requirement (`"^1.2"`), `{ path = "../library" }` when kept inside the project, or `{ git = "https://example.invalid/library.git", rev = "<full commit id>" }`. Git references must use a 40- or 64-digit commit ID. Project `entry` defaults to `src/main.star`.
+Package names use ASCII letters, digits, `_`, and `-`; versions use semantic versioning; paths are relative to the declaring package and cannot traverse parent directories. Dependencies are a version requirement (`"^1.2"`), `{ path = "vendor/library" }` when kept inside the project, or `{ git = "https://example.invalid/library.git", rev = "<full commit id>" }`. Git references must use a 40- or 64-digit commit ID. Project `entry` defaults to `src/main.star`.
 
 `star new` and `star init` create `src/main.star`, `src/lib.star`, an example, a manifest, and ignore rules. The manifest and resolver API are also available from the `star-package` Rust crate for editor, build, and SDK integrations.
 
@@ -39,7 +40,7 @@ Package names use ASCII letters, digits, `_`, and `-`; versions use semantic ver
 
 `ModuleExecutionContext` tracks `Initializing`, `Initialized`, and `Failed` states per canonical module path. A module initializes once per context. Re-entering an initializing module reports a circular pre-initialization access; a failed initializer stays failed for that context.
 
-The bytecode module table declares each module's name, initializer, global IDs, imports, and exports. Exports are explicit and private-by-default. The bytecode VM links and initializes modules already present in one verified image; dynamic imports resolve only within that image. `star-package` exposes a canonical file resolver and a reusable initialization-state API, but the VM does not load external files through them yet. Runtime execution of linked bytecode modules is separate from source-to-IR linking: the source interpreter still executes one parsed `Program`, because multi-file AST-to-IR lowering belongs to compiler work.
+The bytecode module table declares each module's name, initializer, global IDs, imports, and exports. Exports are explicit and private-by-default. `MODULE_GET` returns an exported global or callable function; for an exported structure it returns the numeric type ID consumed by structure operations. Project `check`, `build`, and `run` compile the entry source, project sources, and lock-verified installed dependency sources into one verified multi-module image. Path dependencies are assigned the same `deps/<name>/<version>/src` module names as installed packages. `STAR_PATH` sources are added only when the manifest grants both `environment` and `filesystem`; their import still requires the corresponding `env.read` and `fs.read` capabilities. Dynamic imports resolve within the linked image. The VM does not read external module files at runtime; standalone source interpretation still executes one parsed `Program`. `star-package` also exposes the canonical file resolver and per-execution initialization-state API for SDK integrations.
 
 ## Package operations
 

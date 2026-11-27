@@ -62,6 +62,7 @@ pub struct Permissions {
     pub network: bool,
     pub process: bool,
     pub ffi: bool,
+    pub environment: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -80,13 +81,13 @@ pub struct DependencySource {
     pub rev: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct Lockfile {
     pub lock_version: u32,
     pub packages: Vec<LockedPackage>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct LockedPackage {
     pub name: String,
     pub version: String,
@@ -564,6 +565,15 @@ impl LocalRegistry {
                 "no local registry package `{name}` matches `{requirement}`"
             )));
         };
+        let directory_version = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| PackageError::Invalid("registry version path is not UTF-8".into()))?;
+        if manifest.package.name != name || manifest.package.version != directory_version {
+            return Err(PackageError::Invalid(format!(
+                "registry entry `{name}/{directory_version}` has mismatched package identity"
+            )));
+        }
         let checksum = source_checksum(&path)?;
         Ok((path, manifest, checksum))
     }
@@ -656,10 +666,38 @@ pub fn resolve_dependencies(
     project: &Path,
     registry: &LocalRegistry,
 ) -> Result<(Lockfile, Vec<ResolvedPackage>), PackageError> {
+    resolve_dependencies_with_lock(project, registry, None)
+}
+
+/// Resolve dependencies using exact source, version, and checksum entries from
+/// an existing lockfile.
+pub fn resolve_dependencies_from_lock(
+    project: &Path,
+    registry: &LocalRegistry,
+    lock: &Lockfile,
+) -> Result<(Lockfile, Vec<ResolvedPackage>), PackageError> {
+    resolve_dependencies_with_lock(project, registry, Some(lock))
+}
+
+fn resolve_dependencies_with_lock(
+    project: &Path,
+    registry: &LocalRegistry,
+    lock: Option<&Lockfile>,
+) -> Result<(Lockfile, Vec<ResolvedPackage>), PackageError> {
     let root = project.canonicalize()?;
     let manifest = Manifest::read(&root)?;
     let mut output = Vec::new();
-    let mut seen = BTreeSet::new();
+    let locked_by_name = lock.map(|lock| {
+        let mut packages = BTreeMap::<String, Vec<&LockedPackage>>::new();
+        for package in &lock.packages {
+            packages
+                .entry(package.name.clone())
+                .or_default()
+                .push(package);
+        }
+        packages
+    });
+    let mut seen = BTreeMap::new();
     let mut visiting = BTreeSet::new();
     for (name, dependency) in &manifest.dependencies {
         resolve_one(
@@ -667,6 +705,7 @@ pub fn resolve_dependencies(
             name,
             dependency,
             registry,
+            locked_by_name.as_ref(),
             &mut seen,
             &mut visiting,
             &mut output,
@@ -696,11 +735,44 @@ fn resolve_one(
     name: &str,
     dependency: &Dependency,
     registry: &LocalRegistry,
-    seen: &mut BTreeSet<String>,
+    locked_by_name: Option<&BTreeMap<String, Vec<&LockedPackage>>>,
+    seen: &mut BTreeMap<String, (String, String)>,
     visiting: &mut BTreeSet<String>,
     output: &mut Vec<ResolvedPackage>,
 ) -> Result<(), PackageError> {
     let source = dependency.source();
+    let pinned = locked_by_name
+        .and_then(|packages| packages.get(name))
+        .and_then(|packages| {
+            let candidates = packages.iter().copied().filter(|package| {
+                if let Some(path) = source.path.as_ref() {
+                    package.source == format!("path+{}", path.to_string_lossy().replace('\\', "/"))
+                } else if let Some(url) = source.git.as_ref() {
+                    package.source
+                        == format!("git+{url}#{}", source.rev.as_deref().unwrap_or_default())
+                } else {
+                    let requirement = source.version.as_deref().unwrap_or("*");
+                    VersionReq::parse(requirement)
+                        .ok()
+                        .and_then(|requirement| {
+                            Version::parse(&package.version)
+                                .ok()
+                                .map(|version| requirement.matches(&version))
+                        })
+                        .unwrap_or(false)
+                }
+            });
+            candidates.max_by(|left, right| {
+                Version::parse(&left.version)
+                    .ok()
+                    .cmp(&Version::parse(&right.version).ok())
+            })
+        });
+    if locked_by_name.is_some() && pinned.is_none() {
+        return Err(PackageError::Invalid(format!(
+            "star.lock has no compatible entry for dependency `{name}`; run `star update`"
+        )));
+    }
     let (root, manifest, checksum, source_id) = if let Some(relative) = source.path {
         validate_relative_path(&relative)?;
         let root = parent.join(&relative).canonicalize()?;
@@ -811,7 +883,10 @@ fn resolve_one(
         (root, manifest, checksum, format!("git+{url}#{revision}"))
     } else {
         let requirement = source.version.as_deref().unwrap_or("*");
-        let (root, manifest, checksum) = registry.resolve(name, requirement)?;
+        let locked_requirement = pinned
+            .map(|package| format!("={}", package.version))
+            .unwrap_or_else(|| requirement.to_owned());
+        let (root, manifest, checksum) = registry.resolve(name, &locked_requirement)?;
         (root, manifest, checksum, "registry".to_owned())
     };
     if let Some(requirement) = source.version.as_deref() {
@@ -828,20 +903,44 @@ fn resolve_one(
         }
     }
     let package_key = format!("{}@{}", manifest.package.name, manifest.package.version);
+    if let Some(pinned) = pinned {
+        if pinned.version != manifest.package.version
+            || pinned.source != source_id
+            || pinned.checksum != checksum
+        {
+            return Err(PackageError::Invalid(format!(
+                "locked identity or checksum changed for `{package_key}`"
+            )));
+        }
+    }
     if visiting.contains(&package_key) {
         return Err(PackageError::Invalid(format!(
             "dependency cycle detected at `{package_key}`"
         )));
     }
-    if seen.contains(&package_key) {
+    if let Some((existing_source, existing_checksum)) = seen.get(&package_key) {
+        if existing_source != &source_id || existing_checksum != &checksum {
+            return Err(PackageError::Invalid(format!(
+                "conflicting sources resolve to `{package_key}`"
+            )));
+        }
         return Ok(());
     }
     visiting.insert(package_key.clone());
     for (child_name, child) in &manifest.dependencies {
-        resolve_one(&root, child_name, child, registry, seen, visiting, output)?;
+        resolve_one(
+            &root,
+            child_name,
+            child,
+            registry,
+            locked_by_name,
+            seen,
+            visiting,
+            output,
+        )?;
     }
     visiting.remove(&package_key);
-    seen.insert(package_key);
+    seen.insert(package_key, (source_id.clone(), checksum.clone()));
     output.push(ResolvedPackage {
         root,
         locked: LockedPackage {
