@@ -29,6 +29,7 @@ use crate::{
 };
 
 pub mod collections;
+pub mod math;
 pub mod stdio;
 
 mod bytecode_vm;
