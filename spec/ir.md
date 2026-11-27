@@ -2,7 +2,7 @@
 
 Status: draft
 
-This document defines the target-independent IR and the lowering from parsed, semantically valid Star programs. It does not define `.starc` serialization, bytecode opcode values, or VM instruction selection; those belong to the bytecode and compiler roadmap items. Source opcode assignments remain in `spec/opcodes.toml`, while stack effects and failures remain in `spec/instruction-semantics.md`.
+This document defines the target-independent IR and the lowering contract for parsed, semantically valid Star programs. The current `star-compiler::compile` API consumes an already constructed `ModuleIR`; an AST-to-IR lowering pass is not yet implemented in this repository. The reference source interpreter executes parsed programs directly. It does not define `.starc` serialization, bytecode opcode values, or VM instruction selection; those belong to the bytecode and compiler roadmap items. Source opcode assignments remain in `spec/opcodes.toml`, while stack effects and failures remain in `spec/instruction-semantics.md`.
 
 ## IR model
 
