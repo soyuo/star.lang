@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 mod dap;
+mod package_commands;
 mod source_lowering;
 mod source_tools;
 
@@ -41,6 +42,9 @@ Star command line
 Usage:
   star new <directory>
   star init [package-name]
+  star add <name> [--version <requirement>|--path <directory>|--git <url> --rev <commit>]
+  star remove <name>
+  star install | update | search <query> | package | publish | audit
   star check [<file.star|file.starc>] [options]
   star build [<file.star>] [--output <file.starc>] [options]
   star run [<file.star|file.starc>] [options]
@@ -153,6 +157,8 @@ fn run(args: Vec<String>) -> u8 {
                 EXIT_USAGE
             }
         },
+        "add" | "remove" | "install" | "update" | "search" | "package" | "publish" | "audit"
+        | "login" => package_commands::run(command, &args[1..]),
         "run" => match parse_run_options(&args[1..]) {
             Ok(options) => run_file(options),
             Err(message) => {
@@ -762,33 +768,50 @@ fn validate_project_name(name: &str) -> Result<(), String> {
 }
 
 fn create_project(directory: &Path, name: &str, create_directory: bool) -> u8 {
-    let manifest = directory.join("Star.toml");
+    let manifest = directory.join(star_package::MANIFEST_FILE);
     let source_dir = directory.join("src");
     let source = source_dir.join("main.star");
+    let library = source_dir.join("lib.star");
+    let example_dir = directory.join("examples");
+    let example = example_dir.join("hello.star");
     let gitignore = directory.join(".gitignore");
-    for path in [&manifest, &source, &gitignore] {
+    for path in [&manifest, &source, &library, &example, &gitignore] {
         if path.exists() {
             eprintln!("{}: project file already exists", path.display());
             return EXIT_IO;
         }
     }
+    if directory.join("Star.toml").exists() {
+        eprintln!(
+            "{}: project manifest already exists",
+            directory.join("Star.toml").display()
+        );
+        return EXIT_IO;
+    }
     if create_directory && directory.exists() {
         eprintln!("{}: project directory already exists", directory.display());
         return EXIT_IO;
     }
-    if let Err(error) = fs::create_dir_all(&source_dir) {
+    if let Err(error) =
+        fs::create_dir_all(&source_dir).and_then(|()| fs::create_dir_all(&example_dir))
+    {
         eprintln!("{}: {error}", source_dir.display());
         return EXIT_IO;
     }
     let source_bits = "010010000110010101101100011011000110111100101100001000000101001101110100011000010111001000100001";
     let source_text = format!("\"{source_bits}\"******'\n");
     let manifest_text = format!(
-        "schema_version = 1\n\n[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nentry = \"src/main.star\"\n"
+        "schema_version = 1\n\n[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"1\"\ndescription = \"A Star language project\"\n\n[build]\nentry = \"src/main.star\"\ntarget = \"bytecode\"\noptimization = 0\n\n[dependencies]\n\n[permissions]\nfilesystem = false\nnetwork = false\nprocess = false\nffi = false\n"
     );
     for (path, contents) in [
         (&manifest, manifest_text.as_bytes()),
         (&source, source_text.as_bytes()),
-        (&gitignore, b"/target/\n/src/*.starc\n".as_slice()),
+        (&library, b"".as_slice()),
+        (&example, source_text.as_bytes()),
+        (
+            &gitignore,
+            b"/target/\n/deps/\n/.star/\n/src/*.starc\n".as_slice(),
+        ),
     ] {
         if let Err(error) = fs::write(path, contents) {
             eprintln!("{}: {error}", path.display());
