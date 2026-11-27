@@ -77,17 +77,22 @@ and redirects are not followed, so proxy configuration and redirect targets
 cannot bypass endpoint checks. HTTP status codes, including 4xx and 5xx, are
 returned as ordinary responses. Callers provide independent request and
 response byte limits; an oversized body returns `NetworkError::BodyTooLarge`.
-Header names and values are validated as HTTP syntax, with values represented
-as raw bytes.
+Request and response headers are bounded to 64 KiB and 128 fields. Header names
+and values are validated as HTTP syntax, with values represented as raw bytes.
 
 ## HTTP server
 
 `NetworkServices::http_listen` starts a plain HTTP server on an allowlisted
-`net.listen` endpoint. `HttpServer::receive_request` can block or wait for a
-caller-specified timeout; its body reader consumes at most the caller's byte
-limit and returns 413 when the body is too large. It returns the method, path
-and query, raw headers, body, and optional peer address. `HttpRequest::respond`
-validates the status code and response headers before sending the response.
+`net.listen` endpoint. `HttpServer::receive_request` can block or wait up to a
+caller-specified timeout for a client connection; accepted connections have a
+30-second per-operation read/write timeout. The parser supports HTTP/1.0 and
+HTTP/1.1, bounds headers to 64 KiB and 128 fields before collecting them, and
+accepts `Content-Length` or chunked
+request bodies. It reads at most the caller's body limit and returns 413 when
+that limit is exceeded. It returns the method, path and query, raw headers,
+body, and peer address. `HttpRequest::respond` validates the final status and
+response headers, applies a caller-supplied response-body limit, sends a
+`Content-Length`, and closes the connection after one request.
 
 HTTPS server/TLS configuration is separate and is not implied by `net.listen`.
 The host must also apply OS-level isolation when guest code needs stronger
@@ -98,5 +103,5 @@ network confinement than this capability and endpoint policy provides.
 These are host-side Rust APIs. Guest-visible standard-library modules,
 structured guest values, and module imports will be connected during the
 module-loading roadmap work. The API does not provide DNS refresh, arbitrary
-proxy configuration, redirect following, TLS server setup, or unbounded JSON
-or HTTP body reads.
+proxy configuration, redirect following, TLS server setup, persistent HTTP
+connections, or unbounded JSON or HTTP body reads.
