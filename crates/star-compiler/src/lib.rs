@@ -12,8 +12,8 @@ mod intrinsics;
 pub use intrinsics::IrOp;
 mod verifier;
 pub use verifier::{
-    verify_bytecode, Capability, VerificationError, VerificationLimits, VerificationPolicy,
-    VerifiedProgram,
+    disassemble_bytecode, verify_bytecode, Capability, VerificationError, VerificationLimits,
+    VerificationPolicy, VerifiedProgram,
 };
 
 /// Function-local block identifier.

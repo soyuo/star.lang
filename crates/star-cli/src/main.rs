@@ -9,13 +9,18 @@ use std::time::{Duration, Instant};
 mod source_lowering;
 mod source_tools;
 
-use star_compiler::{compile, verify_bytecode, VerificationLimits, VerificationPolicy};
+use star_compiler::{
+    compile, disassemble_bytecode, verify_bytecode, Capability, VerificationLimits,
+    VerificationPolicy,
+};
 use star_interpreter::{
-    runtime::{BytecodeVm, ExecutionLimits, Interpreter, RuntimeError, RuntimeErrorKind},
+    runtime::{
+        stdio::InputError, BytecodeVm, ExecutionLimits, Interpreter, RuntimeError, RuntimeErrorKind,
+    },
     semantic::analyze,
 };
 use star_lexer::{normalize_source, LexMode};
-use star_parser::parse;
+use star_parser::{parse, ParseErrorKind};
 
 const EXIT_OK: u8 = 0;
 const EXIT_USAGE: u8 = 2;
@@ -25,6 +30,7 @@ const EXIT_RUNTIME: u8 = 5;
 const EXIT_LIMIT: u8 = 6;
 const EXIT_TEST_FAILURE: u8 = 7;
 const DEFAULT_FILE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_REPL_LINE_BYTES: usize = 1024 * 1024;
 
 const HELP: &str = "\
 Star command line
@@ -41,6 +47,8 @@ Usage:
   star minify <file.star> [--write]
   star encode (--int N | --float N | --string TEXT | --file PATH | --opcode NAME)
   star decode <encoded-source.star>
+  star disasm <file.starc>
+  star repl
   star help
 
 Execution options:
@@ -164,9 +172,207 @@ fn run(args: Vec<String>) -> u8 {
         "minify" => source_tools::minify_command(&args[1..]),
         "encode" => source_tools::encode_command(&args[1..]),
         "decode" => source_tools::decode_command(&args[1..]),
+        "disasm" => disassemble_file(&args[1..]),
+        "repl" => {
+            if args.len() != 1 {
+                eprintln!("star: `repl` does not accept arguments");
+                EXIT_USAGE
+            } else {
+                run_repl()
+            }
+        }
         other => {
             eprintln!("star: unknown command `{other}`\n\n{HELP}");
             EXIT_USAGE
+        }
+    }
+}
+
+fn disassemble_file(arguments: &[String]) -> u8 {
+    if arguments.len() != 1 {
+        eprintln!("star: `disasm` requires exactly one `.starc` file");
+        return EXIT_USAGE;
+    }
+    let path = PathBuf::from(&arguments[0]);
+    let bytes = match read_limited_file(&path, DEFAULT_FILE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(code) => return code,
+    };
+    let mut policy = verification_policy(&ExecutionLimits::default());
+    // Disassembly verifies structure but never executes privileged code.
+    policy.granted_capabilities = [
+        Capability::FsRead,
+        Capability::FsWrite,
+        Capability::NetConnect,
+        Capability::NetListen,
+        Capability::ProcessSpawn,
+        Capability::EnvRead,
+        Capability::Ffi,
+        Capability::Clock,
+        Capability::Random,
+    ]
+    .into_iter()
+    .collect();
+    match disassemble_bytecode(&bytes, &policy) {
+        Ok(listing) => {
+            print!("{listing}");
+            if let Err(error) = io::stdout().flush() {
+                eprintln!("{}: {error}", path.display());
+                EXIT_IO
+            } else {
+                EXIT_OK
+            }
+        }
+        Err(error) => {
+            eprintln!("{}: {error}", path.display());
+            EXIT_SOURCE
+        }
+    }
+}
+
+fn run_repl() -> u8 {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut interpreter = Interpreter::new(BufReader::new(stdin.lock()), stdout.lock());
+    let mut pending_source = Vec::new();
+
+    loop {
+        if pending_source.is_empty() {
+            eprint!("star> ");
+        } else {
+            eprint!("...> ");
+        }
+        if let Err(error) = io::stderr().flush() {
+            eprintln!("star: cannot write prompt: {error}");
+            return EXIT_IO;
+        }
+
+        let line = match interpreter.read_repl_line(DEFAULT_REPL_LINE_BYTES) {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                if pending_source.is_empty() {
+                    return EXIT_OK;
+                }
+                let code = report_pending_repl_error(&pending_source);
+                return code;
+            }
+            Err(error) => {
+                eprintln!("star: REPL input failed: {error}");
+                return if matches!(error, InputError::LimitExceeded) {
+                    EXIT_LIMIT
+                } else {
+                    EXIT_IO
+                };
+            }
+        };
+
+        if pending_source.is_empty() {
+            match trim_ascii(&line) {
+                b"exit" | b"quit" => return EXIT_OK,
+                b"help" => {
+                    eprintln!("Enter Star source; incomplete instructions and blocks continue on the next line.");
+                    eprintln!("Commands: help, reset, exit");
+                    continue;
+                }
+                b"reset" => {
+                    match interpreter.reset_repl_session() {
+                        Ok(()) => eprintln!("star: session reset"),
+                        Err(error) => eprintln!(
+                            "star: session state reset; garbage collection deferred: {error}"
+                        ),
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        if pending_source
+            .len()
+            .saturating_add(line.len())
+            .saturating_add(1)
+            > DEFAULT_FILE_BYTES
+        {
+            eprintln!("star: REPL submission exceeds the {DEFAULT_FILE_BYTES}-byte limit");
+            pending_source.clear();
+            continue;
+        }
+        pending_source.extend_from_slice(&line);
+        pending_source.push(b'\n');
+
+        let normalized = match normalize_source(&pending_source, LexMode::Normal) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("star: {error}");
+                pending_source.clear();
+                continue;
+            }
+        };
+        match parse(&normalized) {
+            Ok(program) if program.statements.is_empty() => pending_source.clear(),
+            Ok(program) => {
+                let previous_stack_len = interpreter.stack().len();
+                match interpreter.execute_repl(&program) {
+                    Ok(()) => {
+                        if let Some(value) = interpreter.stack().get(previous_stack_len) {
+                            eprintln!("=> {value}");
+                        }
+                    }
+                    Err(error) => eprintln!("star: {error}"),
+                }
+                pending_source.clear();
+            }
+            Err(error) if is_incomplete_repl_input(&error.kind) => {}
+            Err(error) => {
+                report_repl_parse_error(&error);
+                pending_source.clear();
+            }
+        }
+    }
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
+fn is_incomplete_repl_input(kind: &ParseErrorKind) -> bool {
+    matches!(
+        kind,
+        ParseErrorKind::IncompleteBasicInstruction
+            | ParseErrorKind::IncompleteExtendedPayload { .. }
+            | ParseErrorKind::MissingExtendedTerminator
+            | ParseErrorKind::UnterminatedDataLiteral
+            | ParseErrorKind::UnclosedBlock { .. }
+    )
+}
+
+fn report_repl_parse_error(error: &star_parser::ParseError) {
+    eprintln!(
+        "star: {} at {}:{}",
+        error.kind, error.span.start.line, error.span.start.column
+    );
+}
+
+fn report_pending_repl_error(source: &[u8]) -> u8 {
+    match normalize_source(source, LexMode::Normal) {
+        Ok(normalized) => match parse(&normalized) {
+            Ok(_) => EXIT_OK,
+            Err(error) => {
+                report_repl_parse_error(&error);
+                EXIT_SOURCE
+            }
+        },
+        Err(error) => {
+            eprintln!("star: {error}");
+            EXIT_SOURCE
         }
     }
 }
