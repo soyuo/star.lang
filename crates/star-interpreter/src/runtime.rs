@@ -2728,7 +2728,31 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             .try_reserve_exact(arguments.len())
             .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("callback arguments"), span))?;
         owned_arguments.extend_from_slice(arguments);
-        self.invoke_function(function, owned_arguments, captures, span)
+        let stack_base = self.stack.len();
+        let scope_count = self.scopes.len();
+        let scope_floor_count = self.scope_floors.len();
+        let frame_stack_base_count = self.frame_stack_bases.len();
+        let capture_vector_count = self.capture_vectors.len();
+        let call_depth = self.call_depth;
+        let trace_count = self.call_trace.len();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.invoke_function(function, owned_arguments, captures, span)
+        })) {
+            Ok(result) => result,
+            Err(_) => {
+                self.stack.truncate(stack_base);
+                self.scopes.truncate(scope_count);
+                self.scope_floors.truncate(scope_floor_count);
+                self.frame_stack_bases.truncate(frame_stack_base_count);
+                self.capture_vectors.truncate(capture_vector_count);
+                self.call_depth = call_depth;
+                self.call_trace.truncate(trace_count);
+                Err(self.error(
+                    RuntimeErrorKind::Unsupported("native callback panicked"),
+                    span,
+                ))
+            }
+        }
     }
 
     fn to_int(&mut self, span: Span) -> Result<(), RuntimeError> {
