@@ -488,10 +488,10 @@ impl HttpServer {
     }
 
     /// Waits up to `timeout` for a client connection (`None` waits indefinitely)
-    /// and then reads one request. Accepted connections have a 30-second
-    /// per-operation I/O timeout. Headers are limited to 64 KiB and 128 fields;
-    /// the body is limited by `max_request_body_bytes`. Each response closes
-    /// its connection.
+    /// and then reads one request. Accepted connections have a 30-second total
+    /// request-read deadline and a 30-second write timeout. Headers are limited
+    /// to 64 KiB and 128 fields; the body is limited by
+    /// `max_request_body_bytes`. Each response closes its connection.
     pub fn receive_request(
         &self,
         timeout: Option<Duration>,
@@ -512,7 +512,13 @@ impl HttpServer {
         };
         stream.set_read_timeout(Some(HTTP_SOCKET_TIMEOUT))?;
         stream.set_write_timeout(Some(HTTP_SOCKET_TIMEOUT))?;
-        match read_http_request(stream, remote_addr, max_request_body_bytes) {
+        let request_deadline = Instant::now() + HTTP_SOCKET_TIMEOUT;
+        match read_http_request(
+            stream,
+            remote_addr,
+            max_request_body_bytes,
+            request_deadline,
+        ) {
             Ok(request) => Ok(Some(request)),
             Err(error) => Err(error),
         }
@@ -603,8 +609,9 @@ fn read_http_request(
     stream: TcpStream,
     remote_addr: SocketAddr,
     max_request_body_bytes: usize,
+    deadline: Instant,
 ) -> Result<HttpRequest, NetworkError> {
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(RequestDeadlineStream { stream, deadline });
     let raw_headers = match read_http_header_block(&mut reader) {
         Ok(headers) => headers,
         Err(error @ NetworkError::HeadersTooLarge { .. }) => {
@@ -612,7 +619,7 @@ fn read_http_request(
             return Err(error);
         }
         Err(error) => {
-            let _ = write_simple_http_response(reader.get_mut(), 400);
+            let _ = write_simple_http_response(reader.get_mut(), request_error_status(&error));
             return Err(error);
         }
     };
@@ -699,6 +706,36 @@ fn read_http_request(
             "Transfer-Encoding and Content-Length cannot be combined".to_owned(),
         ));
     }
+    if content_length.is_some_and(|length| length > max_request_body_bytes) {
+        let _ = write_simple_http_response(reader.get_mut(), 413);
+        return Err(NetworkError::BodyTooLarge {
+            limit: max_request_body_bytes,
+        });
+    }
+    let mut expectation = None;
+    for (name, value) in &headers {
+        if name.eq_ignore_ascii_case("expect") {
+            if expectation.is_some() {
+                let _ = write_simple_http_response(reader.get_mut(), 417);
+                return Err(NetworkError::HttpProtocolError(
+                    "duplicate Expect headers are not allowed".to_owned(),
+                ));
+            }
+            expectation = Some(value.as_slice());
+        }
+    }
+    if let Some(expectation) = expectation {
+        if version != 1 || !expectation.eq_ignore_ascii_case(b"100-continue") {
+            let _ = write_simple_http_response(reader.get_mut(), 417);
+            return Err(NetworkError::HttpProtocolError(
+                "unsupported HTTP Expect header".to_owned(),
+            ));
+        }
+        reader
+            .get_mut()
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        reader.get_mut().flush()?;
+    }
     let body = if let Some(encoding) = transfer_encoding {
         if !encoding.eq_ignore_ascii_case(b"chunked") {
             let _ = write_simple_http_response(reader.get_mut(), 501);
@@ -713,7 +750,7 @@ fn read_http_request(
                 return Err(error);
             }
             Err(error) => {
-                let _ = write_simple_http_response(reader.get_mut(), 400);
+                let _ = write_simple_http_response(reader.get_mut(), request_error_status(&error));
                 return Err(error);
             }
         }
@@ -728,13 +765,18 @@ fn read_http_request(
         body.try_reserve_exact(length)
             .map_err(|error| NetworkError::Io(io::Error::other(error.to_string())))?;
         body.resize(length, 0);
-        reader.read_exact(&mut body)?;
+        if let Err(error) = reader.read_exact(&mut body) {
+            let network_error = NetworkError::Io(error);
+            let _ =
+                write_simple_http_response(reader.get_mut(), request_error_status(&network_error));
+            return Err(network_error);
+        }
         body
     } else {
         Vec::new()
     };
     Ok(HttpRequest {
-        stream: reader.into_inner(),
+        stream: reader.into_inner().stream,
         method,
         url,
         remote_addr,
@@ -843,7 +885,7 @@ fn read_chunked_body<R: BufRead>(
     }
 }
 
-fn write_simple_http_response(stream: &mut TcpStream, status: u16) -> io::Result<()> {
+fn write_simple_http_response<W: Write>(stream: &mut W, status: u16) -> io::Result<()> {
     let (reason, body): (&str, &[u8]) = match status {
         400 => ("Bad Request", b"Bad Request"),
         413 => ("Payload Too Large", b"Payload Too Large"),
@@ -851,6 +893,8 @@ fn write_simple_http_response(stream: &mut TcpStream, status: u16) -> io::Result
             "Request Header Fields Too Large",
             b"Request Header Fields Too Large",
         ),
+        408 => ("Request Timeout", b"Request Timeout"),
+        417 => ("Expectation Failed", b"Expectation Failed"),
         501 => ("Not Implemented", b"Not Implemented"),
         _ => ("Bad Request", b"Bad Request"),
     };
@@ -861,6 +905,44 @@ fn write_simple_http_response(stream: &mut TcpStream, status: u16) -> io::Result
     )?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+fn request_error_status(error: &NetworkError) -> u16 {
+    match error {
+        NetworkError::BodyTooLarge { .. } => 413,
+        NetworkError::HeadersTooLarge { .. } | NetworkError::TooManyHeaders { .. } => 431,
+        NetworkError::Io(error) if error.kind() == io::ErrorKind::TimedOut => 408,
+        _ => 400,
+    }
+}
+
+struct RequestDeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl Read for RequestDeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP request deadline exceeded",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for RequestDeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 fn validate_http_headers(headers: &[(String, Vec<u8>)]) -> Result<(), NetworkError> {

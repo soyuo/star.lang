@@ -85,12 +85,13 @@ and values are validated as HTTP syntax, with values represented as raw bytes.
 `NetworkServices::http_listen` starts a plain HTTP server on an allowlisted
 `net.listen` endpoint. `HttpServer::receive_request` can block or wait up to a
 caller-specified timeout for a client connection; accepted connections have a
-30-second per-operation read/write timeout. The parser supports HTTP/1.0 and
-HTTP/1.1, bounds headers to 64 KiB and 128 fields before collecting them, and
-accepts `Content-Length` or chunked
-request bodies. It reads at most the caller's body limit and returns 413 when
-that limit is exceeded. It returns the method, path and query, raw headers,
-body, and peer address. `HttpRequest::respond` validates the final status and
+30-second total request-read deadline and a 30-second write timeout. The parser
+supports HTTP/1.0 and HTTP/1.1, bounds headers to 64 KiB and 128 fields before
+collecting them, and accepts `Content-Length` or chunked request bodies. It
+handles `Expect: 100-continue` and rejects other expectations with 417. It
+reads at most the caller's body limit and returns 413 when that limit is
+exceeded. It returns the method, path and query, raw headers, body, and peer
+address. `HttpRequest::respond` validates the final status and
 response headers, applies a caller-supplied response-body limit, sends a
 `Content-Length`, and closes the connection after one request.
 
