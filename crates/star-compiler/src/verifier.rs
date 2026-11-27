@@ -730,14 +730,7 @@ fn parse_functions(
             }
             parameter_ids.push(id);
         }
-        let max_stack_offset = reader.offset();
         let max_stack = reader.u32()?;
-        if max_stack > limits.max_stack_depth {
-            return Err(failure(
-                Some(max_stack_offset),
-                "function max_stack exceeds host limit",
-            ));
-        }
         let code_offset_u64 = reader.u64()?;
         let code_length_u64 = reader.u64()?;
         let code_offset = usize::try_from(code_offset_u64).map_err(|_| {
