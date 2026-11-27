@@ -19,6 +19,7 @@ star-common = { path = "crates/star-common" }
 star-lexer = { path = "crates/star-lexer" }
 star-parser = { path = "crates/star-parser" }
 star-compiler = { path = "crates/star-compiler" }
+cap-std = "4.0.3"
 num-bigint = "0.5"
 num-traits = "0.2"
 sha2 = "0.11.2"

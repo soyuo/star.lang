@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cap-std.workspace = true
 num-bigint = "0.5"
 num-traits.workspace = true
 star-common.workspace = true
