@@ -90,13 +90,15 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 self.runtime
                     .error(RuntimeErrorKind::CompileError(message), empty_span())
             })?;
-            let result = self.execute_image(&image)?;
-            self.runtime.output.flush().map_err(|error| {
-                self.runtime
-                    .error(RuntimeErrorKind::IOError(error.to_string()), empty_span())
-            })?;
-            Ok(result)
+            self.execute_image(&image)
         })();
+        let result = match (result, self.runtime.output.flush()) {
+            (Err(error), _) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(self
+                .runtime
+                .error(RuntimeErrorKind::IOError(error.to_string()), empty_span())),
+        };
         self.runtime.set_external_memory_bytes(0);
         if result.is_err() {
             self.cleanup_after_error();

@@ -19,6 +19,7 @@ use star_parser::{
 
 use crate::{
     gc::{GcError, GcHeap, GcStats},
+    runtime::stdio::{BufferedOutput, InputError, StandardInput},
     semantic::{self, ResolvedFunction},
     value::{
         binding_cell, BindingCell, ClosureState, FunctionRef, InterfaceDefinition, IteratorState,
@@ -26,6 +27,8 @@ use crate::{
     },
     BigInt,
 };
+
+pub mod stdio;
 
 mod bytecode_vm;
 pub use bytecode_vm::BytecodeVm;
@@ -212,8 +215,8 @@ impl std::error::Error for RuntimeError {}
 /// This execution slice runs synchronous named functions. Calling an
 /// `ASYNC_FUNC` returns `Unsupported` until task scheduling is implemented.
 pub struct Interpreter<R: BufRead, W: Write> {
-    input: R,
-    output: W,
+    input: StandardInput<R>,
+    output: BufferedOutput<W>,
     stack: Vec<Value>,
     scopes: Vec<HashMap<BigInt, BindingCell>>,
     scope_floors: Vec<usize>,
@@ -254,8 +257,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     /// Creates an interpreter with empty operand and module-global state.
     pub fn new(input: R, output: W) -> Self {
         Self {
-            input,
-            output,
+            input: StandardInput::new(input),
+            output: BufferedOutput::new(output),
             stack: Vec::new(),
             scopes: vec![HashMap::new()],
             scope_floors: vec![0],
@@ -593,7 +596,13 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             self.call_trace.truncate(trace_base);
             self.call_depth = call_depth_base;
         }
-        result
+        match (result, self.output.flush()) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => {
+                Err(self.error(RuntimeErrorKind::IOError(error.to_string()), empty_span()))
+            }
+        }
     }
 
     fn execute_program(&mut self, program: &Program) -> Result<(), RuntimeError> {
@@ -665,7 +674,10 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     /// Returns the injected I/O objects after execution.
     pub fn into_io(self) -> (R, W) {
-        (self.input, self.output)
+        (
+            self.input.into_inner(),
+            self.output.into_inner_after_execution(),
+        )
     }
 
     fn execute_statements(
@@ -2850,65 +2862,13 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn read_input_line(&mut self, span: Span) -> Result<Option<Vec<u8>>, RuntimeError> {
         let max_line_bytes = self.available_memory_bytes(span)?;
-        let memory_error = self.error(RuntimeErrorKind::ResourceLimit("memory"), span);
-        let mut line = Vec::new();
-        loop {
-            let buffer = match self.input.fill_buf() {
-                Ok(buffer) => buffer,
-                Err(error) => {
-                    return Err(self.error(RuntimeErrorKind::IOError(error.to_string()), span));
-                }
-            };
-            if buffer.is_empty() {
-                return Ok((!line.is_empty()).then_some(line));
+        match self.input.read_line_bytes(max_line_bytes) {
+            Ok(line) => Ok(line),
+            Err(InputError::LimitExceeded) => {
+                Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span))
             }
-            if let Some(index) = buffer
-                .iter()
-                .position(|byte| *byte == b'\n' || *byte == b'\r')
-            {
-                let terminator = buffer[index];
-                if Self::reserve_input_bytes(&mut line, index, max_line_bytes).is_err() {
-                    return Err(memory_error);
-                }
-                line.extend_from_slice(&buffer[..index]);
-                self.input.consume(index + 1);
-                if terminator == b'\r' {
-                    let next_is_lf = match self.input.fill_buf() {
-                        Ok(buffer) => buffer.first() == Some(&b'\n'),
-                        Err(error) => {
-                            return Err(
-                                self.error(RuntimeErrorKind::IOError(error.to_string()), span)
-                            );
-                        }
-                    };
-                    if next_is_lf {
-                        self.input.consume(1);
-                    }
-                }
-                return Ok(Some(line));
-            }
-            let length = buffer.len();
-            if Self::reserve_input_bytes(&mut line, length, max_line_bytes).is_err() {
-                return Err(memory_error);
-            }
-            line.extend_from_slice(buffer);
-            self.input.consume(length);
+            Err(error) => Err(self.error(RuntimeErrorKind::IOError(error.to_string()), span)),
         }
-    }
-
-    fn reserve_input_bytes(
-        line: &mut Vec<u8>,
-        additional: usize,
-        max_line_bytes: usize,
-    ) -> Result<(), ()> {
-        if line.len().saturating_add(additional) > max_line_bytes {
-            return Err(());
-        }
-        line.try_reserve_exact(additional).map_err(|_| ())?;
-        if line.capacity() > max_line_bytes {
-            return Err(());
-        }
-        Ok(())
     }
 
     fn type_error(&self, expected: &'static str, found: &Value, span: Span) -> RuntimeError {
