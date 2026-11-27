@@ -705,6 +705,16 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
         let result = (|| loop {
             self.advance_step(block.span)?;
+            let next_payload_bytes = {
+                let iterator = iterator.borrow();
+                iterator
+                    .values
+                    .get(iterator.next_index)
+                    .map(|value| estimated_unmanaged_payload_bytes(value, 0))
+            };
+            if let Some(payload_bytes) = next_payload_bytes {
+                self.ensure_memory_budget(payload_bytes, block.span)?;
+            }
             let next = {
                 let mut iterator = iterator.borrow_mut();
                 let value = iterator.values.get(iterator.next_index).cloned();
@@ -1704,17 +1714,36 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let key = self.pop(span)?;
         let collection = self.pop(span)?;
         let item = match collection {
-            Value::Array(values) => values
-                .borrow()
-                .get(self.index_from_value(key, span)?)
-                .cloned()
-                .ok_or_else(|| self.index_error(span))?,
-            Value::Tuple(values) => values
-                .values
-                .borrow()
-                .get(self.index_from_value(key, span)?)
-                .cloned()
-                .ok_or_else(|| self.index_error(span))?,
+            Value::Array(values) => {
+                let index = self.index_from_value(key, span)?;
+                let payload_bytes = values
+                    .borrow()
+                    .get(index)
+                    .map(|value| estimated_unmanaged_payload_bytes(value, 0))
+                    .ok_or_else(|| self.index_error(span))?;
+                self.ensure_memory_budget(payload_bytes, span)?;
+                values
+                    .borrow()
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| self.index_error(span))?
+            }
+            Value::Tuple(values) => {
+                let index = self.index_from_value(key, span)?;
+                let payload_bytes = values
+                    .values
+                    .borrow()
+                    .get(index)
+                    .map(|value| estimated_unmanaged_payload_bytes(value, 0))
+                    .ok_or_else(|| self.index_error(span))?;
+                self.ensure_memory_budget(payload_bytes, span)?;
+                values
+                    .values
+                    .borrow()
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| self.index_error(span))?
+            }
             Value::String(value) => value
                 .chars()
                 .nth(self.index_from_value(key, span)?)
@@ -1726,8 +1755,22 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .map(Value::Byte)
                 .ok_or_else(|| self.index_error(span))?,
             Value::Map(map) => {
+                let key_payload_bytes = estimated_key_clone_bytes(&key, 0);
+                self.ensure_memory_budget(key_payload_bytes, span)?;
                 let key_value = RuntimeKey::from_value(&key)
                     .ok_or_else(|| self.type_error("hashable Map key", &key, span))?;
+                let value_payload_bytes = map
+                    .borrow()
+                    .entries
+                    .get(&key_value)
+                    .map(|value| estimated_unmanaged_payload_bytes(value, 0))
+                    .ok_or_else(|| {
+                        self.error(RuntimeErrorKind::ReferenceError("Map key not found"), span)
+                    })?;
+                self.ensure_memory_budget(
+                    key_payload_bytes.saturating_add(value_payload_bytes),
+                    span,
+                )?;
                 map.borrow()
                     .entries
                     .get(&key_value)
@@ -2051,6 +2094,16 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             Value::Iterator(iterator) => iterator,
             other => return Err(self.type_error("Iterator", &other, span)),
         };
+        let next_payload_bytes = {
+            let iterator = iterator.borrow();
+            iterator
+                .values
+                .get(iterator.next_index)
+                .map(|value| estimated_unmanaged_payload_bytes(value, 0))
+        };
+        if let Some(payload_bytes) = next_payload_bytes {
+            self.ensure_memory_budget(payload_bytes, span)?;
+        }
         let value = {
             let mut iterator = iterator.borrow_mut();
             let value = iterator.values.get(iterator.next_index).cloned();
@@ -2059,8 +2112,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
             value
         };
-        self.stack.push(value.clone().unwrap_or(Value::Null));
-        self.stack.push(Value::Bool(value.is_some()));
+        let found = value.is_some();
+        self.stack.push(value.unwrap_or(Value::Null));
+        self.stack.push(Value::Bool(found));
         Ok(())
     }
 
@@ -2333,6 +2387,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         };
+        let binding = binding.clone();
+        let payload_bytes = {
+            let binding = binding.borrow();
+            estimated_unmanaged_payload_bytes(&binding.value, 0)
+        };
+        self.ensure_memory_budget(payload_bytes, span)?;
         self.stack.push(binding.borrow().value.clone());
         Ok(())
     }

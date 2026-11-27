@@ -246,7 +246,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     )
                 })?;
                 match value {
-                    Constant::Value(value) => self.runtime.stack.push(value.clone()),
+                    Constant::Value(value) => {
+                        self.runtime.ensure_memory_budget(
+                            super::estimated_unmanaged_payload_bytes(value, 0),
+                            span,
+                        )?;
+                        self.runtime.stack.push(value.clone());
+                    }
                     Constant::FunctionRef(function_index) => {
                         let function =
                             image
@@ -260,7 +266,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                                         span,
                                     )
                                 })?;
-                        let Some(id) = function.id.clone() else {
+                        let Some(function_id) = function.id.as_ref() else {
                             return Err(self.runtime.error(
                                 RuntimeErrorKind::ReferenceError(
                                     "initializer is not a function value",
@@ -268,6 +274,11 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                                 span,
                             ));
                         };
+                        self.runtime.ensure_memory_budget(
+                            super::estimated_bigint_bytes(function_id),
+                            span,
+                        )?;
+                        let id = function_id.clone();
                         self.runtime.stack.push(Value::Function(FunctionRef {
                             module_index: function.module_index,
                             id,
@@ -628,6 +639,16 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         let iterator_ref = Rc::clone(&state.iterator);
         let variable_id = state.variable_id.clone();
         let scope_depth = state.scope_depth;
+        let next_payload_bytes = {
+            let iterator = iterator_ref.borrow();
+            iterator
+                .values
+                .get(iterator.next_index)
+                .map(|value| super::estimated_unmanaged_payload_bytes(value, 0))
+        };
+        if let Some(payload_bytes) = next_payload_bytes {
+            self.runtime.ensure_memory_budget(payload_bytes, span)?;
+        }
         let next = {
             let mut iterator = iterator_ref.borrow_mut();
             let value = iterator.values.get(iterator.next_index).cloned();
