@@ -107,6 +107,8 @@ pub struct ExceptionRegionIr {
     pub protected_start: BlockId,
     pub protected_end: Option<BlockId>,
     pub handler: BlockId,
+    /// Exclusive handler end, or function end when `None`.
+    pub handler_end: Option<BlockId>,
     /// Operand-stack depth restored before control enters the handler.
     pub stack_depth: u32,
 }
@@ -218,6 +220,7 @@ pub fn compile(
                 protected_start: region.protected_start,
                 protected_end: region.protected_end,
                 handler_offset: region.handler_offset,
+                handler_end: region.handler_end,
                 stack_depth: region.stack_depth,
             }
         }));
@@ -370,6 +373,7 @@ struct EncodedExceptionRegion {
     protected_start: u64,
     protected_end: u64,
     handler_offset: u64,
+    handler_end: u64,
     stack_depth: u32,
 }
 
@@ -378,6 +382,7 @@ struct ExceptionRecordData {
     protected_start: u64,
     protected_end: u64,
     handler_offset: u64,
+    handler_end: u64,
     stack_depth: u32,
 }
 
@@ -463,6 +468,9 @@ fn validate_function(function: &FunctionIr, is_initializer: bool) -> Result<(), 
             require_target(&blocks, end)?;
         }
         require_target(&blocks, region.handler)?;
+        if let Some(handler_end) = region.handler_end {
+            require_target(&blocks, handler_end)?;
+        }
         if region.stack_depth > function.max_stack {
             return Err(CompileError::new(
                 "exception stack depth exceeds function max_stack",
@@ -598,20 +606,32 @@ fn encode_function(
             None => checked_u64(next_offset, "exception range end")?,
         };
         let handler_offset = u64::from(block_offset(&offsets, region.handler)?);
+        let handler_end = match region.handler_end {
+            Some(end) => u64::from(block_offset(&offsets, end)?),
+            None => checked_u64(next_offset, "exception handler end")?,
+        };
         if protected_start >= protected_end {
             return Err(CompileError::new(
                 "exception protected range must be nonempty and forward ordered",
             ));
         }
-        if (protected_start..protected_end).contains(&handler_offset) {
+        if handler_offset >= handler_end
+            || handler_end > checked_u64(next_offset, "function code length")?
+        {
             return Err(CompileError::new(
-                "exception handler must be outside its protected range",
+                "exception handler range must be nonempty and within the function",
+            ));
+        }
+        if handler_offset < protected_end && protected_start < handler_end {
+            return Err(CompileError::new(
+                "exception handler range must not overlap its protected range",
             ));
         }
         exception_regions.push(EncodedExceptionRegion {
             protected_start,
             protected_end,
             handler_offset,
+            handler_end,
             stack_depth: region.stack_depth,
         });
     }
@@ -775,6 +795,7 @@ fn encode_exception_table(records: &[ExceptionRecordData]) -> Result<Vec<u8>, Co
         write_u64(&mut output, record.protected_start);
         write_u64(&mut output, record.protected_end);
         write_u64(&mut output, record.handler_offset);
+        write_u64(&mut output, record.handler_end);
         write_u32(&mut output, record.stack_depth);
         write_u32(&mut output, u32::MAX); // catch-all handler
         write_u32(&mut output, 0); // version 1.0 flags

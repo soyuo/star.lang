@@ -144,12 +144,13 @@ function_index:u32
 protected_start:u64
 protected_end:u64
 handler_offset:u64
+handler_end:u64
 stack_depth:u32
 exception_type_constant_index:u32  # 0xFFFFFFFF means catch-all
 flags:u32                          # zero in version 1.0
 ```
 
-Offsets are relative to the start of the referenced function's code range. Protected ranges are half-open. Start, end, and handler offsets must be instruction boundaries; `protected_start < protected_end`. `stack_depth` is the number of operand slots retained from the exception-region entry snapshot when entering the handler; it cannot exceed the function's declared `max_stack`. Handler records for a function are ordered by start then end. The verifier rejects overlapping ranges unless one range is properly nested in the other. A catch-all uses the sentinel; otherwise the type index refers to a TypeRef constant.
+Offsets are relative to the start of the referenced function's code range. Protected and handler ranges are half-open. Start, end, handler, and handler-end offsets must be instruction boundaries (function end is allowed for either exclusive end); `protected_start < protected_end`, `handler_offset < handler_end`, and a handler range must not overlap its own protected range. `stack_depth` is the number of operand slots retained from the exception-region entry snapshot when entering the handler; it cannot exceed the function's declared `max_stack`, and the verifier confirms it equals the reachable stack depth at `protected_start`. RETHROW is valid only within a declared handler range. Handler records for a function are ordered by protected start then end. The verifier rejects overlapping protected ranges unless one is properly nested in the other. A catch-all uses the sentinel; otherwise the type index refers to a TypeRef constant.
 
 ## Debug information and checksum
 

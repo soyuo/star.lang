@@ -169,6 +169,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             let instruction_offset = frame.ip;
             let function_index = frame.function_index;
             let absolute_code_offset = frame.function.code_offset + instruction_offset;
+            self.expire_pending_exceptions(frames.last_mut().expect("active frame"));
             self.activate_exception_regions(image, frames.last_mut().expect("active frame"));
             let span = image.span(function_index, absolute_code_offset);
             let instruction = {
@@ -331,14 +332,23 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     .error(RuntimeErrorKind::Unsupported("reached compiler TRAP"), span));
             }
             Instruction::Rethrow => {
-                let error = frames[frame_index].pending_error.take().ok_or_else(|| {
-                    self.runtime.error(
-                        RuntimeErrorKind::CompileError(
-                            "RETHROW without a pending exception".into(),
-                        ),
-                        span,
-                    )
-                })?;
+                let error = frames[frame_index]
+                    .pending_exceptions
+                    .iter()
+                    .rev()
+                    .find(|pending| {
+                        instruction_offset >= pending.handler_start
+                            && instruction_offset < pending.handler_end
+                    })
+                    .map(|pending| pending.error.clone())
+                    .ok_or_else(|| {
+                        self.runtime.error(
+                            RuntimeErrorKind::CompileError(
+                                "RETHROW without a pending exception".into(),
+                            ),
+                            span,
+                        )
+                    })?;
                 return Err(error);
             }
         }
@@ -371,6 +381,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 .entry(index)
                 .or_insert_with(|| snapshot.clone());
         }
+    }
+
+    fn expire_pending_exceptions(&self, frame: &mut Frame) {
+        frame
+            .pending_exceptions
+            .retain(|pending| frame.ip >= pending.handler_start && frame.ip < pending.handler_end);
     }
 
     fn dispatch_exception(
@@ -431,9 +447,20 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         let Some(snapshot) = frame.active_exceptions.remove(&region_index) else {
             return false;
         };
+        let restored_scope_depth = snapshot.scope_depth;
         self.runtime.restore_execution_snapshot(&snapshot);
         frame.ip = handler_offset;
-        frame.pending_error = Some(error);
+        frame
+            .loop_states
+            .retain(|_, state| state.scope_depth < restored_scope_depth);
+        frame.pending_exceptions.retain(|pending| {
+            handler_offset >= pending.handler_start && handler_offset < pending.handler_end
+        });
+        frame.pending_exceptions.push(PendingException {
+            handler_start: handler_offset,
+            handler_end: image.exceptions[region_index].handler_end,
+            error,
+        });
         true
     }
 
@@ -1470,7 +1497,15 @@ struct ExceptionRegion {
     protected_start: usize,
     protected_end: usize,
     handler_offset: usize,
+    handler_end: usize,
     stack_depth: u32,
+}
+
+#[derive(Clone, Debug)]
+struct PendingException {
+    handler_start: usize,
+    handler_end: usize,
+    error: RuntimeError,
 }
 
 impl<'a> Image<'a> {
@@ -1533,7 +1568,7 @@ struct Frame {
     return_action: ReturnAction,
     loop_states: HashMap<u32, LoopState>,
     call_site_offset: usize,
-    pending_error: Option<RuntimeError>,
+    pending_exceptions: Vec<PendingException>,
     active_exceptions: HashMap<usize, super::ExecutionSnapshot>,
 }
 
@@ -1550,7 +1585,7 @@ impl Frame {
             return_action: ReturnAction::PushResult,
             loop_states: HashMap::new(),
             call_site_offset: 0,
-            pending_error: None,
+            pending_exceptions: Vec::new(),
             active_exceptions: HashMap::new(),
             function,
         }
@@ -1576,7 +1611,7 @@ impl Frame {
             return_action,
             loop_states: HashMap::new(),
             call_site_offset,
-            pending_error: None,
+            pending_exceptions: Vec::new(),
             active_exceptions: HashMap::new(),
             function,
         }
@@ -1733,6 +1768,8 @@ fn parse_exceptions(bytes: &[u8]) -> Result<Vec<ExceptionRegion>, String> {
             usize::try_from(reader.u64()?).map_err(|_| "exception end offset overflow")?;
         let handler_offset =
             usize::try_from(reader.u64()?).map_err(|_| "exception handler offset overflow")?;
+        let handler_end =
+            usize::try_from(reader.u64()?).map_err(|_| "exception handler end overflow")?;
         let stack_depth = reader.u32()?;
         let type_constant_index = reader.u32()?;
         let flags = reader.u32()?;
@@ -1747,6 +1784,7 @@ fn parse_exceptions(bytes: &[u8]) -> Result<Vec<ExceptionRegion>, String> {
             protected_start,
             protected_end,
             handler_offset,
+            handler_end,
             stack_depth,
         });
     }
