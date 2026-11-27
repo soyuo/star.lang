@@ -28,10 +28,21 @@ pub struct BytecodeVm<R: BufRead, W: Write> {
 impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     /// Creates a VM with injected standard input/output and verifier policy.
     pub fn new(input: R, output: W, policy: VerificationPolicy) -> Self {
+        let capabilities = policy.granted_capabilities.clone();
         Self {
-            runtime: Interpreter::new(input, output),
+            runtime: Interpreter::new(input, output).with_capabilities(capabilities),
             policy,
         }
+    }
+
+    /// Returns the host services configured from this VM's verifier policy.
+    pub fn host_services(&self) -> &crate::runtime::host::HostServices {
+        self.runtime.host_services()
+    }
+
+    /// Returns mutable host services for trusted host setup or use.
+    pub fn host_services_mut(&mut self) -> &mut crate::runtime::host::HostServices {
+        self.runtime.host_services_mut()
     }
 
     /// Sets the maximum number of executed bytecode instructions.

@@ -1,7 +1,7 @@
 //! Reference execution for literals, primitive operations, variables, and I/O.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use num_bigint::Sign;
 use num_traits::Zero;
 use star_common::SourcePosition;
+use star_compiler::Capability;
 use star_parser::Span;
 use star_parser::{
     DataLiteral, ForBlock, FunctionBlock, FunctionKind, IfBlock, Instruction, InstructionOpcode,
@@ -19,6 +20,7 @@ use star_parser::{
 
 use crate::{
     gc::{GcError, GcHeap, GcStats},
+    runtime::host::HostServices,
     runtime::stdio::{BufferedOutput, InputError, StandardInput},
     semantic::{self, ResolvedFunction},
     value::{
@@ -29,7 +31,9 @@ use crate::{
 };
 
 pub mod collections;
+pub mod host;
 pub mod math;
+pub mod path;
 pub mod stdio;
 pub mod strings;
 
@@ -231,6 +235,7 @@ pub struct Interpreter<R: BufRead, W: Write> {
     gc: GcHeap,
     call_depth: usize,
     call_trace: Vec<StackTraceFrame>,
+    host_services: HostServices,
     limits: ExecutionLimits,
     external_memory_bytes: usize,
     execution_started: Option<Instant>,
@@ -273,6 +278,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             gc: GcHeap::default(),
             call_depth: 0,
             call_trace: Vec::new(),
+            host_services: HostServices::new(BTreeSet::new()),
             limits: ExecutionLimits::default(),
             external_memory_bytes: 0,
             execution_started: None,
@@ -284,6 +290,22 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     pub fn with_execution_limits(mut self, limits: ExecutionLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Sets the host capabilities available through this interpreter's host services.
+    pub fn with_capabilities(mut self, capabilities: BTreeSet<Capability>) -> Self {
+        self.host_services = HostServices::new(capabilities);
+        self
+    }
+
+    /// Returns the configured host services for trusted host setup or use.
+    pub fn host_services(&self) -> &HostServices {
+        &self.host_services
+    }
+
+    /// Returns mutable host services for trusted host setup or use.
+    pub fn host_services_mut(&mut self) -> &mut HostServices {
+        &mut self.host_services
     }
 
     /// Sets the maximum number of nested direct calls accepted by this instance.
