@@ -1,10 +1,11 @@
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use num_bigint::{BigInt, BigUint, Sign};
-use num_traits::{ToPrimitive, Zero};
+use num_traits::ToPrimitive;
 use star_lexer::{normalize_source, LexMode};
 use star_parser::{format_program, DataLiteral, InstructionOpcode, Program, Statement};
 
@@ -319,13 +320,13 @@ fn decode_program(program: &Program) -> Result<String, String> {
         if instruction_is(instruction, "INT_TO_BYTES") {
             let bytes = decode_bytes(payload, length)?;
             if statements.len() == 3 {
-                return Ok(format!("Bytes({})", format_hex(&bytes)));
+                return format_bytes(&bytes);
             }
             if let [_, _, _, decode] = statements.as_slice() {
                 if instruction_is(decode, "UTF8_DECODE") {
                     let text = std::str::from_utf8(&bytes)
                         .map_err(|error| format!("byte payload is not valid UTF-8: {error}"))?;
-                    return Ok(format!("String({text:?})"));
+                    return format_debug_string(text);
                 }
             }
         }
@@ -343,26 +344,36 @@ fn decode_program(program: &Program) -> Result<String, String> {
 }
 
 fn bits_to_biguint(literal: &DataLiteral) -> BigUint {
-    literal.bits.iter().fold(BigUint::zero(), |value, bit| {
-        (value << 1usize) + BigUint::from(u8::from(*bit == 1))
-    })
+    let byte_len = literal.bits.len().saturating_add(7) / 8;
+    let leading_padding = byte_len * 8 - literal.bits.len();
+    let mut bytes = vec![0; byte_len];
+    for (index, bit) in literal.bits.iter().enumerate() {
+        if *bit == 1 {
+            let bit_index = leading_padding + index;
+            bytes[bit_index / 8] |= 1 << (7 - bit_index % 8);
+        }
+    }
+    BigUint::from_bytes_be(&bytes)
 }
 
 fn decode_bytes(payload: &DataLiteral, length: &DataLiteral) -> Result<Vec<u8>, String> {
-    let value = bits_to_biguint(payload);
-    let length = bits_to_biguint(length)
-        .to_usize()
-        .ok_or_else(|| "byte length does not fit this platform".to_owned())?;
+    let length =
+        bits_to_usize(length).ok_or_else(|| "byte length does not fit this platform".to_owned())?;
     if length > DEFAULT_FILE_BYTES {
         return Err("decoded byte payload exceeds the CLI file-size limit".to_owned());
     }
+    let significant_bits = significant_bit_len(payload);
+    if significant_bits > length.saturating_mul(8) {
+        return Err("byte payload does not fit the encoded length".to_owned());
+    }
     if length == 0 {
-        return if value.is_zero() {
+        return if significant_bits == 0 {
             Ok(Vec::new())
         } else {
             Err("a zero-length byte payload must have value zero".to_owned())
         };
     }
+    let value = bits_to_biguint(payload);
     let encoded = value.to_bytes_be();
     if encoded.len() > length {
         return Err("byte payload does not fit the encoded length".to_owned());
@@ -372,12 +383,69 @@ fn decode_bytes(payload: &DataLiteral, length: &DataLiteral) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
-fn format_hex(bytes: &[u8]) -> String {
-    bytes
+fn bits_to_usize(literal: &DataLiteral) -> Option<usize> {
+    let significant_bits = significant_bit_len(literal);
+    if significant_bits > usize::BITS as usize {
+        return None;
+    }
+    let mut value = 0usize;
+    let first_one = literal.bits.iter().position(|bit| *bit == 1);
+    if let Some(first_one) = first_one {
+        for bit in &literal.bits[first_one..] {
+            value = (value << 1) | usize::from(*bit == 1);
+        }
+    }
+    Some(value)
+}
+
+fn significant_bit_len(literal: &DataLiteral) -> usize {
+    literal
+        .bits
         .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+        .position(|bit| *bit == 1)
+        .map_or(0, |first_one| literal.bits.len() - first_one)
+}
+
+fn format_bytes(bytes: &[u8]) -> Result<String, String> {
+    let output_len = bytes.len().saturating_mul(3).saturating_add(7);
+    if output_len > DEFAULT_FILE_BYTES {
+        return Err("decoded byte display exceeds the CLI output-size limit".to_owned());
+    }
+    let mut output = String::with_capacity(output_len);
+    output.push_str("Bytes(");
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            output.push(' ');
+        }
+        write!(output, "{byte:02X}").expect("writing to String cannot fail");
+    }
+    output.push(')');
+    Ok(output)
+}
+
+fn format_debug_string(text: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(text.len().saturating_add(9));
+    output.push_str("String(\"");
+    for character in text.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\0' => output.push_str("\\0"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character.is_control() => {
+                write!(output, "\\u{{{:x}}}", character as u32)
+                    .expect("writing to String cannot fail");
+            }
+            character => output.push(character),
+        }
+        if output.len() > DEFAULT_FILE_BYTES.saturating_sub(2) {
+            return Err("decoded string display exceeds the CLI output-size limit".to_owned());
+        }
+    }
+    output.push_str("\")");
+    Ok(output)
 }
 
 fn instruction_is(statement: &Statement, mnemonic: &str) -> bool {
