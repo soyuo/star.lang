@@ -16,9 +16,9 @@ use star_compiler::{
 };
 use star_interpreter::{
     runtime::{
-        stdio::InputError, BytecodeVm, DebugBinding, DebugBreakpoint, DebugCommand,
-        DebugController, DebugExecution, DebugOptions, DebugSnapshot, DebugStopReason,
-        ExecutionLimits, Interpreter, RuntimeError, RuntimeErrorKind,
+        source_breakpoint_locations, stdio::InputError, BytecodeVm, DebugBinding, DebugBreakpoint,
+        DebugCommand, DebugController, DebugExecution, DebugOptions, DebugSnapshot,
+        DebugStopReason, ExecutionLimits, Interpreter, RuntimeError, RuntimeErrorKind,
     },
     semantic::analyze,
 };
@@ -552,6 +552,10 @@ fn debug_file_dap(options: DebugFileOptions) -> u8 {
             return EXIT_SOURCE;
         }
     };
+    let valid_locations = source_breakpoint_locations(&program)
+        .into_iter()
+        .filter_map(|location| location.column.map(|column| (location.line, column)))
+        .collect();
     let guest_input = match options.input {
         Some(path) => match read_limited_file(&path, DEFAULT_FILE_BYTES) {
             Ok(input) => input,
@@ -561,16 +565,17 @@ fn debug_file_dap(options: DebugFileOptions) -> u8 {
     };
     let cli_breakpoints = options.breakpoints;
     let dap_output = dap::DapOutput::new();
-    let mut controller = match dap::DapController::new(&options.path, dap_output.clone()) {
-        Ok(controller) => controller,
-        Err(error) => {
-            eprintln!(
-                "{}: cannot initialize DAP source: {error}",
-                options.path.display()
-            );
-            return EXIT_IO;
-        }
-    };
+    let mut controller =
+        match dap::DapController::new(&options.path, dap_output.clone(), valid_locations) {
+            Ok(controller) => controller,
+            Err(error) => {
+                eprintln!(
+                    "{}: cannot initialize DAP source: {error}",
+                    options.path.display()
+                );
+                return EXIT_IO;
+            }
+        };
     let mut breakpoints = match controller.configure() {
         Ok(breakpoints) => breakpoints,
         Err(error) => {

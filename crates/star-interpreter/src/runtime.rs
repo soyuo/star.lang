@@ -47,8 +47,8 @@ mod bytecode_vm;
 mod guest_concurrency;
 pub use bytecode_vm::BytecodeVm;
 pub use debugger::{
-    DebugBinding, DebugBreakpoint, DebugCallFrame, DebugCommand, DebugController, DebugExecution,
-    DebugOptions, DebugSnapshot, DebugStopReason, DebugValue,
+    source_breakpoint_locations, DebugBinding, DebugBreakpoint, DebugCallFrame, DebugCommand,
+    DebugController, DebugExecution, DebugOptions, DebugSnapshot, DebugStopReason, DebugValue,
 };
 
 /// The reason execution stopped.

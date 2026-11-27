@@ -1,5 +1,6 @@
 //! Host-controlled source debugging for the reference interpreter.
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 
 use num_bigint::BigInt;
@@ -136,6 +137,72 @@ pub enum DebugExecution {
     Quit,
 }
 
+/// Returns the source positions at which the runtime can stop before a statement.
+/// Nested block bodies and function bodies are included.
+pub fn source_breakpoint_locations(program: &Program) -> Vec<DebugBreakpoint> {
+    let mut locations = BTreeSet::new();
+    collect_statement_locations(&program.statements, &mut locations);
+    locations
+        .into_iter()
+        .map(|(line, column)| DebugBreakpoint {
+            line,
+            column: Some(column),
+        })
+        .collect()
+}
+
+fn collect_statement_locations(
+    statements: &[star_parser::Statement],
+    locations: &mut BTreeSet<(usize, usize)>,
+) {
+    for statement in statements {
+        let span = match statement {
+            star_parser::Statement::Instruction(instruction) => instruction.span,
+            star_parser::Statement::DataLiteral(literal) => literal.span,
+            star_parser::Statement::If(block) => block.span,
+            star_parser::Statement::Loop(block) => block.span,
+            star_parser::Statement::For(block) => block.span,
+            star_parser::Statement::Function(block) => block.span,
+            star_parser::Statement::Scope(block) => block.span,
+            star_parser::Statement::Try(block) => block.span,
+        };
+        locations.insert((span.start.line, span.start.column));
+        match statement {
+            star_parser::Statement::If(block) => {
+                collect_statement_locations(&block.then_body, locations);
+                if let Some(body) = &block.else_body {
+                    collect_statement_locations(body, locations);
+                }
+            }
+            star_parser::Statement::Loop(block) => {
+                if let Some(condition) = &block.condition {
+                    collect_statement_locations(condition, locations);
+                }
+                collect_statement_locations(&block.body, locations);
+            }
+            star_parser::Statement::For(block) => {
+                collect_statement_locations(&block.body, locations);
+            }
+            star_parser::Statement::Function(block) => {
+                collect_statement_locations(&block.body, locations);
+            }
+            star_parser::Statement::Scope(block) => {
+                collect_statement_locations(&block.body, locations);
+            }
+            star_parser::Statement::Try(block) => {
+                collect_statement_locations(&block.try_body, locations);
+                if let Some(body) = &block.catch_body {
+                    collect_statement_locations(body, locations);
+                }
+                if let Some(body) = &block.finally_body {
+                    collect_statement_locations(body, locations);
+                }
+            }
+            star_parser::Statement::Instruction(_) | star_parser::Statement::DataLiteral(_) => {}
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum StepPlan {
     Into { after: u64 },
@@ -171,7 +238,8 @@ impl DebugSession {
     pub(super) fn should_stop(
         &mut self,
         position: SourcePosition,
-        depth: usize,
+        step_depth: usize,
+        call_depth: usize,
     ) -> Option<DebugStopReason> {
         self.sequence = self.sequence.saturating_add(1);
         if !self.started {
@@ -193,11 +261,11 @@ impl DebugSession {
             Some(StepPlan::Over {
                 after,
                 depth: origin,
-            }) if self.sequence > after && depth <= origin => Some(DebugStopReason::Step),
+            }) if self.sequence > after && step_depth <= origin => Some(DebugStopReason::Step),
             Some(StepPlan::Out {
                 after,
                 depth: origin,
-            }) if self.sequence > after && depth < origin => Some(DebugStopReason::Step),
+            }) if self.sequence > after && call_depth < origin => Some(DebugStopReason::Step),
             _ => None,
         }
     }
@@ -206,7 +274,8 @@ impl DebugSession {
         &mut self,
         reason: DebugStopReason,
         snapshot: &DebugSnapshot,
-        depth: usize,
+        step_depth: usize,
+        call_depth: usize,
     ) -> DebugCommand {
         let command = self.controller.on_stop(reason, snapshot);
         self.step_plan = match command {
@@ -216,11 +285,11 @@ impl DebugSession {
             }),
             DebugCommand::StepOver => Some(StepPlan::Over {
                 after: self.sequence,
-                depth,
+                depth: step_depth,
             }),
             DebugCommand::StepOut => Some(StepPlan::Out {
                 after: self.sequence,
-                depth,
+                depth: call_depth,
             }),
         };
         command
@@ -318,11 +387,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     pub(super) fn debug_before_statement(&mut self, span: Span) -> Result<(), RuntimeError> {
-        let depth = self.call_depth.saturating_add(self.debug_nesting);
+        let call_depth = self.call_depth;
+        let step_depth = call_depth.saturating_add(self.debug_nesting);
         let reason = self
             .debug_session
             .as_mut()
-            .and_then(|session| session.should_stop(span.start, depth));
+            .and_then(|session| session.should_stop(span.start, step_depth, call_depth));
         let Some(reason) = reason else {
             return Ok(());
         };
@@ -335,7 +405,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             .debug_session
             .as_mut()
             .expect("debug session remains installed while executing")
-            .stop(reason, &snapshot, depth);
+            .stop(reason, &snapshot, step_depth, call_depth);
         if command == DebugCommand::Quit {
             return Err(self.error(RuntimeErrorKind::DebuggerStopped, span));
         }

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,11 +78,25 @@ impl DapOutput {
     }
 }
 
-pub(crate) struct DapGuestOutput(DapOutput);
+pub(crate) struct DapGuestOutput {
+    output: DapOutput,
+    pending_utf8: Vec<u8>,
+}
 
 impl DapGuestOutput {
     pub(crate) fn new(output: DapOutput) -> Self {
-        Self(output)
+        Self {
+            output,
+            pending_utf8: Vec::new(),
+        }
+    }
+
+    fn send_text(&self, text: &str) -> io::Result<()> {
+        if !text.is_empty() {
+            self.output
+                .event("output", json!({"category":"stdout", "output":text}))?;
+        }
+        Ok(())
     }
 }
 
@@ -90,18 +105,33 @@ impl Write for DapGuestOutput {
         if bytes.is_empty() {
             return Ok(0);
         }
-        self.0.event(
-            "output",
-            json!({
-                "category":"stdout",
-                "output":String::from_utf8_lossy(bytes),
-            }),
-        )?;
+        let mut combined = std::mem::take(&mut self.pending_utf8);
+        combined.extend_from_slice(bytes);
+        match std::str::from_utf8(&combined) {
+            Ok(text) => self.send_text(text)?,
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                self.send_text(
+                    std::str::from_utf8(&combined[..valid_up_to])
+                        .expect("valid UTF-8 prefix was reported by the decoder"),
+                )?;
+                if error.error_len().is_none() {
+                    self.pending_utf8
+                        .extend_from_slice(&combined[valid_up_to..]);
+                } else {
+                    self.send_text(&String::from_utf8_lossy(&combined[valid_up_to..]))?;
+                }
+            }
+        }
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0
+        if !self.pending_utf8.is_empty() {
+            let pending = std::mem::take(&mut self.pending_utf8);
+            self.send_text(&String::from_utf8_lossy(&pending))?;
+        }
+        self.output
             .stdout
             .lock()
             .map_err(|_| io::Error::other("DAP output lock poisoned"))?
@@ -114,17 +144,23 @@ pub(crate) struct DapController {
     output: DapOutput,
     source_path: PathBuf,
     breakpoints: Vec<DebugBreakpoint>,
+    valid_locations: BTreeSet<(usize, usize)>,
     initialized: bool,
     launched: bool,
 }
 
 impl DapController {
-    pub(crate) fn new(source_path: &Path, output: DapOutput) -> io::Result<Self> {
+    pub(crate) fn new(
+        source_path: &Path,
+        output: DapOutput,
+        valid_locations: BTreeSet<(usize, usize)>,
+    ) -> io::Result<Self> {
         Ok(Self {
             stdin: BufReader::new(io::stdin()),
             output,
             source_path: source_path.canonicalize()?,
             breakpoints: Vec::new(),
+            valid_locations,
             initialized: false,
             launched: false,
         })
@@ -250,9 +286,17 @@ impl DapController {
                 .get("column")
                 .and_then(Value::as_u64)
                 .and_then(|column| usize::try_from(column).ok());
+            let location_matches = line.is_some_and(|line| match column {
+                Some(column) => self.valid_locations.contains(&(line, column)),
+                None => self
+                    .valid_locations
+                    .iter()
+                    .any(|(valid_line, _)| *valid_line == line),
+            });
             let verified = path_matches
                 && line.is_some_and(|line| line > 0)
-                && column.map_or(true, |column| column > 0);
+                && column.map_or(true, |column| column > 0)
+                && location_matches;
             if verified {
                 self.breakpoints.push(DebugBreakpoint {
                     line: line.unwrap(),
@@ -305,12 +349,15 @@ impl DapController {
                     .and_then(|value| value.get("frameId"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
+                let frame_is_valid = frame_id > 0 && frame_id <= snapshot.call_stack.len() as u64;
                 let scopes = if frame_id == 1 {
                     vec![
                         json!({"name":"Locals","variablesReference":1,"expensive":false,"namedVariables":snapshot.locals.len()}),
                         json!({"name":"Globals","variablesReference":2,"expensive":false,"namedVariables":snapshot.globals.len()}),
                         json!({"name":"Operand Stack","variablesReference":3,"expensive":false,"namedVariables":snapshot.operand_stack.len()}),
                     ]
+                } else if frame_is_valid {
+                    vec![json!({"name":"Globals","variablesReference":2,"expensive":false,"namedVariables":snapshot.globals.len()})]
                 } else {
                     Vec::new()
                 };
