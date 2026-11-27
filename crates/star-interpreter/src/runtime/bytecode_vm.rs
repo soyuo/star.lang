@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
@@ -13,7 +13,7 @@ use crate::value::{
     binding_cell, BindingCell, ClosureState, FunctionRef, IteratorState, ObjectState, Value,
 };
 
-use super::{empty_span, Interpreter, RuntimeError, RuntimeErrorKind};
+use super::{empty_span, ffi::NativeCallbackContext, Interpreter, RuntimeError, RuntimeErrorKind};
 
 /// Executes verified version 1.0 `.starc` bytecode using the reference runtime.
 ///
@@ -23,6 +23,18 @@ use super::{empty_span, Interpreter, RuntimeError, RuntimeErrorKind};
 pub struct BytecodeVm<R: BufRead, W: Write> {
     runtime: Interpreter<R, W>,
     policy: VerificationPolicy,
+    frame_storage_estimates: Vec<usize>,
+    tasks: HashMap<u64, BytecodeTask>,
+    ready_tasks: VecDeque<u64>,
+    next_task_id: u64,
+    current_task_id: Option<u64>,
+    task_memory_bytes: usize,
+}
+
+struct BytecodeCallbackContext<'a, R: BufRead, W: Write> {
+    vm: *mut BytecodeVm<R, W>,
+    image: *const Image<'a>,
+    call_site_offset: usize,
 }
 
 impl<R: BufRead, W: Write> BytecodeVm<R, W> {
@@ -32,6 +44,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         Self {
             runtime: Interpreter::new(input, output).with_capabilities(capabilities),
             policy,
+            frame_storage_estimates: Vec::new(),
+            tasks: HashMap::new(),
+            ready_tasks: VecDeque::new(),
+            next_task_id: 1,
+            current_task_id: None,
+            task_memory_bytes: 0,
         }
     }
 
@@ -161,6 +179,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.call_depth = 0;
         self.runtime.executed_steps = 0;
         self.runtime.set_external_memory_bytes(0);
+        self.frame_storage_estimates.clear();
+        self.tasks.clear();
+        self.ready_tasks.clear();
+        self.next_task_id = 1;
+        self.current_task_id = None;
+        self.task_memory_bytes = 0;
     }
 
     fn cleanup_after_error(&mut self) {
@@ -202,7 +226,26 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 .error(RuntimeErrorKind::ResourceLimit("call frames"), entry_span)
         })?;
         frames.push(Frame::initializer(entry, entry_function.clone()));
-        self.update_external_frame_memory(&frames);
+        self.run_frames(image, &mut frames)
+    }
+
+    fn run_frames(
+        &mut self,
+        image: &Image<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> Result<Value, RuntimeError> {
+        self.frame_storage_estimates.push(0);
+        let result = self.run_frames_loop(image, frames);
+        self.frame_storage_estimates.pop();
+        self.sync_external_memory();
+        result
+    }
+
+    fn run_frames_loop(
+        &mut self,
+        image: &Image<'_>,
+        frames: &mut Vec<Frame>,
+    ) -> Result<Value, RuntimeError> {
         loop {
             self.update_external_frame_memory(&frames);
             let Some(frame) = frames.last() else {
@@ -251,7 +294,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 decode_instruction(image, frame, span, &self.runtime)?
             };
             let instruction_result =
-                self.execute_instruction(image, &mut frames, instruction, instruction_offset, span);
+                self.execute_instruction(image, frames, instruction, instruction_offset, span);
             self.update_external_frame_memory(&frames);
             match instruction_result {
                 Ok(Some(value)) => {
@@ -260,12 +303,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 }
                 Ok(None) => self.runtime.check_resource_limits(span)?,
                 Err(error) => {
-                    if self.dispatch_exception(
-                        image,
-                        &mut frames,
-                        instruction_offset,
-                        error.clone(),
-                    ) {
+                    if self.dispatch_exception(image, frames, instruction_offset, error.clone()) {
                         continue;
                     }
                     return Err(error);
@@ -276,8 +314,403 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     }
 
     fn update_external_frame_memory(&mut self, frames: &Vec<Frame>) {
+        if let Some(current) = self.frame_storage_estimates.last_mut() {
+            *current = frame_storage_bytes(frames, frames.capacity());
+        }
+        self.sync_external_memory();
+    }
+
+    fn sync_external_memory(&mut self) {
+        self.task_memory_bytes = bytecode_task_memory_bytes(
+            &self.tasks,
+            self.tasks.capacity(),
+            self.ready_tasks.capacity(),
+        );
+        let frame_bytes = self
+            .frame_storage_estimates
+            .iter()
+            .copied()
+            .fold(0usize, usize::saturating_add);
         self.runtime
-            .set_external_memory_bytes(frame_storage_bytes(frames, frames.capacity()));
+            .set_external_memory_bytes(frame_bytes.saturating_add(self.task_memory_bytes));
+    }
+
+    fn enqueue_task(&mut self, request: CallRequest, span: Span) -> Result<u64, RuntimeError> {
+        let Some(next_id) = self.next_task_id.checked_add(1) else {
+            return Err(self
+                .runtime
+                .error(RuntimeErrorKind::ResourceLimit("task identifiers"), span));
+        };
+        let task_capacity =
+            super::projected_capacity_after_push(self.tasks.len(), self.tasks.capacity());
+        let ready_capacity = super::projected_capacity_after_push(
+            self.ready_tasks.len(),
+            self.ready_tasks.capacity(),
+        );
+        let additional = size_of::<BytecodeTask>()
+            .saturating_add(call_request_memory_bytes(&request))
+            .saturating_add(
+                task_capacity
+                    .saturating_sub(self.tasks.capacity())
+                    .saturating_mul(size_of::<(u64, BytecodeTask)>()),
+            )
+            .saturating_add(
+                ready_capacity
+                    .saturating_sub(self.ready_tasks.capacity())
+                    .saturating_mul(size_of::<u64>()),
+            );
+        self.runtime.ensure_memory_budget(additional, span)?;
+        self.tasks.try_reserve(1).map_err(|_| {
+            self.runtime
+                .error(RuntimeErrorKind::ResourceLimit("task registry"), span)
+        })?;
+        self.ready_tasks.try_reserve(1).map_err(|_| {
+            self.runtime
+                .error(RuntimeErrorKind::ResourceLimit("task queue"), span)
+        })?;
+        let id = self.next_task_id;
+        self.next_task_id = next_id;
+        self.tasks.insert(
+            id,
+            BytecodeTask {
+                request: Some(request),
+                status: BytecodeTaskStatus::Pending,
+            },
+        );
+        self.ready_tasks.push_back(id);
+        self.sync_external_memory();
+        Ok(id)
+    }
+
+    fn task_status_kind_and_copy_bytes(&self, id: u64) -> Option<(BytecodeTaskStatusKind, usize)> {
+        self.tasks.get(&id).map(|task| match &task.status {
+            BytecodeTaskStatus::Pending => (BytecodeTaskStatusKind::Pending, 0),
+            BytecodeTaskStatus::Running => (BytecodeTaskStatusKind::Running, 0),
+            BytecodeTaskStatus::Completed(value) => (
+                BytecodeTaskStatusKind::Completed,
+                size_of::<Value>()
+                    .saturating_add(super::estimated_unmanaged_payload_bytes(value, 0)),
+            ),
+            BytecodeTaskStatus::Failed(error) => (
+                BytecodeTaskStatusKind::Failed,
+                super::estimated_runtime_error_bytes(error),
+            ),
+            BytecodeTaskStatus::Cancelled => (BytecodeTaskStatusKind::Cancelled, 0),
+        })
+    }
+
+    fn run_next_task(&mut self, image: &Image<'_>, span: Span) -> Result<bool, RuntimeError> {
+        while let Some(id) = self.ready_tasks.pop_front() {
+            if matches!(
+                self.tasks.get(&id).map(|task| &task.status),
+                Some(BytecodeTaskStatus::Pending)
+            ) {
+                let _ = self.run_task(image, id, span);
+                self.sync_external_memory();
+                return Ok(true);
+            }
+        }
+        self.sync_external_memory();
+        Ok(false)
+    }
+
+    fn run_task(&mut self, image: &Image<'_>, id: u64, span: Span) -> Result<Value, RuntimeError> {
+        let Some((status, copy_bytes)) = self.task_status_kind_and_copy_bytes(id) else {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("task does not exist"),
+                span,
+            ));
+        };
+        match status {
+            BytecodeTaskStatusKind::Completed => {
+                self.runtime.ensure_memory_budget(copy_bytes, span)?;
+                let Some(BytecodeTaskStatus::Completed(value)) =
+                    self.tasks.get(&id).map(|task| &task.status)
+                else {
+                    return Err(self
+                        .runtime
+                        .error(RuntimeErrorKind::ReferenceError("task state changed"), span));
+                };
+                return Ok(value.clone());
+            }
+            BytecodeTaskStatusKind::Failed => {
+                self.runtime.ensure_memory_budget(copy_bytes, span)?;
+                let Some(BytecodeTaskStatus::Failed(error)) =
+                    self.tasks.get(&id).map(|task| &task.status)
+                else {
+                    return Err(self
+                        .runtime
+                        .error(RuntimeErrorKind::ReferenceError("task state changed"), span));
+                };
+                return Err(error.clone());
+            }
+            BytecodeTaskStatusKind::Cancelled => {
+                return Err(self.runtime.error(RuntimeErrorKind::TaskCancelled, span))
+            }
+            BytecodeTaskStatusKind::Running => {
+                return Err(self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("task cannot await itself while running"),
+                    span,
+                ))
+            }
+            BytecodeTaskStatusKind::Pending => {}
+        }
+
+        let request = {
+            let task = self.tasks.get_mut(&id).expect("task was found above");
+            task.status = BytecodeTaskStatus::Running;
+            task.request.take().ok_or_else(|| {
+                self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("task call state is unavailable"),
+                    span,
+                )
+            })?
+        };
+        let previous_task = self.current_task_id.replace(id);
+        let mut frames = Vec::new();
+        self.frame_storage_estimates.push(0);
+        let execution = self
+            .enter_function(request, span, 0, image, &mut frames, true)
+            .and_then(|()| self.run_frames_loop(image, &mut frames));
+        self.frame_storage_estimates.pop();
+        self.current_task_id = previous_task;
+        if execution.is_err() {
+            for frame in frames.drain(..).rev() {
+                self.unwind_exception_frame(&frame);
+            }
+        }
+        self.runtime.cleanup_task_concurrency(id);
+        self.sync_external_memory();
+
+        let status_copy_bytes = match &execution {
+            Ok(value) => size_of::<Value>()
+                .saturating_add(super::estimated_unmanaged_payload_bytes(value, 0)),
+            Err(error) => super::estimated_runtime_error_bytes(error),
+        };
+        let execution = if self
+            .runtime
+            .ensure_memory_budget(status_copy_bytes, span)
+            .is_err()
+        {
+            Err(RuntimeError {
+                kind: RuntimeErrorKind::ResourceLimit("memory"),
+                span,
+                stack_trace: Vec::new(),
+                stack_trace_truncated: true,
+            })
+        } else {
+            execution
+        };
+        let result = match execution {
+            Ok(value) => {
+                if let Some(task) = self.tasks.get_mut(&id) {
+                    task.status = BytecodeTaskStatus::Completed(value.clone());
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if let Some(task) = self.tasks.get_mut(&id) {
+                    task.status = BytecodeTaskStatus::Failed(error.clone());
+                }
+                Err(error)
+            }
+        };
+        self.sync_external_memory();
+        result
+    }
+
+    fn await_task(
+        &mut self,
+        image: &Image<'_>,
+        id: u64,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        loop {
+            let Some((status, _)) = self.task_status_kind_and_copy_bytes(id) else {
+                return Err(self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("task does not exist"),
+                    span,
+                ));
+            };
+            match status {
+                BytecodeTaskStatusKind::Pending => {
+                    if !self.run_next_task(image, span)? {
+                        return self.run_task(image, id, span);
+                    }
+                }
+                BytecodeTaskStatusKind::Completed
+                | BytecodeTaskStatusKind::Failed
+                | BytecodeTaskStatusKind::Cancelled
+                | BytecodeTaskStatusKind::Running => return self.run_task(image, id, span),
+            }
+        }
+    }
+
+    fn spawn_task(&mut self, span: Span, image: &Image<'_>) -> Result<(), RuntimeError> {
+        if !self.runtime.host_services().task_creation_enabled() {
+            return Err(self
+                .runtime
+                .error(RuntimeErrorKind::PermissionError("task.spawn"), span));
+        }
+        let callable = self.runtime.pop(span)?;
+        let (function_module, function_id, capture_bytes) = match &callable {
+            Value::Function(function) => (function.module_index, &function.id, 0usize),
+            Value::Closure(closure) => {
+                let capture_bytes = {
+                    let captures = closure.captures.borrow();
+                    super::estimated_capture_clone_bytes(&captures)
+                };
+                (
+                    closure.function.module_index,
+                    &closure.function.id,
+                    capture_bytes,
+                )
+            }
+            other => return Err(self.runtime.type_error("Function or Closure", &other, span)),
+        };
+        let function_index = image
+            .functions
+            .iter()
+            .position(|function| {
+                function.module_index == function_module
+                    && function.id.as_ref() == Some(function_id)
+            })
+            .ok_or_else(|| {
+                self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("function does not exist"),
+                    span,
+                )
+            })?;
+        let function_record = &image.functions[function_index];
+        let parameter_count = function_record.parameter_ids.len();
+        let required = if function_record.rest_parameter_code == 0 {
+            parameter_count
+        } else {
+            parameter_count.saturating_sub(1)
+        };
+        if required > 0 || (function_record.rest_parameter_code == 0 && parameter_count != 0) {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "zero-argument function for SPAWN",
+                    found: "function requiring arguments",
+                },
+                span,
+            ));
+        }
+        let request_memory = size_of::<CallRequest>()
+            .saturating_add(super::estimated_bigint_bytes(function_id))
+            .saturating_add(capture_bytes);
+        self.runtime
+            .ensure_memory_budget(self.projected_task_insert_bytes(request_memory), span)?;
+        let (owned_module, owned_id, captures) = match callable {
+            Value::Function(function) => (function.module_index, function.id, Vec::new()),
+            Value::Closure(closure) => (
+                closure.function.module_index,
+                closure.function.id.clone(),
+                closure.captures.borrow().clone(),
+            ),
+            _ => unreachable!("callable kind was validated"),
+        };
+        let request = CallRequest {
+            module_index: owned_module,
+            function_id: owned_id,
+            arguments: Vec::new(),
+            captures,
+            return_action: ReturnAction::PushResult,
+        };
+        let id = self.enqueue_task(request, span)?;
+        self.runtime.push_value(Value::Task(id), span)
+    }
+
+    fn projected_task_insert_bytes(&self, request_bytes: usize) -> usize {
+        let task_capacity =
+            super::projected_capacity_after_push(self.tasks.len(), self.tasks.capacity());
+        let ready_capacity = super::projected_capacity_after_push(
+            self.ready_tasks.len(),
+            self.ready_tasks.capacity(),
+        );
+        size_of::<BytecodeTask>()
+            .saturating_add(request_bytes)
+            .saturating_add(
+                task_capacity
+                    .saturating_sub(self.tasks.capacity())
+                    .saturating_mul(size_of::<(u64, BytecodeTask)>()),
+            )
+            .saturating_add(
+                ready_capacity
+                    .saturating_sub(self.ready_tasks.capacity())
+                    .saturating_mul(size_of::<u64>()),
+            )
+    }
+
+    fn sleep_task(&mut self, image: &Image<'_>, span: Span) -> Result<(), RuntimeError> {
+        if self.current_task_id.is_none() {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "async task context",
+                    found: "main execution context",
+                },
+                span,
+            ));
+        }
+        let value = self.runtime.pop(span)?;
+        let Value::Int(milliseconds) = value else {
+            return Err(self
+                .runtime
+                .type_error("nonnegative Int milliseconds", &value, span));
+        };
+        let milliseconds = milliseconds.to_u64().ok_or_else(|| {
+            self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "nonnegative representable Int milliseconds",
+                    found: "Int",
+                },
+                span,
+            )
+        })?;
+        let duration = std::time::Duration::from_millis(milliseconds);
+        if self.runtime.execution_started.is_some_and(|started| {
+            started.elapsed().saturating_add(duration) >= self.runtime.limits.max_execution_time
+        }) {
+            return Err(self
+                .runtime
+                .error(RuntimeErrorKind::ResourceLimit("execution time"), span));
+        }
+        let Some(deadline) = std::time::Instant::now().checked_add(duration) else {
+            return Err(self
+                .runtime
+                .error(RuntimeErrorKind::ResourceLimit("execution time"), span));
+        };
+        while std::time::Instant::now() < deadline {
+            if !self.run_next_task(image, span)? {
+                std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                break;
+            }
+            self.runtime.check_resource_limits(span)?;
+        }
+        self.runtime.push_value(Value::Null, span)
+    }
+
+    fn cancel_task(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.runtime.pop(span)?;
+        let Value::Task(id) = value else {
+            return Err(self.runtime.type_error("Task", &value, span));
+        };
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("task does not exist"),
+                span,
+            ));
+        };
+        let accepted = if matches!(task.status, BytecodeTaskStatus::Pending) {
+            task.status = BytecodeTaskStatus::Cancelled;
+            true
+        } else {
+            false
+        };
+        self.ready_tasks.retain(|queued| *queued != id);
+        self.sync_external_memory();
+        self.runtime.push_value(Value::Bool(accepted), span)
     }
 
     fn execute_instruction(
@@ -353,8 +786,10 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 })?;
                 self.check_capability(operation, span)?;
                 let module_index = frames[frame_index].module_index;
-                if let Some(request) = self.call_intrinsic(operation, span, module_index, image)? {
-                    self.enter_function(request, span, instruction_offset, image, frames)?;
+                if let Some(request) =
+                    self.call_intrinsic(operation, span, module_index, image, frames)?
+                {
+                    self.enter_function(request, span, instruction_offset, image, frames, false)?;
                 }
             }
             Instruction::Jump { target, unwind } => {
@@ -771,6 +1206,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         call_site_offset: usize,
         image: &Image<'_>,
         frames: &mut Vec<Frame>,
+        task_entry: bool,
     ) -> Result<(), RuntimeError> {
         let function_index = image
             .functions
@@ -786,12 +1222,6 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 )
             })?;
         let function_record = &image.functions[function_index];
-        if function_record.asynchronous {
-            return Err(self.unsupported(span, "async task scheduling"));
-        }
-        if self.runtime.call_depth >= self.runtime.limits.max_call_depth {
-            return Err(self.runtime.error(RuntimeErrorKind::StackOverflow, span));
-        }
         let parameter_count = function_record.parameter_ids.len();
         let required = if function_record.rest_parameter_code == 0 {
             parameter_count
@@ -809,6 +1239,14 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 },
                 span,
             ));
+        }
+        if function_record.asynchronous && !task_entry {
+            let task_id = self.enqueue_task(request, span)?;
+            self.runtime.push_value(Value::Task(task_id), span)?;
+            return Ok(());
+        }
+        if self.runtime.call_depth >= self.runtime.limits.max_call_depth {
+            return Err(self.runtime.error(RuntimeErrorKind::StackOverflow, span));
         }
         let fixed_count = if function_record.rest_parameter_code == 0 {
             parameter_count
@@ -978,12 +1416,367 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         Ok(())
     }
 
+    fn send_channel(&mut self, image: &Image<'_>, span: Span) -> Result<(), RuntimeError> {
+        let value = self.runtime.pop(span)?;
+        let channel = self.runtime.pop(span)?;
+        let Value::Channel(channel_id) = channel else {
+            return Err(self.runtime.type_error("Channel", &channel, span));
+        };
+        if self.current_task_id.is_none() {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "async task context",
+                    found: "main execution context",
+                },
+                span,
+            ));
+        }
+        let pending = self.runtime.account_pending_channel_value(&value, span)?;
+        let result = loop {
+            match self.runtime.try_send_channel(channel_id, &value, span) {
+                Ok(true) => break Ok(()),
+                Ok(false) => match self.run_next_task(image, span) {
+                    Ok(true) => {
+                        if let Err(error) = self.runtime.check_resource_limits(span) {
+                            break Err(error);
+                        }
+                    }
+                    Ok(false) => break Err(self.runtime.error(RuntimeErrorKind::Deadlock, span)),
+                    Err(error) => break Err(error),
+                },
+                Err(error) => break Err(error),
+            }
+        };
+        self.runtime.release_pending_channel_value(pending);
+        result?;
+        self.runtime.push_value(Value::Null, span)
+    }
+
+    fn receive_channel(&mut self, image: &Image<'_>, span: Span) -> Result<(), RuntimeError> {
+        let channel = self.runtime.pop(span)?;
+        let Value::Channel(channel_id) = channel else {
+            return Err(self.runtime.type_error("Channel", &channel, span));
+        };
+        let Some(task_id) = self.current_task_id else {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "async task context",
+                    found: "main execution context",
+                },
+                span,
+            ));
+        };
+        if let Some(value) = self.runtime.try_receive_channel(channel_id, None, span)? {
+            return self.runtime.push_value(value, span);
+        }
+        let waiter_id = self
+            .runtime
+            .register_channel_receiver(channel_id, task_id, span)?;
+        let result = loop {
+            match self
+                .runtime
+                .try_receive_channel(channel_id, Some(waiter_id), span)
+            {
+                Ok(Some(value)) => {
+                    self.runtime
+                        .unregister_channel_receiver(channel_id, waiter_id);
+                    break Ok(value);
+                }
+                Ok(None) => match self.run_next_task(image, span) {
+                    Ok(true) => {
+                        match self
+                            .runtime
+                            .try_receive_channel(channel_id, Some(waiter_id), span)
+                        {
+                            Ok(Some(value)) => {
+                                self.runtime
+                                    .unregister_channel_receiver(channel_id, waiter_id);
+                                break Ok(value);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.runtime
+                                    .unregister_channel_receiver(channel_id, waiter_id);
+                                break Err(error);
+                            }
+                        }
+                        if let Err(error) = self.runtime.check_resource_limits(span) {
+                            self.runtime
+                                .unregister_channel_receiver(channel_id, waiter_id);
+                            break Err(error);
+                        }
+                    }
+                    Ok(false) => {
+                        self.runtime
+                            .unregister_channel_receiver(channel_id, waiter_id);
+                        break Err(self.runtime.error(RuntimeErrorKind::Deadlock, span));
+                    }
+                    Err(error) => {
+                        self.runtime
+                            .unregister_channel_receiver(channel_id, waiter_id);
+                        break Err(error);
+                    }
+                },
+                Err(error) => {
+                    self.runtime
+                        .unregister_channel_receiver(channel_id, waiter_id);
+                    break Err(error);
+                }
+            }
+        };
+        self.runtime.push_value(result?, span)
+    }
+
+    fn lock_mutex(&mut self, image: &Image<'_>, span: Span) -> Result<(), RuntimeError> {
+        let mutex = self.runtime.pop(span)?;
+        let Value::Mutex(mutex_id) = mutex else {
+            return Err(self.runtime.type_error("Mutex", &mutex, span));
+        };
+        let Some(task_id) = self.current_task_id else {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "async task context",
+                    found: "main execution context",
+                },
+                span,
+            ));
+        };
+        loop {
+            match self.runtime.try_lock_mutex(mutex_id, task_id, span) {
+                Ok(true) => break,
+                Ok(false) => match self.run_next_task(image, span) {
+                    Ok(true) => self.runtime.check_resource_limits(span)?,
+                    Ok(false) => return Err(self.runtime.error(RuntimeErrorKind::Deadlock, span)),
+                    Err(error) => return Err(error),
+                },
+                Err(error) => return Err(error),
+            }
+        }
+        self.runtime.push_value(Value::Null, span)
+    }
+
+    fn unlock_mutex(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let mutex = self.runtime.pop(span)?;
+        let Value::Mutex(mutex_id) = mutex else {
+            return Err(self.runtime.type_error("Mutex", &mutex, span));
+        };
+        let Some(task_id) = self.current_task_id else {
+            return Err(self
+                .runtime
+                .error(RuntimeErrorKind::PermissionError("mutex ownership"), span));
+        };
+        self.runtime
+            .unlock_mutex_for_task(mutex_id, task_id, span)?;
+        self.runtime.push_value(Value::Null, span)
+    }
+
+    fn execute_native_call(
+        &mut self,
+        image: &Image<'_>,
+        frames: &mut Vec<Frame>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        let mut plan = self.runtime.prepare_native_call(span)?;
+        let stack_base = self.runtime.push_native_callback_roots(&mut plan, span)?;
+        let call_site_offset = frames.last().map_or(0, |frame| frame.ip);
+        let mut callback_data = BytecodeCallbackContext {
+            vm: self as *mut _,
+            image,
+            call_site_offset,
+        };
+        let mut callback_context = NativeCallbackContext::new(
+            (&mut callback_data as *mut BytecodeCallbackContext<'_, R, W>).cast(),
+            invoke_bytecode_callback::<R, W>,
+            preflight_bytecode_callback::<R, W>,
+            span,
+        );
+        let call_result = plan.call(&mut callback_context);
+        self.runtime.stack.truncate(stack_base);
+        self.runtime.finish_native_call(call_result, span)
+    }
+
+    fn invoke_native_callback(
+        &mut self,
+        image: &Image<'_>,
+        call_site_offset: usize,
+        callable: &Value,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let (function_ref_ref, capture_bytes) = match callable {
+            Value::Function(function) => (function, 0),
+            Value::Closure(closure) => {
+                let captures = closure.captures.try_borrow().map_err(|_| {
+                    self.runtime.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "available callback captures",
+                            found: "borrowed Closure",
+                        },
+                        span,
+                    )
+                })?;
+                (
+                    &closure.function,
+                    super::estimated_capture_clone_bytes(&captures),
+                )
+            }
+            _ => {
+                return Err(self.runtime.type_error(
+                    "Function or Closure callback",
+                    callable,
+                    span,
+                ));
+            }
+        };
+        let Some(function_index) = image.functions.iter().position(|function| {
+            function.module_index == function_ref_ref.module_index
+                && function.id.as_ref() == Some(&function_ref_ref.id)
+        }) else {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("callback function does not exist"),
+                span,
+            ));
+        };
+        let function = &image.functions[function_index];
+        if function.asynchronous {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "synchronous native callback",
+                    found: "async Function",
+                },
+                span,
+            ));
+        }
+        self.runtime.ensure_memory_budget(
+            size_of::<FunctionRef>()
+                .saturating_add(super::estimated_bigint_bytes(&function_ref_ref.id))
+                .saturating_add(size_of::<FunctionRecord>())
+                .saturating_add(function_record_payload_bytes(function))
+                .saturating_add(capture_bytes)
+                .saturating_add(arguments.len().saturating_mul(size_of::<Value>()))
+                .saturating_add(super::estimate_cloned_value_payloads(arguments)),
+            span,
+        )?;
+        let function_ref = function_ref_ref.clone();
+        let captures = match callable {
+            Value::Closure(closure) => closure
+                .captures
+                .try_borrow()
+                .map_err(|_| {
+                    self.runtime.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "available callback captures",
+                            found: "borrowed Closure",
+                        },
+                        span,
+                    )
+                })?
+                .clone(),
+            Value::Function(_) => Vec::new(),
+            _ => unreachable!("callable kind was checked above"),
+        };
+        let mut owned_arguments = Vec::new();
+        owned_arguments
+            .try_reserve_exact(arguments.len())
+            .map_err(|_| {
+                self.runtime
+                    .error(RuntimeErrorKind::ResourceLimit("callback arguments"), span)
+            })?;
+        owned_arguments.extend_from_slice(arguments);
+        let request = CallRequest {
+            module_index: function_ref.module_index,
+            function_id: function_ref.id,
+            arguments: owned_arguments,
+            captures,
+            return_action: ReturnAction::PushResult,
+        };
+        let mut callback_frames = Vec::new();
+        let frame_scope = self.runtime.scopes.len();
+        let frame_stack = self.runtime.stack.len();
+        let scope_floors = self.runtime.scope_floors.len();
+        let frame_stack_bases = self.runtime.frame_stack_bases.len();
+        let capture_vectors = self.runtime.capture_vectors.len();
+        let call_depth = self.runtime.call_depth;
+        let trace_length = self.runtime.call_trace.len();
+        let storage_estimates = self.frame_storage_estimates.len();
+        let task_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let enter = self.enter_function(
+                request,
+                span,
+                call_site_offset,
+                image,
+                &mut callback_frames,
+                false,
+            );
+            enter?;
+            self.run_frames(image, &mut callback_frames)
+        }));
+        match task_state {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                self.restore_after_callback(
+                    frame_scope,
+                    frame_stack,
+                    scope_floors,
+                    frame_stack_bases,
+                    capture_vectors,
+                    call_depth,
+                    trace_length,
+                    storage_estimates,
+                );
+                Err(error)
+            }
+            Err(_) => {
+                self.restore_after_callback(
+                    frame_scope,
+                    frame_stack,
+                    scope_floors,
+                    frame_stack_bases,
+                    capture_vectors,
+                    call_depth,
+                    trace_length,
+                    storage_estimates,
+                );
+                Err(self.runtime.error(
+                    RuntimeErrorKind::Unsupported("native callback panicked"),
+                    span,
+                ))
+            }
+        }
+    }
+
+    fn restore_after_callback(
+        &mut self,
+        scope_count: usize,
+        stack_count: usize,
+        scope_floor_count: usize,
+        frame_stack_base_count: usize,
+        capture_vector_count: usize,
+        call_depth: usize,
+        trace_count: usize,
+        storage_estimate_count: usize,
+    ) {
+        self.runtime.stack.truncate(stack_count);
+        self.runtime.scopes.truncate(scope_count);
+        self.runtime.scope_floors.truncate(scope_floor_count);
+        self.runtime
+            .frame_stack_bases
+            .truncate(frame_stack_base_count);
+        self.runtime.capture_vectors.truncate(capture_vector_count);
+        self.runtime.call_depth = call_depth;
+        self.runtime.call_trace.truncate(trace_count);
+        self.frame_storage_estimates
+            .truncate(storage_estimate_count);
+        self.sync_external_memory();
+    }
+
     fn call_intrinsic(
         &mut self,
         operation: IrOp,
         span: Span,
         module_index: u32,
         image: &Image<'_>,
+        frames: &mut Vec<Frame>,
     ) -> Result<Option<CallRequest>, RuntimeError> {
         use IrOp::*;
         match operation {
@@ -1103,6 +1896,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     "NativeFunction",
                     "Iterator",
                     "Task",
+                    "Channel",
+                    "Mutex",
                     "Error",
                     "Handle",
                     "Module",
@@ -1455,9 +2250,44 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     return_action: ReturnAction::PushResult,
                 }));
             }
+            Await | Join => {
+                let value = self.runtime.pop(span)?;
+                let Value::Task(id) = value else {
+                    return Err(self.runtime.type_error("Task", &value, span));
+                };
+                let result = self.await_task(image, id, span)?;
+                self.runtime.push_value(result, span)?;
+            }
+            Spawn => self.spawn_task(span, image)?,
+            Yield => {
+                if self.current_task_id.is_none() {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "async task context",
+                            found: "main execution context",
+                        },
+                        span,
+                    ));
+                }
+                self.run_next_task(image, span)?;
+            }
+            Sleep => self.sleep_task(image, span)?,
+            Cancel => self.cancel_task(span)?,
+            ChannelNew => self.runtime.create_channel(span)?,
+            ChannelSend => self.send_channel(image, span)?,
+            ChannelRecv => self.receive_channel(image, span)?,
+            MutexNew => self.runtime.create_mutex(span)?,
+            MutexLock => self.lock_mutex(image, span)?,
+            MutexUnlock => self.unlock_mutex(span)?,
             Import | ImportDynamic => {
                 return Err(self.unsupported(span, "module import resolution"))
             }
+            NativeLoad => self.runtime.execute_native_instruction(0xB0, span, None)?,
+            NativeSymbol => self.runtime.execute_native_instruction(0xB1, span, None)?,
+            NativeCall => self.execute_native_call(image, frames, span)?,
+            NativeClose => self.runtime.execute_native_instruction(0xB3, span, None)?,
+            NativeCallback => self.runtime.execute_native_instruction(0xB4, span, None)?,
+            NativeBuffer => self.runtime.execute_native_instruction(0xB5, span, None)?,
             TailCall => return Err(self.unsupported(span, "TAIL_CALL")),
             _ => return Err(self.unsupported(span, "intrinsic runtime feature")),
         }
@@ -2053,6 +2883,27 @@ struct LoopState {
     scope_depth: usize,
 }
 
+struct BytecodeTask {
+    request: Option<CallRequest>,
+    status: BytecodeTaskStatus,
+}
+
+enum BytecodeTaskStatus {
+    Pending,
+    Running,
+    Completed(Value),
+    Failed(RuntimeError),
+    Cancelled,
+}
+
+enum BytecodeTaskStatusKind {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 struct CallRequest {
     module_index: u32,
     function_id: BigInt,
@@ -2065,6 +2916,59 @@ struct CallRequest {
 enum ReturnAction {
     PushResult,
     PushValue(Value),
+}
+
+fn bytecode_task_memory_bytes(
+    tasks: &HashMap<u64, BytecodeTask>,
+    task_capacity: usize,
+    ready_capacity: usize,
+) -> usize {
+    let entries = task_capacity
+        .saturating_mul(size_of::<(u64, BytecodeTask)>())
+        .saturating_add(ready_capacity.saturating_mul(size_of::<u64>()));
+    tasks.iter().fold(entries, |total, (id, task)| {
+        let request_bytes = task
+            .request
+            .as_ref()
+            .map(call_request_memory_bytes)
+            .unwrap_or(0);
+        let status_bytes = match &task.status {
+            BytecodeTaskStatus::Completed(value) => size_of::<Value>()
+                .saturating_add(super::estimated_unmanaged_payload_bytes(value, 0)),
+            BytecodeTaskStatus::Failed(error) => super::estimated_runtime_error_bytes(error),
+            BytecodeTaskStatus::Pending
+            | BytecodeTaskStatus::Running
+            | BytecodeTaskStatus::Cancelled => 0,
+        };
+        total
+            .saturating_add(size_of::<BytecodeTask>())
+            .saturating_add(size_of::<u64>())
+            .saturating_add(super::estimated_bigint_bytes(&BigInt::from(*id)))
+            .saturating_add(request_bytes)
+            .saturating_add(status_bytes)
+    })
+}
+
+fn call_request_memory_bytes(request: &CallRequest) -> usize {
+    request
+        .arguments
+        .capacity()
+        .saturating_mul(size_of::<Value>())
+        + super::estimate_cloned_value_payloads(&request.arguments)
+        + request
+            .captures
+            .capacity()
+            .saturating_mul(size_of::<(BigInt, BindingCell)>())
+        + request
+            .captures
+            .iter()
+            .map(|(id, _)| super::estimated_bigint_bytes(id))
+            .fold(0usize, usize::saturating_add)
+        + super::estimated_bigint_bytes(&request.function_id)
+        + match &request.return_action {
+            ReturnAction::PushResult => 0,
+            ReturnAction::PushValue(value) => super::estimated_unmanaged_payload_bytes(value, 0),
+        }
 }
 
 enum Instruction {
@@ -2515,4 +3419,26 @@ impl<'a> Cursor<'a> {
             Err(format!("trailing bytes in {section}"))
         }
     }
+}
+
+unsafe fn invoke_bytecode_callback<R: BufRead, W: Write>(
+    data: *mut std::ffi::c_void,
+    callable: &Value,
+    arguments: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    let context = unsafe { &mut *data.cast::<BytecodeCallbackContext<'_, R, W>>() };
+    let vm = unsafe { &mut *context.vm };
+    let image = unsafe { &*context.image };
+    vm.invoke_native_callback(image, context.call_site_offset, callable, arguments, span)
+}
+
+unsafe fn preflight_bytecode_callback<R: BufRead, W: Write>(
+    data: *mut std::ffi::c_void,
+    bytes: usize,
+    span: Span,
+) -> Result<(), RuntimeError> {
+    let context = unsafe { &mut *data.cast::<BytecodeCallbackContext<'_, R, W>>() };
+    let vm = unsafe { &mut *context.vm };
+    vm.runtime.ensure_memory_budget(bytes, span)
 }

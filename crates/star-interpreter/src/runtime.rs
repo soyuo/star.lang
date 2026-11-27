@@ -1,7 +1,7 @@
 //! Reference execution for literals, primitive operations, variables, and I/O.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
@@ -9,7 +9,7 @@ use std::mem::size_of;
 use std::time::{Duration, Instant};
 
 use num_bigint::Sign;
-use num_traits::Zero;
+use num_traits::{ToPrimitive, Zero};
 use star_common::SourcePosition;
 use star_compiler::Capability;
 use star_parser::Span;
@@ -31,6 +31,8 @@ use crate::{
 };
 
 pub mod collections;
+pub mod concurrency;
+pub mod ffi;
 pub mod host;
 pub mod json;
 pub mod math;
@@ -38,8 +40,10 @@ pub mod network;
 pub mod path;
 pub mod stdio;
 pub mod strings;
+pub mod worker;
 
 mod bytecode_vm;
+mod guest_concurrency;
 pub use bytecode_vm::BytecodeVm;
 
 /// The reason execution stopped.
@@ -68,6 +72,10 @@ pub enum RuntimeErrorKind {
     CompileError(String),
     /// The configured function call-depth limit was exceeded.
     StackOverflow,
+    /// A task was awaited after cancellation.
+    TaskCancelled,
+    /// A cooperative channel or mutex has no runnable task that can unblock it.
+    Deadlock,
     /// The configured statement execution limit was exceeded.
     ExecutionLimit,
     /// A configured runtime memory, operand-stack, or wall-clock ceiling was exceeded.
@@ -97,6 +105,8 @@ impl fmt::Display for RuntimeErrorKind {
             }
             Self::CompileError(reason) => write!(formatter, "compile error: {reason}"),
             Self::StackOverflow => formatter.write_str("function call-depth limit exceeded"),
+            Self::TaskCancelled => formatter.write_str("task was cancelled"),
+            Self::Deadlock => formatter.write_str("cooperative scheduler deadlock"),
             Self::ExecutionLimit => formatter.write_str("execution step limit exceeded"),
             Self::ResourceLimit(resource) => write!(formatter, "{resource} limit exceeded"),
             Self::UnsupportedInstruction(opcode) => {
@@ -221,8 +231,8 @@ impl std::error::Error for RuntimeError {}
 ///
 /// The first environment is the module-global scope. Nested `SCOPE` nodes add
 /// temporary lexical environments; ordinary reads and stores walk outward.
-/// This execution slice runs synchronous named functions. Calling an
-/// `ASYNC_FUNC` returns `Unsupported` until task scheduling is implemented.
+/// Source `ASYNC_FUNC` calls create cooperative tasks that run when scheduled
+/// or awaited; bytecode task scheduling belongs to `BytecodeVm`.
 pub struct Interpreter<R: BufRead, W: Write> {
     input: StandardInput<R>,
     output: BufferedOutput<W>,
@@ -242,6 +252,56 @@ pub struct Interpreter<R: BufRead, W: Write> {
     external_memory_bytes: usize,
     execution_started: Option<Instant>,
     executed_steps: u64,
+    tasks: HashMap<u64, GuestTask>,
+    ready_tasks: VecDeque<u64>,
+    next_task_id: u64,
+    current_task_id: Option<u64>,
+    channels: HashMap<u64, GuestChannel>,
+    next_channel_id: u64,
+    next_channel_waiter_id: u64,
+    mutexes: HashMap<u64, GuestMutex>,
+    next_mutex_id: u64,
+    pending_channel_message_bytes: usize,
+}
+
+pub(crate) struct NativeCallPlan {
+    function: ffi::NativeFunctionHandle,
+    arguments: Vec<ffi::NativeValue>,
+    callback_roots: Vec<Value>,
+    capabilities: BTreeSet<Capability>,
+}
+
+impl NativeCallPlan {
+    pub(crate) fn call(
+        &self,
+        callback_context: &mut ffi::NativeCallbackContext,
+    ) -> Result<ffi::NativeValue, ffi::NativeCallError> {
+        self.function
+            .call_scoped(&self.arguments, &self.capabilities, Some(callback_context))
+    }
+
+    fn take_callback_roots(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.callback_roots)
+    }
+}
+
+#[derive(Debug)]
+struct GuestChannel {
+    capacity: usize,
+    queue: VecDeque<Value>,
+    waiting_receivers: VecDeque<GuestChannelReceiver>,
+}
+
+#[derive(Debug)]
+struct GuestChannelReceiver {
+    waiter_id: u64,
+    task_id: u64,
+    transfer: Option<Value>,
+}
+
+#[derive(Debug, Default)]
+struct GuestMutex {
+    owner: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -261,6 +321,32 @@ struct ExecutionSnapshot {
     capture_lengths: Vec<usize>,
     call_depth: usize,
     call_trace_depth: usize,
+}
+
+#[derive(Clone, Debug)]
+enum GuestTaskStatus {
+    Pending,
+    Running,
+    Completed(Value),
+    Failed(RuntimeError),
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GuestTaskStatusKind {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+struct GuestTask {
+    function: ResolvedFunction,
+    arguments: Vec<Value>,
+    captures: Vec<(BigInt, BindingCell)>,
+    status: GuestTaskStatus,
 }
 
 impl<R: BufRead, W: Write> Interpreter<R, W> {
@@ -285,6 +371,16 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             external_memory_bytes: 0,
             execution_started: None,
             executed_steps: 0,
+            tasks: HashMap::new(),
+            ready_tasks: VecDeque::new(),
+            next_task_id: 1,
+            current_task_id: None,
+            channels: HashMap::new(),
+            next_channel_id: 1,
+            next_channel_waiter_id: 1,
+            mutexes: HashMap::new(),
+            next_mutex_id: 1,
+            pending_channel_message_bytes: 0,
         }
     }
 
@@ -378,7 +474,10 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         estimated = estimated
             .saturating_add(self.external_memory_bytes)
             .saturating_add(self.call_trace_memory_bytes().saturating_mul(2))
-            .saturating_add(self.call_frame_bookkeeping_memory_bytes());
+            .saturating_add(self.call_frame_bookkeeping_memory_bytes())
+            .saturating_add(self.task_memory_bytes())
+            .saturating_add(self.concurrent_primitive_memory_bytes())
+            .saturating_add(self.pending_channel_message_bytes);
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             self.collect_garbage().map_err(|_| {
                 self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
@@ -397,7 +496,10 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             estimated = estimated
                 .saturating_add(self.external_memory_bytes)
                 .saturating_add(self.call_trace_memory_bytes().saturating_mul(2))
-                .saturating_add(self.call_frame_bookkeeping_memory_bytes());
+                .saturating_add(self.call_frame_bookkeeping_memory_bytes())
+                .saturating_add(self.task_memory_bytes())
+                .saturating_add(self.concurrent_primitive_memory_bytes())
+                .saturating_add(self.pending_channel_message_bytes);
         }
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             return Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span));
@@ -430,6 +532,80 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     .capacity()
                     .saturating_mul(size_of::<usize>()),
             )
+    }
+
+    fn task_memory_bytes(&self) -> usize {
+        self.tasks
+            .capacity()
+            .saturating_mul(size_of::<(u64, GuestTask)>())
+            .saturating_add(self.ready_tasks.capacity().saturating_mul(size_of::<u64>()))
+            .saturating_add(self.tasks.values().fold(0usize, |total, task| {
+                total
+                    .saturating_add(estimated_function_clone_bytes(&task.function))
+                    .saturating_add(task.arguments.capacity().saturating_mul(size_of::<Value>()))
+                    .saturating_add(estimate_cloned_value_payloads(&task.arguments))
+                    .saturating_add(estimated_capture_clone_bytes(&task.captures))
+                    .saturating_add(match &task.status {
+                        GuestTaskStatus::Completed(value) => size_of::<Value>()
+                            .saturating_add(estimated_unmanaged_payload_bytes(value, 0)),
+                        GuestTaskStatus::Failed(error) => estimated_runtime_error_bytes(error),
+                        GuestTaskStatus::Pending
+                        | GuestTaskStatus::Running
+                        | GuestTaskStatus::Cancelled => 0,
+                    })
+            }))
+    }
+
+    fn concurrent_primitive_memory_bytes(&self) -> usize {
+        self.channels
+            .capacity()
+            .saturating_mul(size_of::<(u64, GuestChannel)>())
+            .saturating_add(self.channels.values().fold(0usize, |total, channel| {
+                total
+                    .saturating_add(channel.queue.capacity().saturating_mul(size_of::<Value>()))
+                    .saturating_add(
+                        channel
+                            .waiting_receivers
+                            .capacity()
+                            .saturating_mul(size_of::<GuestChannelReceiver>()),
+                    )
+                    .saturating_add(
+                        channel
+                            .queue
+                            .iter()
+                            .map(|value| estimated_unmanaged_payload_bytes(value, 0))
+                            .fold(0usize, usize::saturating_add),
+                    )
+                    .saturating_add(
+                        channel
+                            .waiting_receivers
+                            .iter()
+                            .filter_map(|receiver| receiver.transfer.as_ref())
+                            .map(|value| estimated_unmanaged_payload_bytes(value, 0))
+                            .fold(0usize, usize::saturating_add),
+                    )
+            }))
+            .saturating_add(
+                self.mutexes
+                    .capacity()
+                    .saturating_mul(size_of::<(u64, GuestMutex)>()),
+            )
+    }
+
+    fn task_status_kind_and_copy_bytes(&self, id: u64) -> Option<(GuestTaskStatusKind, usize)> {
+        self.tasks.get(&id).map(|task| match &task.status {
+            GuestTaskStatus::Pending => (GuestTaskStatusKind::Pending, 0),
+            GuestTaskStatus::Running => (GuestTaskStatusKind::Running, 0),
+            GuestTaskStatus::Completed(value) => (
+                GuestTaskStatusKind::Completed,
+                size_of::<Value>().saturating_add(estimated_unmanaged_payload_bytes(value, 0)),
+            ),
+            GuestTaskStatus::Failed(error) => (
+                GuestTaskStatusKind::Failed,
+                estimated_runtime_error_bytes(error),
+            ),
+            GuestTaskStatus::Cancelled => (GuestTaskStatusKind::Cancelled, 0),
+        })
     }
 
     pub(crate) fn call_frame_bookkeeping_growth_bytes(&self) -> usize {
@@ -1033,6 +1209,275 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         Ok(())
     }
 
+    fn create_task(
+        &mut self,
+        function: ResolvedFunction,
+        arguments: Vec<Value>,
+        captures: Vec<(BigInt, BindingCell)>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let parameter_count = function.parameter_ids.len();
+        let arity_matches = if function.variadic {
+            arguments.len() >= parameter_count.saturating_sub(1)
+        } else {
+            arguments.len() == parameter_count
+        };
+        if !arity_matches {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "argument count matching function signature",
+                    found: "wrong argument count",
+                },
+                span,
+            ));
+        }
+        let Some(next_id) = self.next_task_id.checked_add(1) else {
+            return Err(self.error(RuntimeErrorKind::ResourceLimit("task identifiers"), span));
+        };
+        let task_bytes = estimated_function_clone_bytes(&function)
+            .saturating_add(arguments.capacity().saturating_mul(size_of::<Value>()))
+            .saturating_add(estimate_cloned_value_payloads(&arguments))
+            .saturating_add(estimated_capture_clone_bytes(&captures))
+            .saturating_add(size_of::<GuestTask>())
+            .saturating_add(size_of::<u64>() * 2)
+            .saturating_add(
+                projected_capacity_after_push(self.tasks.len(), self.tasks.capacity())
+                    .saturating_sub(self.tasks.capacity())
+                    .saturating_mul(size_of::<(u64, GuestTask)>()),
+            )
+            .saturating_add(
+                projected_capacity_after_push(self.ready_tasks.len(), self.ready_tasks.capacity())
+                    .saturating_sub(self.ready_tasks.capacity())
+                    .saturating_mul(size_of::<u64>()),
+            );
+        self.ensure_memory_budget(task_bytes, span)?;
+        self.tasks
+            .try_reserve(1)
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("task registry"), span))?;
+        self.ready_tasks
+            .try_reserve(1)
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("task queue"), span))?;
+        let id = self.next_task_id;
+        self.next_task_id = next_id;
+        self.tasks.insert(
+            id,
+            GuestTask {
+                function,
+                arguments,
+                captures,
+                status: GuestTaskStatus::Pending,
+            },
+        );
+        self.ready_tasks.push_back(id);
+        Ok(Value::Task(id))
+    }
+
+    fn run_task(&mut self, id: u64, span: Span) -> Result<Value, RuntimeError> {
+        let Some((status, clone_bytes)) = self.task_status_kind_and_copy_bytes(id) else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("task does not exist"),
+                span,
+            ));
+        };
+        match status {
+            GuestTaskStatusKind::Completed => {
+                self.ensure_memory_budget(clone_bytes, span)?;
+                let Some(GuestTaskStatus::Completed(value)) =
+                    self.tasks.get(&id).map(|task| &task.status)
+                else {
+                    return Err(
+                        self.error(RuntimeErrorKind::ReferenceError("task state changed"), span)
+                    );
+                };
+                return Ok(value.clone());
+            }
+            GuestTaskStatusKind::Failed => {
+                self.ensure_memory_budget(clone_bytes, span)?;
+                let Some(GuestTaskStatus::Failed(error)) =
+                    self.tasks.get(&id).map(|task| &task.status)
+                else {
+                    return Err(
+                        self.error(RuntimeErrorKind::ReferenceError("task state changed"), span)
+                    );
+                };
+                return Err(error.clone());
+            }
+            GuestTaskStatusKind::Cancelled => {
+                return Err(self.error(RuntimeErrorKind::TaskCancelled, span))
+            }
+            GuestTaskStatusKind::Running => {
+                return Err(self.error(
+                    RuntimeErrorKind::ReferenceError("task cannot await itself while running"),
+                    span,
+                ))
+            }
+            GuestTaskStatusKind::Pending => {}
+        }
+        let Some(clone_bytes) = self.tasks.get(&id).map(|task| {
+            let clone_bytes = estimated_function_clone_bytes(&task.function)
+                .saturating_add(task.arguments.capacity().saturating_mul(size_of::<Value>()))
+                .saturating_add(estimate_cloned_value_payloads(&task.arguments))
+                .saturating_add(estimated_capture_clone_bytes(&task.captures));
+            clone_bytes
+        }) else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("task does not exist"),
+                span,
+            ));
+        };
+        self.ensure_memory_budget(clone_bytes, span)?;
+        let task = self.tasks.get_mut(&id).expect("task checked above");
+        task.status = GuestTaskStatus::Running;
+        let function = task.function.clone();
+        let arguments = task.arguments.clone();
+        let captures = task.captures.clone();
+        let previous_task = self.current_task_id.replace(id);
+        let result = self.invoke_function_body(function, arguments, captures, span);
+        self.current_task_id = previous_task;
+        self.cleanup_task_concurrency(id);
+        let status_copy_bytes = match &result {
+            Ok(value) => {
+                size_of::<Value>().saturating_add(estimated_unmanaged_payload_bytes(value, 0))
+            }
+            Err(error) => estimated_runtime_error_bytes(error),
+        };
+        if self.ensure_memory_budget(status_copy_bytes, span).is_err() {
+            let error = RuntimeError {
+                kind: RuntimeErrorKind::ResourceLimit("memory"),
+                span,
+                stack_trace: Vec::new(),
+                stack_trace_truncated: true,
+            };
+            if let Some(task) = self.tasks.get_mut(&id) {
+                task.status = GuestTaskStatus::Failed(error.clone());
+            }
+            return Err(error);
+        }
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.status = match &result {
+                Ok(value) => GuestTaskStatus::Completed(value.clone()),
+                Err(error) => GuestTaskStatus::Failed(error.clone()),
+            };
+        }
+        result
+    }
+
+    fn run_next_task(&mut self, span: Span) -> Result<bool, RuntimeError> {
+        while let Some(id) = self.ready_tasks.pop_front() {
+            let pending = self
+                .tasks
+                .get(&id)
+                .is_some_and(|task| matches!(task.status, GuestTaskStatus::Pending));
+            if pending {
+                let _ = self.run_task(id, span);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn await_task(&mut self, id: u64, span: Span) -> Result<Value, RuntimeError> {
+        loop {
+            let Some((status, _)) = self.task_status_kind_and_copy_bytes(id) else {
+                return Err(self.error(
+                    RuntimeErrorKind::ReferenceError("task does not exist"),
+                    span,
+                ));
+            };
+            match status {
+                GuestTaskStatusKind::Completed
+                | GuestTaskStatusKind::Failed
+                | GuestTaskStatusKind::Cancelled
+                | GuestTaskStatusKind::Running => return self.run_task(id, span),
+                GuestTaskStatusKind::Pending => {
+                    if !self.run_next_task(span)? {
+                        return self.run_task(id, span);
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn_task(&mut self, span: Span) -> Result<(), RuntimeError> {
+        if !self.host_services.task_creation_enabled() {
+            return Err(self.error(RuntimeErrorKind::PermissionError("task.spawn"), span));
+        }
+        let callable = self.pop(span)?;
+        let (module_index, function_id, capture_bytes) = match &callable {
+            Value::Function(function_ref) => (function_ref.module_index, &function_ref.id, 0usize),
+            Value::Closure(closure) => {
+                let capture_bytes = {
+                    let captures = closure.captures.borrow();
+                    estimated_capture_clone_bytes(&captures)
+                };
+                (
+                    closure.function.module_index,
+                    &closure.function.id,
+                    capture_bytes,
+                )
+            }
+            other => return Err(self.type_error("Function or Closure", other, span)),
+        };
+        if module_index != 0 {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("function belongs to another module"),
+                span,
+            ));
+        }
+        let function_clone_bytes = self
+            .functions
+            .get(function_id)
+            .map(estimated_function_clone_bytes)
+            .ok_or_else(|| {
+                self.error(
+                    RuntimeErrorKind::ReferenceError("function does not exist"),
+                    span,
+                )
+            })?;
+        self.ensure_memory_budget(function_clone_bytes.saturating_add(capture_bytes), span)?;
+        let function = self.functions.get(function_id).cloned().ok_or_else(|| {
+            self.error(
+                RuntimeErrorKind::ReferenceError("function does not exist"),
+                span,
+            )
+        })?;
+        let captures = match &callable {
+            Value::Closure(closure) => closure.captures.borrow().clone(),
+            _ => Vec::new(),
+        };
+        let task = self.create_task(function, Vec::new(), captures, span)?;
+        self.push_value(task, span)
+    }
+
+    fn await_instruction(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let Value::Task(id) = value else {
+            return Err(self.type_error("Task", &value, span));
+        };
+        let result = self.await_task(id, span)?;
+        self.push_value(result, span)
+    }
+
+    fn cancel_task(&mut self, span: Span) -> Result<(), RuntimeError> {
+        let value = self.pop(span)?;
+        let Value::Task(id) = value else {
+            return Err(self.type_error("Task", &value, span));
+        };
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("task does not exist"),
+                span,
+            ));
+        };
+        let accepted = if matches!(task.status, GuestTaskStatus::Pending) {
+            task.status = GuestTaskStatus::Cancelled;
+            true
+        } else {
+            false
+        };
+        self.push_value(Value::Bool(accepted), span)
+    }
+
     fn invoke_function(
         &mut self,
         function: ResolvedFunction,
@@ -1040,13 +1485,20 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         captures: Vec<(BigInt, BindingCell)>,
         span: Span,
     ) -> Result<Value, RuntimeError> {
-        let argument_count = arguments.len();
         if function.kind == FunctionKind::Asynchronous {
-            return Err(self.error(
-                RuntimeErrorKind::Unsupported("asynchronous function scheduling"),
-                span,
-            ));
+            return self.create_task(function, arguments, captures, span);
         }
+        self.invoke_function_body(function, arguments, captures, span)
+    }
+
+    fn invoke_function_body(
+        &mut self,
+        function: ResolvedFunction,
+        arguments: Vec<Value>,
+        captures: Vec<(BigInt, BindingCell)>,
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let argument_count = arguments.len();
         let parameter_count = function.parameter_ids.len();
         let arity_matches = if function.variadic {
             argument_count >= parameter_count.saturating_sub(1)
@@ -1799,6 +2251,77 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x52) => self.delete(span),
             InstructionOpcode::Extended(0x53) => self.load(span, true),
             InstructionOpcode::Extended(0x54) => self.store_global(span),
+            InstructionOpcode::Extended(0xA1 | 0xA5) => self.await_instruction(span),
+            InstructionOpcode::Extended(0xA2) => self.spawn_task(span),
+            InstructionOpcode::Extended(0xA3) => {
+                if self.current_task_id.is_none() {
+                    Err(self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "async task context",
+                            found: "main execution context",
+                        },
+                        span,
+                    ))
+                } else {
+                    self.run_next_task(span).map(|_| ())
+                }
+            }
+            InstructionOpcode::Extended(0xA4) => {
+                if self.current_task_id.is_none() {
+                    Err(self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "async task context",
+                            found: "main execution context",
+                        },
+                        span,
+                    ))
+                } else {
+                    let value = self.pop(span)?;
+                    let Value::Int(milliseconds) = value else {
+                        return Err(self.type_error("nonnegative Int milliseconds", &value, span));
+                    };
+                    let milliseconds = milliseconds.to_u64().ok_or_else(|| {
+                        self.error(
+                            RuntimeErrorKind::TypeError {
+                                expected: "nonnegative representable Int milliseconds",
+                                found: "Int",
+                            },
+                            span,
+                        )
+                    })?;
+                    let duration = Duration::from_millis(milliseconds);
+                    if self.execution_started.is_some_and(|started| {
+                        started.elapsed().saturating_add(duration) >= self.limits.max_execution_time
+                    }) {
+                        return Err(
+                            self.error(RuntimeErrorKind::ResourceLimit("execution time"), span)
+                        );
+                    }
+                    let Some(deadline) = Instant::now().checked_add(duration) else {
+                        return Err(
+                            self.error(RuntimeErrorKind::ResourceLimit("execution time"), span)
+                        );
+                    };
+                    while Instant::now() < deadline {
+                        if !self.run_next_task(span)? {
+                            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                            break;
+                        }
+                        self.check_resource_limits(span)?;
+                    }
+                    self.push_value(Value::Null, span)
+                }
+            }
+            InstructionOpcode::Extended(0xA6) => self.cancel_task(span),
+            InstructionOpcode::Extended(0xA7) => self.create_channel(span),
+            InstructionOpcode::Extended(0xA8) => self.send_channel(span),
+            InstructionOpcode::Extended(0xA9) => self.receive_channel(span),
+            InstructionOpcode::Extended(0xAA) => self.create_mutex(span),
+            InstructionOpcode::Extended(0xAB) => self.acquire_mutex(span),
+            InstructionOpcode::Extended(0xAC) => self.release_mutex(span),
+            InstructionOpcode::Extended(opcode @ 0xB0..=0xB5) => {
+                self.execute_native_instruction(opcode, span, None)
+            }
             InstructionOpcode::Basic(_) | InstructionOpcode::Extended(_) => Err(self.error(
                 RuntimeErrorKind::UnsupportedInstruction(instruction.opcode),
                 span,
@@ -1808,6 +2331,428 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             self.collect_if_needed();
         }
         result
+    }
+
+    pub(crate) fn execute_native_instruction(
+        &mut self,
+        opcode: u8,
+        span: Span,
+        callback_context: Option<&mut ffi::NativeCallbackContext>,
+    ) -> Result<(), RuntimeError> {
+        use ffi::{NativeBuffer, NativeHandle, NativeLibraryHandle, NativeSignature};
+
+        let capabilities = self.host_services.capabilities().clone();
+        if !capabilities.contains(&Capability::Ffi) {
+            return Err(self.error(RuntimeErrorKind::PermissionError("ffi"), span));
+        }
+        let error = |this: &Self, error: ffi::FfiError, span| match error {
+            ffi::FfiError::PermissionDenied => {
+                this.error(RuntimeErrorKind::PermissionError("ffi"), span)
+            }
+            ffi::FfiError::Load(message) => this.error(RuntimeErrorKind::IOError(message), span),
+            ffi::FfiError::Symbol(_) => this.error(
+                RuntimeErrorKind::ReferenceError("native symbol not found"),
+                span,
+            ),
+            ffi::FfiError::LibraryClosed => this.error(
+                RuntimeErrorKind::ReferenceError("native library is closed"),
+                span,
+            ),
+            _ => this.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "valid native handle, signature, and arguments",
+                    found: "invalid native call",
+                },
+                span,
+            ),
+        };
+
+        match opcode {
+            0xB0 => {
+                let path = self.pop(span)?;
+                let Value::String(path) = path else {
+                    return Err(self.type_error("String native library path", &path, span));
+                };
+                let library = NativeLibraryHandle::load(path, &capabilities)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                self.push_value(Value::Handle(NativeHandle::Library(library)), span)
+            }
+            0xB1 => {
+                let signature = self.pop(span)?;
+                let name = self.pop(span)?;
+                let library = self.pop(span)?;
+                let Value::String(signature) = signature else {
+                    return Err(self.type_error(
+                        "String native function signature",
+                        &signature,
+                        span,
+                    ));
+                };
+                let Value::String(name) = name else {
+                    return Err(self.type_error("String native symbol name", &name, span));
+                };
+                let Value::Handle(NativeHandle::Library(library)) = library else {
+                    return Err(self.type_error("native library Handle", &library, span));
+                };
+                let signature = NativeSignature::parse(&signature)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                let function = library
+                    .symbol(&name, signature, &capabilities)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                self.push_value(Value::Handle(NativeHandle::Function(function)), span)
+            }
+            0xB2 => {
+                let mut plan = self.prepare_native_call(span)?;
+                let stack_base = self.push_native_callback_roots(&mut plan, span)?;
+                let mut source_context;
+                let context = if let Some(context) = callback_context {
+                    context
+                } else {
+                    source_context = ffi::NativeCallbackContext::new(
+                        self as *mut Self as *mut std::ffi::c_void,
+                        invoke_interpreter_callback::<R, W>,
+                        preflight_interpreter_callback::<R, W>,
+                        span,
+                    );
+                    &mut source_context
+                };
+                let call_result = plan.call(context);
+                self.stack.truncate(stack_base);
+                self.finish_native_call(call_result, span)
+            }
+            0xB3 => {
+                let library = self.pop(span)?;
+                let Value::Handle(NativeHandle::Library(library)) = library else {
+                    return Err(self.type_error("native library Handle", &library, span));
+                };
+                library
+                    .close(&capabilities)
+                    .map_err(|error_value| error(self, error_value, span))
+            }
+            0xB4 => {
+                let signature = self.pop(span)?;
+                let callable = self.pop(span)?;
+                let Value::String(signature) = signature else {
+                    return Err(self.type_error(
+                        "String native callback signature",
+                        &signature,
+                        span,
+                    ));
+                };
+                let signature = NativeSignature::parse(&signature)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                let callback = ffi::NativeCallbackHandle::new(callable, signature, &capabilities)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                self.ensure_memory_budget(callback.estimated_bytes(), span)?;
+                self.push_value(Value::Handle(NativeHandle::Callback(callback)), span)
+            }
+            0xB5 => {
+                let length = self.pop(span)?;
+                let Value::Int(length) = length else {
+                    return Err(self.type_error("nonnegative Int buffer length", &length, span));
+                };
+                let length = length.to_string().parse::<usize>().map_err(|_| {
+                    self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "nonnegative Int buffer length",
+                            found: "Int",
+                        },
+                        span,
+                    )
+                })?;
+                self.ensure_memory_budget(length, span)?;
+                let buffer = NativeBuffer::new(length, self.limits.max_memory_bytes)
+                    .map_err(|error_value| error(self, error_value, span))?;
+                self.push_value(Value::Handle(NativeHandle::Buffer(buffer)), span)
+            }
+            _ => Err(self.error(
+                RuntimeErrorKind::UnsupportedInstruction(InstructionOpcode::Extended(opcode)),
+                span,
+            )),
+        }
+    }
+
+    pub(crate) fn prepare_native_call(
+        &mut self,
+        span: Span,
+    ) -> Result<NativeCallPlan, RuntimeError> {
+        use ffi::{NativeHandle, NativeValue};
+
+        let function = self.pop(span)?;
+        let count = self.pop(span)?;
+        let Value::Handle(NativeHandle::Function(function)) = function else {
+            return Err(self.type_error("native function Handle", &function, span));
+        };
+        let Value::Int(count) = count else {
+            return Err(self.type_error("Int native argument count", &count, span));
+        };
+        let count = count.to_string().parse::<usize>().map_err(|_| {
+            self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "nonnegative native argument count",
+                    found: "Int",
+                },
+                span,
+            )
+        })?;
+        if count != function.signature().arguments().len() {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "argument count matching native signature",
+                    found: "Int",
+                },
+                span,
+            ));
+        }
+        self.ensure_memory_budget(
+            count
+                .saturating_mul(size_of::<NativeValue>())
+                .saturating_add(count.saturating_mul(size_of::<Value>())),
+            span,
+        )?;
+        let mut arguments = Vec::new();
+        arguments
+            .try_reserve_exact(count)
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("native arguments"), span))?;
+        let mut callback_roots = Vec::new();
+        callback_roots.try_reserve(count).map_err(|_| {
+            self.error(
+                RuntimeErrorKind::ResourceLimit("native callback roots"),
+                span,
+            )
+        })?;
+        for _ in 0..count {
+            let value = self.pop(span)?;
+            arguments.push(match value {
+                Value::Int(value) => NativeValue::Int(value),
+                Value::Float(value) => NativeValue::Float(value),
+                Value::Bool(value) => NativeValue::Bool(value),
+                Value::String(value) => NativeValue::String(value),
+                Value::Handle(NativeHandle::Buffer(buffer)) => NativeValue::Buffer(buffer),
+                Value::Handle(NativeHandle::Callback(callback)) => {
+                    let callable_ref = callback.callable();
+                    let callable_bytes = match callable_ref {
+                        Value::Function(function) => size_of::<FunctionRef>()
+                            .saturating_add(estimated_bigint_bytes(&function.id)),
+                        Value::Closure(closure) => size_of::<FunctionRef>()
+                            .saturating_add(estimated_bigint_bytes(&closure.function.id))
+                            .saturating_add(
+                                closure
+                                    .captures
+                                    .try_borrow()
+                                    .map(|captures| estimated_capture_clone_bytes(&captures))
+                                    .unwrap_or(0),
+                            ),
+                        _ => 0,
+                    };
+                    self.ensure_memory_budget(callable_bytes, span)?;
+                    let callable = callable_ref.clone();
+                    callback_roots.push(callable);
+                    NativeValue::Callback(callback)
+                }
+                value => {
+                    return Err(self.type_error("C-compatible native argument", &value, span));
+                }
+            });
+        }
+        arguments.reverse();
+        callback_roots.reverse();
+        Ok(NativeCallPlan {
+            function,
+            arguments,
+            callback_roots,
+            capabilities: self.host_services.capabilities().clone(),
+        })
+    }
+
+    pub(crate) fn push_native_callback_roots(
+        &mut self,
+        plan: &mut NativeCallPlan,
+        span: Span,
+    ) -> Result<usize, RuntimeError> {
+        let stack_base = self.stack.len();
+        for root in plan.take_callback_roots() {
+            if let Err(error) = self.push_value(root, span) {
+                self.stack.truncate(stack_base);
+                return Err(error);
+            }
+        }
+        Ok(stack_base)
+    }
+
+    pub(crate) fn finish_native_call(
+        &mut self,
+        call_result: Result<ffi::NativeValue, ffi::NativeCallError>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        use ffi::{NativeHandle, NativeValue};
+
+        let result = match call_result {
+            Ok(value) => value,
+            Err(ffi::NativeCallError::Runtime(error)) => return Err(error),
+            Err(ffi::NativeCallError::Ffi(error)) => match error {
+                ffi::FfiError::PermissionDenied => {
+                    return Err(self.error(RuntimeErrorKind::PermissionError("ffi"), span));
+                }
+                ffi::FfiError::Load(message) => {
+                    return Err(self.error(RuntimeErrorKind::IOError(message), span));
+                }
+                ffi::FfiError::Symbol(_) => {
+                    return Err(self.error(
+                        RuntimeErrorKind::ReferenceError("native symbol not found"),
+                        span,
+                    ));
+                }
+                ffi::FfiError::LibraryClosed => {
+                    return Err(self.error(
+                        RuntimeErrorKind::ReferenceError("native library is closed"),
+                        span,
+                    ));
+                }
+                _ => {
+                    return Err(self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "valid native handle, signature, and arguments",
+                            found: "invalid native call",
+                        },
+                        span,
+                    ));
+                }
+            },
+        };
+        let value = match result {
+            NativeValue::Void => Value::Null,
+            NativeValue::Int(value) => Value::Int(value),
+            NativeValue::Float(value) => Value::Float(value),
+            NativeValue::Bool(value) => Value::Bool(value),
+            NativeValue::String(value) => Value::String(value),
+            NativeValue::Buffer(value) => Value::Handle(NativeHandle::Buffer(value)),
+            NativeValue::Callback(value) => Value::Handle(NativeHandle::Callback(value)),
+        };
+        self.push_value(value, span)
+    }
+
+    fn invoke_native_callback(
+        &mut self,
+        callable: &Value,
+        arguments: &[Value],
+        span: Span,
+    ) -> Result<Value, RuntimeError> {
+        let (function_ref_ref, capture_bytes) = match callable {
+            Value::Function(function) => (function, 0),
+            Value::Closure(closure) => {
+                let captures = closure.captures.try_borrow().map_err(|_| {
+                    self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "available callback captures",
+                            found: "borrowed Closure",
+                        },
+                        span,
+                    )
+                })?;
+                (&closure.function, estimated_capture_clone_bytes(&captures))
+            }
+            _ => {
+                return Err(self.type_error("Function or Closure callback", callable, span));
+            }
+        };
+        if function_ref_ref.module_index != 0 {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("callback function does not exist"),
+                span,
+            ));
+        }
+        let Some((function_bytes, asynchronous)) =
+            self.functions.get(&function_ref_ref.id).map(|function| {
+                (
+                    estimated_function_clone_bytes(function),
+                    function.kind == FunctionKind::Asynchronous,
+                )
+            })
+        else {
+            return Err(self.error(
+                RuntimeErrorKind::ReferenceError("callback function does not exist"),
+                span,
+            ));
+        };
+        if asynchronous {
+            return Err(self.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "synchronous native callback",
+                    found: "async Function",
+                },
+                span,
+            ));
+        }
+        let argument_bytes = arguments
+            .len()
+            .saturating_mul(size_of::<Value>())
+            .saturating_add(estimate_cloned_value_payloads(arguments));
+        self.ensure_memory_budget(
+            size_of::<FunctionRef>()
+                .saturating_add(estimated_bigint_bytes(&function_ref_ref.id))
+                .saturating_add(function_bytes)
+                .saturating_add(capture_bytes)
+                .saturating_add(argument_bytes),
+            span,
+        )?;
+        let function_ref = function_ref_ref.clone();
+        let function = self
+            .functions
+            .get(&function_ref.id)
+            .cloned()
+            .ok_or_else(|| {
+                self.error(
+                    RuntimeErrorKind::ReferenceError("callback function does not exist"),
+                    span,
+                )
+            })?;
+        let captures = match callable {
+            Value::Closure(closure) => closure
+                .captures
+                .try_borrow()
+                .map_err(|_| {
+                    self.error(
+                        RuntimeErrorKind::TypeError {
+                            expected: "available callback captures",
+                            found: "borrowed Closure",
+                        },
+                        span,
+                    )
+                })?
+                .clone(),
+            _ => Vec::new(),
+        };
+        let mut owned_arguments = Vec::new();
+        owned_arguments
+            .try_reserve_exact(arguments.len())
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("callback arguments"), span))?;
+        owned_arguments.extend_from_slice(arguments);
+        let stack_base = self.stack.len();
+        let scope_count = self.scopes.len();
+        let scope_floor_count = self.scope_floors.len();
+        let frame_stack_base_count = self.frame_stack_bases.len();
+        let capture_vector_count = self.capture_vectors.len();
+        let call_depth = self.call_depth;
+        let trace_count = self.call_trace.len();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.invoke_function(function, owned_arguments, captures, span)
+        })) {
+            Ok(result) => result,
+            Err(_) => {
+                self.stack.truncate(stack_base);
+                self.scopes.truncate(scope_count);
+                self.scope_floors.truncate(scope_floor_count);
+                self.frame_stack_bases.truncate(frame_stack_base_count);
+                self.capture_vectors.truncate(capture_vector_count);
+                self.call_depth = call_depth;
+                self.call_trace.truncate(trace_count);
+                Err(self.error(
+                    RuntimeErrorKind::Unsupported("native callback panicked"),
+                    span,
+                ))
+            }
+        }
     }
 
     fn to_int(&mut self, span: Span) -> Result<(), RuntimeError> {
@@ -1866,7 +2811,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             | Value::Char(_)
             | Value::Function(_)
             | Value::Closure(_)
-            | Value::Object(_) => true,
+            | Value::Object(_)
+            | Value::Handle(_)
+            | Value::Task(_)
+            | Value::Channel(_)
+            | Value::Mutex(_) => true,
         };
         self.push_value(Value::Bool(truthy), span)?;
         Ok(())
@@ -3023,6 +3972,7 @@ fn estimated_key_clone_bytes(value: &Value, depth: usize) -> usize {
         | Value::Function(_)
         | Value::Closure(_)
         | Value::Object(_) => 0,
+        Value::Handle(_) | Value::Task(_) | Value::Channel(_) | Value::Mutex(_) => 0,
     }
 }
 
@@ -3048,12 +3998,52 @@ fn estimated_unmanaged_payload_bytes(value: &Value, depth: usize) -> usize {
         | Value::Set(_)
         | Value::Iterator(_)
         | Value::Closure(_)
-        | Value::Object(_) => 0,
+        | Value::Object(_)
+        | Value::Task(_)
+        | Value::Channel(_)
+        | Value::Mutex(_) => 0,
+        Value::Handle(handle) => handle.estimated_bytes(),
     }
 }
 
 fn estimated_bigint_bytes(value: &BigInt) -> usize {
     usize::try_from(value.bits().saturating_add(7) / 8).unwrap_or(usize::MAX)
+}
+
+fn estimated_runtime_error_bytes(error: &RuntimeError) -> usize {
+    let message_bytes = match &error.kind {
+        RuntimeErrorKind::IOError(message) | RuntimeErrorKind::CompileError(message) => {
+            message.capacity()
+        }
+        RuntimeErrorKind::StackUnderflow
+        | RuntimeErrorKind::TypeError { .. }
+        | RuntimeErrorKind::DivisionByZero
+        | RuntimeErrorKind::ReferenceError(_)
+        | RuntimeErrorKind::IndexError(_)
+        | RuntimeErrorKind::PermissionError(_)
+        | RuntimeErrorKind::StackOverflow
+        | RuntimeErrorKind::TaskCancelled
+        | RuntimeErrorKind::Deadlock
+        | RuntimeErrorKind::ExecutionLimit
+        | RuntimeErrorKind::ResourceLimit(_)
+        | RuntimeErrorKind::UnsupportedInstruction(_)
+        | RuntimeErrorKind::Unsupported(_) => 0,
+    };
+    size_of::<RuntimeError>()
+        .saturating_add(message_bytes)
+        .saturating_add(
+            error
+                .stack_trace
+                .capacity()
+                .saturating_mul(size_of::<StackTraceFrame>()),
+        )
+        .saturating_add(
+            error
+                .stack_trace
+                .iter()
+                .map(|frame| estimated_bigint_bytes(&frame.function_id))
+                .fold(0usize, usize::saturating_add),
+        )
 }
 
 fn estimated_capture_clone_bytes(captures: &[(BigInt, BindingCell)]) -> usize {
@@ -3172,4 +4162,23 @@ fn to_float(value: &Value) -> f64 {
         }),
         _ => unreachable!("numeric operands are validated before conversion"),
     }
+}
+
+unsafe fn invoke_interpreter_callback<R: BufRead, W: Write>(
+    data: *mut std::ffi::c_void,
+    callable: &Value,
+    arguments: &[Value],
+    span: Span,
+) -> Result<Value, RuntimeError> {
+    let interpreter = unsafe { &mut *data.cast::<Interpreter<R, W>>() };
+    interpreter.invoke_native_callback(callable, arguments, span)
+}
+
+unsafe fn preflight_interpreter_callback<R: BufRead, W: Write>(
+    data: *mut std::ffi::c_void,
+    bytes: usize,
+    span: Span,
+) -> Result<(), RuntimeError> {
+    let interpreter = unsafe { &mut *data.cast::<Interpreter<R, W>>() };
+    interpreter.ensure_memory_budget(bytes, span)
 }

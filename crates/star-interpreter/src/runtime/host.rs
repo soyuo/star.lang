@@ -89,6 +89,7 @@ impl From<io::Error> for HostError {
 /// A deny-by-default set of host services with explicit directory roots.
 pub struct HostServices {
     capabilities: BTreeSet<Capability>,
+    task_creation_enabled: bool,
     read_root: Option<Dir>,
     write_root: Option<Dir>,
     network: NetworkServices,
@@ -100,6 +101,7 @@ impl HostServices {
         let network = NetworkServices::new(capabilities.clone());
         Self {
             capabilities,
+            task_creation_enabled: true,
             read_root: None,
             write_root: None,
             network,
@@ -109,6 +111,16 @@ impl HostServices {
     /// Returns the immutable capability grants used by this service set.
     pub fn capabilities(&self) -> &BTreeSet<Capability> {
         &self.capabilities
+    }
+
+    /// Enables or disables guest-created tasks started by `SPAWN`.
+    pub fn set_task_creation_enabled(&mut self, enabled: bool) {
+        self.task_creation_enabled = enabled;
+    }
+
+    /// Returns whether guest `SPAWN` may create a task.
+    pub fn task_creation_enabled(&self) -> bool {
+        self.task_creation_enabled
     }
 
     /// Returns the network services governed by this host's capability grants.

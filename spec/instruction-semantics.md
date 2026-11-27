@@ -170,12 +170,12 @@ Constructor binding, method receivers, interface conformance, closure cells, and
 | `async.sleep` | `SLEEP` | `milliseconds: Int -> Null` | Suspends the current task for the specified nonnegative duration. | `TypeError` for a negative duration or use outside an async task. |
 | `async.join` | `JOIN` | `Task -> result` | Waits for task completion and pushes its result. | `TypeError` for a non-task; propagates task failure or cancellation. |
 | `async.cancel` | `CANCEL` | `Task -> Bool` | Requests task cancellation; returns whether the request was accepted. | `TypeError` for a non-task. |
-| `async.channel_new` | `CHANNEL_NEW` | `capacity: Int -> Channel` | Creates a channel; capacity zero creates a rendezvous channel. | `TypeError` for a negative capacity. |
+| `async.channel_new` | `CHANNEL_NEW` | `capacity: Int -> Channel` | Creates a bounded FIFO channel; capacity zero creates an unbuffered rendezvous channel that atomically pairs a send with an already-waiting receiver. | `TypeError` for a negative capacity; `ResourceLimit` when the capacity cannot be represented or reserved. |
 | `async.channel_send` | `CHANNEL_SEND` | `channel, value -> Null` | Sends one value, suspending while a bounded channel is full. | `TypeError` for an invalid channel or use outside an async task. |
 | `async.channel_recv` | `CHANNEL_RECV` | `channel -> value` | Receives one value, suspending while the channel is empty. | `TypeError` for an invalid channel or use outside an async task. |
 | `async.mutex_new` | `MUTEX_NEW` | `- -> Mutex` | Creates a mutex. | None beyond common failures. |
 | `async.mutex_lock` | `MUTEX_LOCK` | `Mutex -> Null` | Acquires the mutex, suspending while another task owns it. | `TypeError` for an invalid mutex or use outside an async task. |
-| `async.mutex_unlock` | `MUTEX_UNLOCK` | `Mutex -> Null` | Releases a mutex owned by the current task. | `TypeError` for an invalid mutex; `PermissionError` if the current task is not its owner. |
+| `async.mutex_unlock` | `MUTEX_UNLOCK` | `Mutex -> Null` | Releases a mutex owned by the current task. A task releases any mutexes it still owns when it exits. | `TypeError` for an invalid mutex; `PermissionError` if the current task is not its owner. |
 
 ## Native interface
 
@@ -185,9 +185,9 @@ FFI instructions require the FFI permission to be enabled. Native pointers are r
 |---|---|---|---|---|
 | `ffi.native_load` | `NATIVE_LOAD` | `path: String -> library: Handle` | Loads a supported native library (`.dll`, `.so`, or `.dylib`) and returns a managed handle. | `PermissionError` when FFI is disabled; `IOError` if loading fails. |
 | `ffi.native_symbol` | `NATIVE_SYMBOL` | `library: Handle, name: String, signature -> function: Handle` | Resolves a symbol and binds its declared C ABI signature and ownership rules. | `PermissionError` when FFI is disabled; `ReferenceError` if the symbol is absent; `TypeError` for an invalid signature. |
-| `ffi.native_call` | `NATIVE_CALL` | `arg1..argN, argc, function: Handle -> result` | Invokes the bound native function using its signature and C ABI; converts arguments/result and applies ownership rules. | `PermissionError` when FFI is disabled; `TypeError` for argument mismatch; `IOError` if the call cannot be completed. |
+| `ffi.native_call` | `NATIVE_CALL` | `arg1..argN, argc, function: Handle -> result` | Invokes the bound native function using its signature and C ABI; converts arguments/result and applies ownership rules. Callback runtime errors and wrong-thread invocations are reported after native code returns. | `PermissionError` when FFI is disabled; `TypeError` for argument mismatch or callback failure; `IOError` if the call cannot be completed. |
 | `ffi.native_close` | `NATIVE_CLOSE` | `library: Handle -> -` | Closes a loaded library and invalidates its symbol handles. | `PermissionError` when FFI is disabled; `TypeError` for an invalid handle. |
-| `ffi.native_callback` | `NATIVE_CALLBACK` | `function: Function, signature -> callback: Handle` | Creates a native-callable callback and roots its Star function for the callback lifetime. | `PermissionError` when FFI is disabled; `TypeError` for an incompatible signature. |
+| `ffi.native_callback` | `NATIVE_CALLBACK` | `function: Function or Closure, signature -> callback: Handle` | Creates a scalar-only C callback; it may run synchronously only during an active `NATIVE_CALL`, on that call's thread. Callback errors are raised after native code returns and never unwind through C. | `PermissionError` when FFI is disabled; `TypeError` for a non-callable or incompatible signature. |
 | `ffi.native_buffer` | `NATIVE_BUFFER` | `length: Int -> buffer: Handle` | Allocates a zero-initialized managed native buffer of the requested byte length. | `PermissionError` when FFI is disabled; `TypeError` for a negative length. |
 
 ## Exception opcode allocation

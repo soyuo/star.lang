@@ -8,12 +8,15 @@ license.workspace = true
 cap-std.workspace = true
 httparse.workspace = true
 http.workspace = true
+libffi.workspace = true
+libloading.workspace = true
 num-bigint = "0.5"
 num-traits.workspace = true
 serde_json.workspace = true
 star-common.workspace = true
 star-compiler.workspace = true
 star-parser.workspace = true
+tokio.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]

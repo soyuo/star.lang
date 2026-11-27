@@ -799,7 +799,15 @@ impl MemoryEstimator {
                     }
                 }
             }
-            Value::Float(_) | Value::Bool(_) | Value::Char(_) | Value::Byte(_) | Value::Null => {}
+            Value::Float(_)
+            | Value::Bool(_)
+            | Value::Char(_)
+            | Value::Byte(_)
+            | Value::Null
+            | Value::Handle(_)
+            | Value::Task(_)
+            | Value::Channel(_)
+            | Value::Mutex(_) => {}
         }
         Ok(())
     }
