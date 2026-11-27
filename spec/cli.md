@@ -4,9 +4,9 @@ Status: draft
 
 The `star` CLI provides source checking and building, single-program execution,
 online-judge fixture execution, process-level timing, source encoding and
-formatting, an interactive source REPL, and verified bytecode disassembly. It
-preserves guest standard input and output for `run`; diagnostics are written to
-stderr.
+formatting, an interactive source REPL, source debugging, and verified bytecode
+disassembly. It preserves guest standard input and output for `run`; diagnostics
+are written to stderr.
 
 ## Commands
 
@@ -25,6 +25,8 @@ stderr.
 | `star decode <source-file>` | Decodes one value or ordinary instruction token produced by `star encode`. |
 | `star disasm <file.starc>` | Verifies the complete bytecode file before listing functions, code offsets, VM instructions, and operands. Intrinsic IDs are shown separately from direct VM opcode names. |
 | `star repl` | Starts a persistent source-interpreter session. Incomplete instructions and blocks continue on the next line; `help`, `reset`, and `exit` are REPL commands. Globals, function/type definitions, and operand-stack values persist between submissions. |
+| `star debug <file.star>` | Runs the source debugger with an interactive command prompt. `--break LINE[:COLUMN]` may be repeated; `--input <file>` supplies guest input separately from debugger commands; `--strict` enables strict source whitespace validation. |
+| `star debug <file.star> --dap` | Runs the source debugger over Debug Adapter Protocol (DAP) messages on stdin/stdout. The adapter implements initialization, launch, line/column breakpoints, stack/scopes/variables inspection, continue, step in/over/out, and disconnect/terminate. Guest input must come from `--input`; guest output is emitted as DAP output events. |
 | `star help` | Prints command usage and stable exit codes. |
 
 `check`, `build`, and `run` accept `--strict` for source whitespace handling.
