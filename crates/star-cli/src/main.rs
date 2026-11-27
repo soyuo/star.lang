@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 mod source_lowering;
+mod source_tools;
 
 use star_compiler::{compile, verify_bytecode, VerificationLimits, VerificationPolicy};
 use star_interpreter::{
@@ -36,6 +37,10 @@ Usage:
   star run [<file.star|file.starc>] [options]
   star test --suite oj [--solutions <directory>]
   star bench [<file.star|file.starc>] --iterations <count> [--input <file>]
+  star fmt <file.star> [--write]
+  star minify <file.star> [--write]
+  star encode (--int N | --float N | --string TEXT | --file PATH | --opcode NAME)
+  star decode <encoded-source.star>
   star help
 
 Execution options:
@@ -51,6 +56,8 @@ Execution options:
 `build` compiles supported `.star` source to `.starc`; TRY/CATCH lowering is not
 yet supported. `test --suite oj` requires paired solutions and Python 3.11+.
 `bench` launches a fresh process per iteration and suppresses guest stdout.
+`fmt` and `minify` print validated source transformations; `--write` replaces
+the input file. `encode` emits valid source and `decode` reads one encoded value.
 
 Standard input and output are streamed without tokenization by the CLI. The
 program controls input reads; output bytes and whitespace are preserved.
@@ -153,6 +160,10 @@ fn run(args: Vec<String>) -> u8 {
                 EXIT_USAGE
             }
         },
+        "fmt" => source_tools::format_command(&args[1..]),
+        "minify" => source_tools::minify_command(&args[1..]),
+        "encode" => source_tools::encode_command(&args[1..]),
+        "decode" => source_tools::decode_command(&args[1..]),
         other => {
             eprintln!("star: unknown command `{other}`\n\n{HELP}");
             EXIT_USAGE

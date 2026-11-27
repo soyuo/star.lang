@@ -9,6 +9,10 @@ mod catalog {
     include!(concat!(env!("OUT_DIR"), "/assigned_opcodes.rs"));
 }
 
+mod format;
+
+pub use format::{format_program, FormatError};
+
 /// A parsed Star program. Statements retain source spans in the original input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Program {
@@ -56,6 +60,20 @@ pub enum InstructionOpcode {
 }
 
 impl InstructionOpcode {
+    /// Resolves an assigned mnemonic, case-insensitively, from the canonical catalog.
+    pub fn from_mnemonic(mnemonic: &str) -> Option<Self> {
+        catalog::BASIC_OPCODE_MNEMONICS
+            .iter()
+            .find(|(_, name)| name.eq_ignore_ascii_case(mnemonic))
+            .map(|(ordinal, _)| Self::Basic(*ordinal))
+            .or_else(|| {
+                catalog::EXTENDED_OPCODE_MNEMONICS
+                    .iter()
+                    .find(|(_, name)| name.eq_ignore_ascii_case(mnemonic))
+                    .map(|(opcode, _)| Self::Extended(*opcode))
+            })
+    }
+
     /// Returns the source mnemonic from the canonical opcode catalog.
     pub fn mnemonic(self) -> Option<&'static str> {
         match self {
@@ -68,6 +86,22 @@ impl InstructionOpcode {
                 .ok()
                 .map(|index| catalog::EXTENDED_OPCODE_MNEMONICS[index].1),
         }
+    }
+
+    /// Returns the canonical source token spelling for this assigned opcode.
+    pub fn source_spelling(self) -> Option<String> {
+        self.mnemonic()?;
+        Some(match self {
+            Self::Basic(ordinal) => format!("{}'", "*".repeat(usize::from(ordinal))),
+            Self::Extended(opcode) => {
+                let bits = format!("{opcode:08b}");
+                let payload: String = bits
+                    .chars()
+                    .map(|bit| if bit == '1' { '*' } else { '\'' })
+                    .collect();
+                format!("'{payload}\"")
+            }
+        })
     }
 }
 
