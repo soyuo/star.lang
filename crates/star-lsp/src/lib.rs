@@ -91,7 +91,11 @@ pub fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     io_threads.join()?;
-    Ok(())
+    if shutdown {
+        Ok(())
+    } else {
+        Err("client sent exit before the shutdown request".into())
+    }
 }
 
 fn server_capabilities() -> Value {
