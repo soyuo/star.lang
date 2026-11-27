@@ -42,8 +42,7 @@ category = "strings"
 input = "string-lengths.in"
 expected_output = "string-lengths.out"
 
-[[case]]
-id = "empty-input"
-category = "input-eof"
+[empty_input]
 input = "empty-input.in"
 expected_output = "empty-input.out"
+expected_exit_code = 0

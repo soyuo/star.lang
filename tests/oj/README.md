@@ -13,18 +13,18 @@ This directory publishes deterministic sample cases for solutions driven by stdi
 | `sort-search` | Sorting and searching | Sort each list, then report the lower and upper bound of the target. |
 | `string-lengths` | Strings | Report Unicode-scalar length and UTF-8 byte length, including empty and multibyte strings. |
 
-Each algorithm input contains multiple cases in one process. Numeric and string values are on separate lines; the string fixture deliberately contains empty and whitespace-bearing lines, and the Fibonacci stream ends without a final line terminator. The standalone empty-input case checks zero-byte EOF. This keeps the pack usable with the current line-oriented `INPUT` instruction while exercising whitespace and EOF handling.
+Each algorithm input contains multiple cases in one process. Numeric and string values are on separate lines; the string fixture deliberately contains empty and whitespace-bearing lines, and the Fibonacci stream ends without a final line terminator. The shared zero-byte empty-input case is applied to every solution pair. This keeps the pack usable with the current line-oriented `INPUT` instruction while exercising whitespace and EOF handling.
 
 ## Running a solution
 
-From the repository root, run each problem's solution against its input and compare the resulting bytes with its expected output:
+The pack contains problem fixtures, not reference solutions. Provide a directory containing one paired source and bytecode solution per problem, named `<case-id>.star` and `<case-id>.starc`. From the repository root, run the parity harness with Python 3.11 or newer:
 
 ```sh
-star run solution.star --max-memory 256M --timeout 30s --stats < tests/oj/array-sum.in > actual.out
+python tests/oj/run.py --solutions path/to/solutions --star-cli target/release/star
 ```
 
-For bytecode, run the corresponding `.starc` file with the same input and limits. Require exit code `0` and byte-identical output from the source interpreter and bytecode VM. Keep diagnostics and `--stats` on stderr so they cannot alter judged output.
+The harness applies every manifest input to both files with identical `star run` limits, then compares each exit code and stdout against the expected fixture and against the other engine. It prints the per-engine elapsed time, peak guest-memory estimate, and step count. `--star-cli` defaults to `star` from `PATH`. Diagnostics and statistics are captured separately from judged stdout.
 
 ## Measurement record
 
-For each published measurement, record the case ID, Star revision, Rust version, target triple, engine, exit code, execution time, and peak guest-memory estimate. State the hardware and method for any language-to-language baseline. The runtime estimate is tracked guest allocation, not process RSS. The fixture data itself is deterministic; timing and memory measurements are platform-specific.
+For each published measurement, record the case ID, Star revision, Rust version, target triple, engine, exit code, execution time, and peak guest-memory estimate printed by the harness. State the hardware and method for any language-to-language baseline. The runtime estimate is tracked guest allocation, not process RSS. The fixture data itself is deterministic; timing and memory measurements are platform-specific.
