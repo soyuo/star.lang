@@ -2116,6 +2116,25 @@ fn verify_function_flow(
             for (successor_index, mut incoming) in successors {
                 let successor = &decoded.instructions[successor_index];
                 let successor_offset = successor.offset as u64;
+                for exception in exceptions
+                    .iter()
+                    .filter(|exception| exception.function_index as usize == function_index)
+                {
+                    let source_inside = exception.protected_start <= instruction_offset
+                        && instruction_offset < exception.protected_end;
+                    let successor_inside = exception.protected_start <= successor_offset
+                        && successor_offset < exception.protected_end;
+                    if !source_inside
+                        && successor_inside
+                        && (incoming.opaque_prefix
+                            || incoming.stack.len() != exception.stack_depth as usize)
+                    {
+                        return Err(failure(
+                            Some(code_base + function.code_offset + successor.offset),
+                            "control-flow entry into protected range has incompatible exception stack depth",
+                        ));
+                    }
+                }
                 if !incoming
                     .handler_range
                     .is_some_and(|(start, end)| start <= successor_offset && successor_offset < end)
