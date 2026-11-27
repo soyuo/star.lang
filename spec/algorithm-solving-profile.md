@@ -22,7 +22,7 @@ The runner accepts these ceilings:
 
 Memory sizes accept bytes or `K`, `M`, and `G` binary suffixes. Timeouts accept integer milliseconds or seconds. Capabilities are disabled by default. Source and bytecode inputs larger than 64 MiB or the configured memory ceiling are rejected before reading.
 
-Stable process exit codes are `0` success, `2` usage/options, `3` input-file I/O, `4` lexical, parse, semantic, or bytecode verification diagnostics, `5` runtime failure, and `6` a configured resource ceiling. Guest output remains on stdout; diagnostics and optional statistics go to stderr.
+Stable process exit codes are `0` success, `2` usage/options, `3` input-file I/O, `4` lexical, parse, semantic, or bytecode verification diagnostics, `5` runtime failure, `6` a configured resource ceiling, and `7` an online-judge fixture failure. `star test --suite oj` runs the repository harness with paired `.star` and `.starc` solutions. Guest output remains on stdout; diagnostics and optional statistics go to stderr. See `spec/cli.md` for command contracts.
 
 Example:
 

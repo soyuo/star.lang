@@ -55,6 +55,22 @@ pub enum InstructionOpcode {
     Extended(u8),
 }
 
+impl InstructionOpcode {
+    /// Returns the source mnemonic from the canonical opcode catalog.
+    pub fn mnemonic(self) -> Option<&'static str> {
+        match self {
+            Self::Basic(ordinal) => catalog::BASIC_OPCODE_MNEMONICS
+                .binary_search_by_key(&ordinal, |(value, _)| *value)
+                .ok()
+                .map(|index| catalog::BASIC_OPCODE_MNEMONICS[index].1),
+            Self::Extended(opcode) => catalog::EXTENDED_OPCODE_MNEMONICS
+                .binary_search_by_key(&opcode, |(value, _)| *value)
+                .ok()
+                .map(|index| catalog::EXTENDED_OPCODE_MNEMONICS[index].1),
+        }
+    }
+}
+
 /// A quoted, non-empty bit payload. Each element is `0` or `1`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataLiteral {

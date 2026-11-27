@@ -64,6 +64,8 @@ pub struct VerifiedProgram<'a> {
     pub function_count: u32,
     pub instruction_count: u64,
     pub required_stack_depth: u32,
+    /// Statically required operand-stack depth for each function-table entry.
+    pub function_stack_depths: Vec<u32>,
 }
 
 impl<'a> VerifiedProgram<'a> {
@@ -728,14 +730,7 @@ fn parse_functions(
             }
             parameter_ids.push(id);
         }
-        let max_stack_offset = reader.offset();
         let max_stack = reader.u32()?;
-        if max_stack > limits.max_stack_depth {
-            return Err(failure(
-                Some(max_stack_offset),
-                "function max_stack exceeds host limit",
-            ));
-        }
         let code_offset_u64 = reader.u64()?;
         let code_length_u64 = reader.u64()?;
         let code_offset = usize::try_from(code_offset_u64).map_err(|_| {
@@ -1556,7 +1551,7 @@ pub fn verify_bytecode<'a>(
     )?;
     let (decoded, instruction_count) =
         decode_functions(bytes, sections[&4], &functions, &constants, policy)?;
-    verify_function_flow(
+    let function_stack_depths = verify_function_flow(
         &functions,
         &decoded,
         &exceptions,
@@ -1565,11 +1560,7 @@ pub fn verify_bytecode<'a>(
         policy,
     )?;
     verify_exception_and_debug(&sections, &functions, &decoded, &exceptions, &debug)?;
-    let required_stack_depth = functions
-        .iter()
-        .map(|function| function.max_stack)
-        .max()
-        .unwrap_or(0);
+    let required_stack_depth = function_stack_depths.iter().copied().max().unwrap_or(0);
     Ok(VerifiedProgram {
         bytes,
         module_count: modules.len() as u32,
@@ -1577,6 +1568,7 @@ pub fn verify_bytecode<'a>(
         function_count: functions.len() as u32,
         instruction_count,
         required_stack_depth,
+        function_stack_depths,
     })
 }
 
@@ -1888,17 +1880,10 @@ fn verify_function_flow(
     constants: &[Constant],
     code_base: usize,
     policy: &VerificationPolicy,
-) -> Result<u32, VerificationError> {
-    let mut maximum_declared_stack = 0_u32;
+) -> Result<Vec<u32>, VerificationError> {
+    let mut function_stack_depths = Vec::with_capacity(functions.len());
     for (function_index, (function, decoded)) in functions.iter().zip(decoded_functions).enumerate()
     {
-        maximum_declared_stack = maximum_declared_stack.max(function.max_stack);
-        if function.max_stack > policy.limits.max_stack_depth {
-            return Err(failure(
-                Some(code_base + function.code_offset),
-                "function max_stack exceeds host limit",
-            ));
-        }
         if decoded.instructions.is_empty() {
             return Err(failure(
                 Some(function.code_offset),
@@ -2110,6 +2095,12 @@ fn verify_function_flow(
                     "function max_stack is below statically required stack depth",
                 ));
             }
+            if required_stack > policy.limits.max_stack_depth as usize {
+                return Err(failure(
+                    Some(absolute_offset),
+                    "statically required stack depth exceeds host limit",
+                ));
+            }
             if terminal {
                 continue;
             }
@@ -2189,8 +2180,12 @@ fn verify_function_flow(
                 }
             }
         }
+        function_stack_depths.push(
+            u32::try_from(required_stack)
+                .map_err(|_| failure(None, "required stack depth exceeds u32"))?,
+        );
     }
-    Ok(maximum_declared_stack)
+    Ok(function_stack_depths)
 }
 
 fn verify_exception_and_debug(

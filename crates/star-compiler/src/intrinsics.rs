@@ -316,6 +316,14 @@ impl IrOp {
             Self::NativeBuffer => "NATIVE_BUFFER",
         }
     }
+
+    /// Resolves a source mnemonic to its IR operation.
+    pub fn from_mnemonic(mnemonic: &str) -> Option<Self> {
+        (0..100)
+            .filter_map(|index| Self::from_intrinsic_id(0x8000 + index))
+            .find(|operation| operation.mnemonic() == mnemonic)
+    }
+
     /// Resolves an intrinsic ID from the emitted bytecode instruction table.
     pub fn from_intrinsic_id(id: u16) -> Option<Self> {
         const OPS: [IrOp; 100] = [
