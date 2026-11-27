@@ -1458,6 +1458,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Import | ImportDynamic => {
                 return Err(self.unsupported(span, "module import resolution"))
             }
+            NativeLoad => self.runtime.execute_native_instruction(0xB0, span)?,
+            NativeSymbol => self.runtime.execute_native_instruction(0xB1, span)?,
+            NativeCall => self.runtime.execute_native_instruction(0xB2, span)?,
+            NativeClose => self.runtime.execute_native_instruction(0xB3, span)?,
+            NativeCallback => self.runtime.execute_native_instruction(0xB4, span)?,
+            NativeBuffer => self.runtime.execute_native_instruction(0xB5, span)?,
             TailCall => return Err(self.unsupported(span, "TAIL_CALL")),
             _ => return Err(self.unsupported(span, "intrinsic runtime feature")),
         }

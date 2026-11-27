@@ -1816,7 +1816,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         result
     }
 
-    fn execute_native_instruction(&mut self, opcode: u8, span: Span) -> Result<(), RuntimeError> {
+    pub(crate) fn execute_native_instruction(
+        &mut self,
+        opcode: u8,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
         use ffi::{NativeBuffer, NativeHandle, NativeLibraryHandle, NativeSignature, NativeValue};
 
         let capabilities = self.host_services.capabilities().clone();
