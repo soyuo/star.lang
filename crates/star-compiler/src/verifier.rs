@@ -1044,6 +1044,8 @@ struct ExceptionRecord {
     protected_start: u64,
     protected_end: u64,
     handler_offset: u64,
+    handler_end: u64,
+    stack_depth: u32,
 }
 
 fn parse_exceptions(
@@ -1066,32 +1068,35 @@ fn parse_exceptions(
         let protected_start = reader.u64()?;
         let protected_end = reader.u64()?;
         let handler_offset = reader.u64()?;
+        let handler_end = reader.u64()?;
         let stack_depth = reader.u32()?;
         let type_constant_index = reader.u32()?;
         let flags = reader.u32()?;
         if flags != 0 {
-            return Err(failure(Some(offset + 36), "exception flags must be zero"));
+            return Err(failure(Some(offset + 44), "exception flags must be zero"));
         }
         if protected_start >= protected_end
             || protected_end > function.code_length as u64
-            || handler_offset >= function.code_length as u64
+            || handler_offset >= handler_end
+            || handler_end > function.code_length as u64
+            || (handler_offset < protected_end && protected_start < handler_end)
         {
             return Err(failure(
                 Some(offset + 4),
-                "exception range or handler is outside its function",
+                "exception protected or handler range is invalid",
             ));
         }
         if stack_depth > function.max_stack {
             return Err(failure(
-                Some(offset + 28),
+                Some(offset + 36),
                 "exception stack depth exceeds function max_stack",
             ));
         }
         if type_constant_index != u32::MAX {
-            let constant = constant_at(constants, type_constant_index, offset + 32)?;
+            let constant = constant_at(constants, type_constant_index, offset + 40)?;
             if constant.tag != 0x08 {
                 return Err(failure(
-                    Some(offset + 32),
+                    Some(offset + 40),
                     "exception type must reference a TypeRef constant",
                 ));
             }
@@ -1113,6 +1118,8 @@ fn parse_exceptions(
             protected_start,
             protected_end,
             handler_offset,
+            handler_end,
+            stack_depth,
         });
     }
     reader.finish("ExceptionTable")?;
@@ -1247,13 +1254,16 @@ enum InstructionKind {
         unwind_to_frame_base: u32,
     },
     Trap,
+    Rethrow,
     Halt,
 }
 
 impl InstructionKind {
     fn is_terminal(&self) -> bool {
-        matches!(self, Self::ReturnTop { .. } | Self::Trap | Self::Halt)
-            || matches!(self, Self::Intrinsic(IrOp::TailCall))
+        matches!(
+            self,
+            Self::ReturnTop { .. } | Self::Trap | Self::Rethrow | Self::Halt
+        ) || matches!(self, Self::Intrinsic(IrOp::TailCall))
     }
 }
 
@@ -1368,6 +1378,7 @@ fn decode_functions(
                     unwind_to_frame_base: reader.u32()?,
                 },
                 0xE8 => InstructionKind::Trap,
+                0xE9 => InstructionKind::Rethrow,
                 0xFF => InstructionKind::Halt,
                 _ => {
                     return Err(failure(
@@ -1538,6 +1549,7 @@ pub fn verify_bytecode<'a>(
     verify_function_flow(
         &functions,
         &decoded,
+        &exceptions,
         &constants,
         sections[&4].offset,
         policy,
@@ -1565,6 +1577,7 @@ struct FlowState {
     scope_depth: u32,
     loop_states: BTreeSet<u32>,
     pending_captures: bool,
+    handler_range: Option<(u64, u64)>,
 }
 
 impl FlowState {
@@ -1575,6 +1588,7 @@ impl FlowState {
             scope_depth: 0,
             loop_states: BTreeSet::new(),
             pending_captures: false,
+            handler_range: None,
         }
     }
 
@@ -1842,18 +1856,32 @@ fn merge_flow_state(
             changed = true;
         }
     }
+    let handler_range = match (current.handler_range, incoming.handler_range) {
+        (Some((current_start, current_end)), Some((incoming_start, incoming_end))) => {
+            let start = current_start.max(incoming_start);
+            let end = current_end.min(incoming_end);
+            (start < end).then_some((start, end))
+        }
+        _ => None,
+    };
+    if handler_range != current.handler_range {
+        current.handler_range = handler_range;
+        changed = true;
+    }
     Ok(changed)
 }
 
 fn verify_function_flow(
     functions: &[FunctionRecord],
     decoded_functions: &[DecodedFunction],
+    exceptions: &[ExceptionRecord],
     constants: &[Constant],
     code_base: usize,
     policy: &VerificationPolicy,
 ) -> Result<u32, VerificationError> {
     let mut maximum_declared_stack = 0_u32;
-    for (function, decoded) in functions.iter().zip(decoded_functions) {
+    for (function_index, (function, decoded)) in functions.iter().zip(decoded_functions).enumerate()
+    {
         maximum_declared_stack = maximum_declared_stack.max(function.max_stack);
         if function.max_stack > policy.limits.max_stack_depth {
             return Err(failure(
@@ -1878,10 +1906,47 @@ fn verify_function_flow(
             let mut state = states[instruction_index]
                 .clone()
                 .expect("queued flow state is present");
+            let instruction_offset = instruction.offset as u64;
+            if !state
+                .handler_range
+                .is_some_and(|(start, end)| start <= instruction_offset && instruction_offset < end)
+            {
+                state.handler_range = None;
+            }
             let absolute_offset = code_base + function.code_offset + instruction.offset;
             required_stack = required_stack.max(state.stack.len());
             let mut successors: Vec<(usize, FlowState)> = Vec::with_capacity(2);
             let mut terminal = false;
+
+            for exception in exceptions.iter().filter(|exception| {
+                exception.function_index as usize == function_index
+                    && exception.protected_start == instruction_offset
+            }) {
+                if state.opaque_prefix || state.stack.len() != exception.stack_depth as usize {
+                    return Err(failure(
+                        Some(absolute_offset),
+                        "exception stack depth does not match protected-entry stack state",
+                    ));
+                }
+                let handler_offset = usize::try_from(exception.handler_offset)
+                    .map_err(|_| failure(Some(absolute_offset), "handler offset overflow"))?;
+                let Some(handler_index) = decoded.offsets.get(&handler_offset).copied() else {
+                    return Err(failure(
+                        Some(absolute_offset),
+                        "exception handler is not an instruction",
+                    ));
+                };
+                let mut handler_state = state.clone();
+                let handler_start = exception.handler_offset;
+                let handler_end = exception.handler_end;
+                handler_state.handler_range = Some(match state.handler_range {
+                    Some((start, end)) if start <= handler_start && handler_start < end => {
+                        (start.min(handler_start), end.max(handler_end))
+                    }
+                    _ => (handler_start, handler_end),
+                });
+                successors.push((handler_index, handler_state));
+            }
 
             match instruction.kind {
                 InstructionKind::PushConst(constant_index) => {
@@ -1996,6 +2061,15 @@ fn verify_function_flow(
                     terminal = true;
                 }
                 InstructionKind::Trap => terminal = true,
+                InstructionKind::Rethrow => {
+                    if state.handler_range.is_none() {
+                        return Err(failure(
+                            Some(absolute_offset),
+                            "RETHROW is not reachable from an exception handler",
+                        ));
+                    }
+                    terminal = true;
+                }
                 InstructionKind::Halt => {
                     if !function.initializer {
                         return Err(failure(
@@ -2039,8 +2113,34 @@ fn verify_function_flow(
                 }
                 successors.push((next_index, state));
             }
-            for (successor_index, incoming) in successors {
+            for (successor_index, mut incoming) in successors {
                 let successor = &decoded.instructions[successor_index];
+                let successor_offset = successor.offset as u64;
+                for exception in exceptions
+                    .iter()
+                    .filter(|exception| exception.function_index as usize == function_index)
+                {
+                    let source_inside = exception.protected_start <= instruction_offset
+                        && instruction_offset < exception.protected_end;
+                    let successor_inside = exception.protected_start <= successor_offset
+                        && successor_offset < exception.protected_end;
+                    if !source_inside
+                        && successor_inside
+                        && (incoming.opaque_prefix
+                            || incoming.stack.len() != exception.stack_depth as usize)
+                    {
+                        return Err(failure(
+                            Some(code_base + function.code_offset + successor.offset),
+                            "control-flow entry into protected range has incompatible exception stack depth",
+                        ));
+                    }
+                }
+                if !incoming
+                    .handler_range
+                    .is_some_and(|(start, end)| start <= successor_offset && successor_offset < end)
+                {
+                    incoming.handler_range = None;
+                }
                 if let Some(current) = &mut states[successor_index] {
                     if merge_flow_state(
                         current,
@@ -2052,6 +2152,30 @@ fn verify_function_flow(
                 } else {
                     states[successor_index] = Some(incoming);
                     worklist.push_back(successor_index);
+                }
+            }
+        }
+
+        for exception in exceptions
+            .iter()
+            .filter(|exception| exception.function_index as usize == function_index)
+        {
+            let start_offset = usize::try_from(exception.protected_start)
+                .map_err(|_| failure(None, "exception start offset overflow"))?;
+            let Some(start_index) = decoded.offsets.get(&start_offset).copied() else {
+                return Err(failure(
+                    Some(code_base + function.code_offset),
+                    "exception protected start is not an instruction",
+                ));
+            };
+            if let Some(entry_state) = &states[start_index] {
+                if entry_state.opaque_prefix
+                    || entry_state.stack.len() != exception.stack_depth as usize
+                {
+                    return Err(failure(
+                        Some(code_base + function.code_offset + start_offset),
+                        "exception stack depth does not match protected-entry stack state",
+                    ));
                 }
             }
         }
@@ -2078,10 +2202,11 @@ fn verify_exception_and_debug(
         if !starts(exception.protected_start)
             || (exception.protected_end != function_end && !starts(exception.protected_end))
             || !starts(exception.handler_offset)
+            || (exception.handler_end != function_end && !starts(exception.handler_end))
         {
             return Err(failure(
                 Some(function_absolute_offset),
-                "exception range or handler does not align to instruction boundaries",
+                "exception or handler range does not align to instruction boundaries",
             ));
         }
         let key = (
@@ -2124,6 +2249,24 @@ fn verify_exception_and_debug(
                 ));
             }
             nesting.push((start, end));
+        }
+    }
+
+    for (function_index, (function, decoded)) in functions.iter().zip(decoded_functions).enumerate()
+    {
+        for instruction in &decoded.instructions {
+            if matches!(&instruction.kind, InstructionKind::Rethrow)
+                && !exceptions.iter().any(|exception| {
+                    exception.function_index as usize == function_index
+                        && instruction.offset as u64 >= exception.handler_offset
+                        && (instruction.offset as u64) < exception.handler_end
+                })
+            {
+                return Err(failure(
+                    Some(code_section.offset + function.code_offset + instruction.offset),
+                    "RETHROW is outside every exception handler range",
+                ));
+            }
         }
     }
 

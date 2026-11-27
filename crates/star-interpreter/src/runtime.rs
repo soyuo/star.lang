@@ -11,7 +11,7 @@ use star_common::SourcePosition;
 use star_parser::Span;
 use star_parser::{
     DataLiteral, ForBlock, FunctionBlock, FunctionKind, IfBlock, Instruction, InstructionOpcode,
-    LoopBlock, Program, ScopeBlock, Statement,
+    LoopBlock, Program, ScopeBlock, Statement, TryBlock,
 };
 
 use crate::{
@@ -89,6 +89,18 @@ impl fmt::Display for RuntimeErrorKind {
     }
 }
 
+impl RuntimeErrorKind {
+    fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::ExecutionLimit
+                | Self::CompileError(_)
+                | Self::UnsupportedInstruction(_)
+                | Self::Unsupported(_)
+        )
+    }
+}
+
 /// An execution failure associated with the source construct that caused it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeError {
@@ -96,6 +108,17 @@ pub struct RuntimeError {
     pub kind: RuntimeErrorKind,
     /// Source range of the failing instruction or construct.
     pub span: Span,
+    /// Active function frames from outermost to innermost at the failure site.
+    pub stack_trace: Vec<StackTraceFrame>,
+}
+
+/// A function frame recorded while propagating a runtime error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackTraceFrame {
+    /// Stable function ID of the active frame.
+    pub function_id: BigInt,
+    /// Source location of the call that entered this frame.
+    pub call_site: Span,
 }
 
 impl fmt::Display for RuntimeError {
@@ -104,7 +127,18 @@ impl fmt::Display for RuntimeError {
             formatter,
             "{} at line {}, column {} (byte offset {})",
             self.kind, self.span.start.line, self.span.start.column, self.span.start.byte_offset
-        )
+        )?;
+        for frame in self.stack_trace.iter().rev() {
+            write!(
+                formatter,
+                "\n  at function {} (called at line {}, column {}, byte offset {})",
+                frame.function_id,
+                frame.call_site.start.line,
+                frame.call_site.start.column,
+                frame.call_site.start.byte_offset
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -129,6 +163,7 @@ pub struct Interpreter<R: BufRead, W: Write> {
     capture_vectors: Vec<Vec<(BigInt, BindingCell)>>,
     gc: GcHeap,
     call_depth: usize,
+    call_trace: Vec<StackTraceFrame>,
     call_depth_limit: usize,
     executed_steps: u64,
     execution_limit: u64,
@@ -140,6 +175,17 @@ enum ControlFlow {
     Break,
     Continue,
     Return(Value),
+}
+
+#[derive(Clone, Debug)]
+struct ExecutionSnapshot {
+    stack: Vec<Value>,
+    scope_depth: usize,
+    scope_floor_depth: usize,
+    frame_stack_depth: usize,
+    capture_lengths: Vec<usize>,
+    call_depth: usize,
+    call_trace_depth: usize,
 }
 
 impl<R: BufRead, W: Write> Interpreter<R, W> {
@@ -158,6 +204,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             capture_vectors: vec![Vec::new()],
             gc: GcHeap::default(),
             call_depth: 0,
+            call_trace: Vec::new(),
             call_depth_limit: 512,
             executed_steps: 0,
             execution_limit: 10_000_000,
@@ -226,14 +273,37 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     /// Executes supported statements in source order.
     pub fn execute(&mut self, program: &Program) -> Result<(), RuntimeError> {
+        let stack_base = self.stack.len();
+        let scope_base = self.scopes.len();
+        let scope_floor_base = self.scope_floors.len();
+        let frame_base = self.frame_stack_bases.len();
+        let capture_base = self.capture_vectors.len();
+        let trace_base = self.call_trace.len();
+        let call_depth_base = self.call_depth;
+        let result = self.execute_program(program);
+        if result.is_err() {
+            self.stack.truncate(stack_base);
+            self.scopes.truncate(scope_base);
+            self.scope_floors.truncate(scope_floor_base);
+            self.frame_stack_bases.truncate(frame_base);
+            self.capture_vectors.truncate(capture_base);
+            self.call_trace.truncate(trace_base);
+            self.call_depth = call_depth_base;
+        }
+        result
+    }
+
+    fn execute_program(&mut self, program: &Program) -> Result<(), RuntimeError> {
         self.executed_steps = 0;
         self.structs.clear();
         self.interfaces.clear();
         self.capture_vectors = vec![Vec::new()];
         self.functions = semantic::resolve_functions(program)
-            .map_err(|error| RuntimeError {
-                kind: RuntimeErrorKind::CompileError(error.kind.to_string()),
-                span: error.span,
+            .map_err(|error| {
+                self.error(
+                    RuntimeErrorKind::CompileError(error.kind.to_string()),
+                    error.span,
+                )
             })?
             .into_iter()
             .map(|function| (function.id.clone(), function))
@@ -320,6 +390,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                         return Ok(flow);
                     }
                 }
+                Statement::Try(block) => {
+                    let flow = self.execute_try(block)?;
+                    if flow != ControlFlow::Normal {
+                        return Ok(flow);
+                    }
+                }
                 Statement::If(block) => {
                     let flow = self.execute_if(block)?;
                     if flow != ControlFlow::Normal {
@@ -349,6 +425,73 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let result = self.execute_statements(&scope.body);
         self.scopes.pop();
         result
+    }
+
+    fn execute_try(&mut self, block: &TryBlock) -> Result<ControlFlow, RuntimeError> {
+        let snapshot = self.execution_snapshot();
+        let mut outcome = match self.execute_statements(&block.try_body) {
+            Ok(flow) => Ok(flow),
+            Err(error) => {
+                self.restore_execution_snapshot(&snapshot);
+                if error.kind.is_fatal() {
+                    return Err(error);
+                }
+                match &block.catch_body {
+                    Some(body) => self.execute_statements(body),
+                    None => Err(error),
+                }
+            }
+        };
+
+        if let Some(finally_body) = &block.finally_body {
+            if let Err(error) = &outcome {
+                if error.kind.is_fatal() {
+                    return Err(error.clone());
+                }
+                self.restore_execution_snapshot(&snapshot);
+            }
+            let prior_outcome = outcome;
+            match self.execute_statements(finally_body) {
+                Ok(ControlFlow::Normal) => outcome = prior_outcome,
+                Ok(flow) => outcome = Ok(flow),
+                Err(error) => {
+                    self.restore_execution_snapshot(&snapshot);
+                    outcome = Err(error);
+                }
+            }
+        }
+
+        outcome
+    }
+
+    fn execution_snapshot(&self) -> ExecutionSnapshot {
+        ExecutionSnapshot {
+            stack: self.stack.clone(),
+            scope_depth: self.scopes.len(),
+            scope_floor_depth: self.scope_floors.len(),
+            frame_stack_depth: self.frame_stack_bases.len(),
+            capture_lengths: self.capture_vectors.iter().map(Vec::len).collect(),
+            call_depth: self.call_depth,
+            call_trace_depth: self.call_trace.len(),
+        }
+    }
+
+    fn restore_execution_snapshot(&mut self, snapshot: &ExecutionSnapshot) {
+        self.stack.clone_from(&snapshot.stack);
+        self.scopes.truncate(snapshot.scope_depth);
+        self.scope_floors.truncate(snapshot.scope_floor_depth);
+        self.frame_stack_bases.truncate(snapshot.frame_stack_depth);
+        self.capture_vectors
+            .truncate(snapshot.capture_lengths.len());
+        for (captures, length) in self
+            .capture_vectors
+            .iter_mut()
+            .zip(&snapshot.capture_lengths)
+        {
+            captures.truncate(*length);
+        }
+        self.call_depth = snapshot.call_depth;
+        self.call_trace.truncate(snapshot.call_trace_depth);
     }
 
     fn execute_if(&mut self, block: &IfBlock) -> Result<ControlFlow, RuntimeError> {
@@ -564,7 +707,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         self.frame_stack_bases.push(stack_base);
         self.capture_vectors.push(Vec::new());
         self.call_depth += 1;
+        self.call_trace.push(StackTraceFrame {
+            function_id: function.id.clone(),
+            call_site: span,
+        });
         let result = self.execute_statements(&function.body);
+        self.call_trace.pop();
         self.call_depth -= 1;
         self.capture_vectors.pop();
         self.frame_stack_bases.pop();
@@ -1927,10 +2075,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             let buffer = match self.input.fill_buf() {
                 Ok(buffer) => buffer,
                 Err(error) => {
-                    return Err(RuntimeError {
-                        kind: RuntimeErrorKind::IOError(error.to_string()),
-                        span,
-                    });
+                    return Err(self.error(RuntimeErrorKind::IOError(error.to_string()), span));
                 }
             };
             if buffer.is_empty() {
@@ -1947,10 +2092,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     let next_is_lf = match self.input.fill_buf() {
                         Ok(buffer) => buffer.first() == Some(&b'\n'),
                         Err(error) => {
-                            return Err(RuntimeError {
-                                kind: RuntimeErrorKind::IOError(error.to_string()),
-                                span,
-                            });
+                            return Err(
+                                self.error(RuntimeErrorKind::IOError(error.to_string()), span)
+                            );
                         }
                     };
                     if next_is_lf {
@@ -1976,7 +2120,11 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     fn error(&self, kind: RuntimeErrorKind, span: Span) -> RuntimeError {
-        RuntimeError { kind, span }
+        RuntimeError {
+            kind,
+            span,
+            stack_trace: self.call_trace.clone(),
+        }
     }
 }
 
@@ -1989,6 +2137,7 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::For(block) => block.span,
         Statement::Function(block) => block.span,
         Statement::Scope(block) => block.span,
+        Statement::Try(block) => block.span,
     }
 }
 

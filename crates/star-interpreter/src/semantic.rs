@@ -565,6 +565,7 @@ impl Analyzer {
                 Statement::If(block) => self.analyze_if(block, state, context)?,
                 Statement::Loop(block) => self.analyze_loop(block, state, context)?,
                 Statement::For(block) => self.analyze_for(block, state, context)?,
+                Statement::Try(block) => self.analyze_try(block, state, context)?,
                 Statement::Function(block) if !self.loop_reanalysis => {
                     self.analyze_function(block, state)?;
                 }
@@ -585,6 +586,37 @@ impl Analyzer {
         state.scopes.push(HashMap::new());
         self.analyze_sequence(&block.body, state, context)?;
         state.scopes.truncate(depth);
+        Ok(())
+    }
+
+    fn analyze_try(
+        &mut self,
+        block: &star_parser::TryBlock,
+        state: &mut FlowState,
+        context: &mut Context,
+    ) -> Result<(), SemanticError> {
+        let entry = state.clone();
+        let mut protected = entry.clone();
+        self.analyze_sequence(&block.try_body, &mut protected, context)?;
+
+        let mut result = if let Some(catch_body) = &block.catch_body {
+            let mut caught = entry;
+            self.analyze_sequence(catch_body, &mut caught, context)?;
+            join_flows(protected, caught, block.span)?
+        } else {
+            protected
+        };
+
+        if let Some(finally_body) = &block.finally_body {
+            let pending_transfer = !result.reachable;
+            result.reachable = true;
+            self.analyze_sequence(finally_body, &mut result, context)?;
+            if pending_transfer && result.reachable {
+                result.reachable = false;
+            }
+        }
+
+        *state = result;
         Ok(())
     }
 
@@ -2210,6 +2242,7 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::For(block) => block.span,
         Statement::Function(block) => block.span,
         Statement::Scope(block) => block.span,
+        Statement::Try(block) => block.span,
     }
 }
 

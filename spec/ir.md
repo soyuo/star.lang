@@ -2,7 +2,7 @@
 
 Status: draft
 
-This document defines the target-independent IR and the lowering from parsed, semantically valid Star programs. It does not define `.starc` serialization, bytecode opcode values, or VM instruction selection; those belong to the bytecode and compiler roadmap items. Source opcode assignments remain in `spec/opcodes.toml`, while stack effects and failures remain in `spec/instruction-semantics.md`.
+This document defines the target-independent IR and the lowering contract for parsed, semantically valid Star programs. The current `star-compiler::compile` API consumes an already constructed `ModuleIR`; an AST-to-IR lowering pass is not yet implemented in this repository. The reference source interpreter executes parsed programs directly. It does not define `.starc` serialization, bytecode opcode values, or VM instruction selection; those belong to the bytecode and compiler roadmap items. Source opcode assignments remain in `spec/opcodes.toml`, while stack effects and failures remain in `spec/instruction-semantics.md`.
 
 ## IR model
 
@@ -22,6 +22,15 @@ FunctionIR {
     entry: BlockId,
     max_stack: u32,
     blocks: [BasicBlock],
+    exception_regions: [ExceptionRegionIR],
+}
+
+ExceptionRegionIR {
+    protected_start: BlockId,
+    protected_end: BlockId?,  # absent means the end of the function
+    handler: BlockId,
+    handler_end: BlockId?,  # absent means the end of the function
+    stack_depth: u32,
 }
 
 BasicBlock {
@@ -45,7 +54,7 @@ The evaluation stack is not converted to SSA in this IR. A stack slot has the sa
 
 The complete assigned operation inventory is grouped below. Every mnemonic in these groups has the corresponding `IrOp` variant unless the structural-lowering section explicitly assigns it to a terminator, scope operation, or function descriptor.
 
-The structural/control mnemonics are `IF`, `ELSE`, `END`, `LOOP`, `WHILE`, `FOR`, `BREAK`, `CONTINUE`, `FUNC`, `ASYNC_FUNC`, `RETURN`, `SCOPE_BEGIN`, and `SCOPE_END`. They lower to CFG, scope, loop-state, or function-descriptor constructs rather than `IrOp` variants.
+The structural/control mnemonics are `IF`, `ELSE`, `END`, `LOOP`, `WHILE`, `FOR`, `BREAK`, `CONTINUE`, `FUNC`, `ASYNC_FUNC`, `RETURN`, `SCOPE_BEGIN`, `SCOPE_END`, `TRY`, `CATCH`, and `FINALLY`. They lower to CFG, scope, loop-state, function-descriptor, or exception-region constructs rather than `IrOp` variants.
 
 | Source family | Assigned mnemonics |
 |---|---|
@@ -73,6 +82,7 @@ The terminator set is:
 | `BranchIfFalse(false_target, true_target)` | Pops one condition; branches on `Bool`. A dynamic non-`Bool` value keeps the specified runtime `TypeError`. |
 | `ForNext(loop_state, body_target, exit_target)` | Requests one iterator item; on success assigns it to the loop binding and enters the body, otherwise exits the loop. Iterator failures propagate. |
 | `ReturnTop(unwind_to_frame_base)` | Returns the top operand above the function frame base, or `Null` if there is none; discards other frame operands and unwinds function scopes. |
+| `Rethrow` | Rethrows the current catch-all handler's pending error to an enclosing exception region. It is valid only on an exception-handler path. |
 | `Halt` | Ends the module initializer normally. |
 | `Unreachable` | Marks a block with no valid incoming execution path after semantic analysis. |
 
@@ -98,6 +108,7 @@ Lowering runs after parsing and successful semantic analysis. It uses the functi
 - **`FOR`:** lower the source iterator and variable ID already on the evaluation stack with `ForInit`. The source stack order is iterator then variable ID, bottom to top. The loop header ends with `ForNext`; its success edge enters the body and its exhaustion edge enters the exit. Normal completion and `CONTINUE` target the header; `BREAK` targets the exit. Both targets retain the `FOR` binding scope; `BREAK` unwinds only body and intervening scopes. The exit block emits the single `ScopeExit` for the loop binding and jumps to the post-loop block.
 - **BREAK / CONTINUE:** emit `Jump` to the nearest enclosing loop's exit or continuation target. Compute `unwind_scopes` from the source and target scope depths; preserve every scope in the target block, including the `FOR` binding scope when targeting its header or exit. Scopes are unwound only once, and a transfer never unwinds across the current function boundary.
 - **RETURN:** terminate the current function with `ReturnTop`; no return edge may cross a function boundary. A source return inside a nested block or loop still exits the function.
+- **TRY / CATCH / FINALLY:** emit an `ExceptionRegionIR` for each protected instruction interval. A region catches any non-fatal runtime error and restores the operand stack to `stack_depth` before entering its handler. Its half-open handler range begins at `handler` and is disjoint from its protected range; `RETHROW` must be inside that handler range. For `TRY/CATCH`, the protected interval targets the catch block. For `TRY/FINALLY`, and for the outer region of `TRY/CATCH/FINALLY`, the handler executes the finalizer and then emits bytecode `RETHROW` so an unhandled error continues outward. In the combined form, a nested inner region routes errors from the try body to `CATCH`, while the outer region protects both try and catch bodies and routes errors from either to the finalizer-and-rethrow handler. Normal completion, `RETURN`, `BREAK`, and `CONTINUE` paths execute the finalizer before transferring; the lowerer may duplicate finalizer blocks to preserve this rule. A transfer or new error produced by `FINALLY` overrides the pending transfer or error. Catch-all handlers are the only handler type emitted for `.starc` version 1.0.
 
 Control-flow targets are function-local `BlockId`s, not source opcode values or bytecode addresses. Branch targets are allocated once and every incoming edge is recorded before the function is finalized. The lowerer rejects an unresolved target or a block without exactly one terminator as an internal compiler error.
 
@@ -107,5 +118,6 @@ Control-flow targets are function-local `BlockId`s, not source opcode values or 
 - Every reachable join has a compatible operand-stack state; every loop back-edge restores its header stack state.
 - Function IDs and parameter IDs remain arbitrary-precision nonnegative integers in IR metadata.
 - Reserved or pending source opcode values have no IR operation. `.starc` opcodes are assigned independently by the bytecode format.
+- Exception regions are function-local, half-open instruction intervals after layout. They are serialized in function/start/end order; ranges may be disjoint or properly nested, never partially overlapping. `stack_depth` is the number of operand slots retained at handler entry and must not exceed `max_stack`.
 - Future optimization passes may add constants, simplify branches, or remove dead blocks only when they preserve output, I/O, bindings, errors and their order, function behavior, and source attribution.
 - IR is an in-memory compiler representation. `.starc` serialization and the emitted bytecode instruction subset are defined by `spec/bytecode-format.md` and `spec/bytecode-instructions.md`; VM verification remains a later roadmap item.

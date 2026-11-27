@@ -62,22 +62,28 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     /// Verifies and executes a `.starc` program, returning the module result.
     pub fn execute(&mut self, bytes: &[u8]) -> Result<Value, RuntimeError> {
         self.reset_state();
-        let verified = verify_bytecode(bytes, &self.policy).map_err(|error| {
-            self.runtime.error(
-                RuntimeErrorKind::CompileError(error.to_string()),
-                empty_span(),
-            )
-        })?;
-        let image = Image::parse(&verified).map_err(|message| {
-            self.runtime
-                .error(RuntimeErrorKind::CompileError(message), empty_span())
-        })?;
-        let result = self.execute_image(&image)?;
-        self.runtime.output.flush().map_err(|error| {
-            self.runtime
-                .error(RuntimeErrorKind::IOError(error.to_string()), empty_span())
-        })?;
-        Ok(result)
+        let result = (|| {
+            let verified = verify_bytecode(bytes, &self.policy).map_err(|error| {
+                self.runtime.error(
+                    RuntimeErrorKind::CompileError(error.to_string()),
+                    empty_span(),
+                )
+            })?;
+            let image = Image::parse(&verified).map_err(|message| {
+                self.runtime
+                    .error(RuntimeErrorKind::CompileError(message), empty_span())
+            })?;
+            let result = self.execute_image(&image)?;
+            self.runtime.output.flush().map_err(|error| {
+                self.runtime
+                    .error(RuntimeErrorKind::IOError(error.to_string()), empty_span())
+            })?;
+            Ok(result)
+        })();
+        if result.is_err() {
+            self.cleanup_after_error();
+        }
+        result
     }
 
     /// Returns the current operand stack, from bottom to top.
@@ -109,15 +115,30 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.interfaces.clear();
         self.runtime.capture_vectors.clear();
         self.runtime.capture_vectors.push(Vec::new());
+        self.runtime.call_trace.clear();
         self.runtime.call_depth = 0;
         self.runtime.executed_steps = 0;
+    }
+
+    fn cleanup_after_error(&mut self) {
+        self.runtime.stack.clear();
+        self.runtime.scopes.truncate(1);
+        self.runtime.scope_floors.truncate(1);
+        if self.runtime.scope_floors.is_empty() {
+            self.runtime.scope_floors.push(0);
+        }
+        self.runtime.frame_stack_bases.clear();
+        self.runtime.capture_vectors.truncate(1);
+        self.runtime.capture_vectors[0].clear();
+        self.runtime.call_trace.clear();
+        self.runtime.call_depth = 0;
     }
 
     fn execute_image(&mut self, image: &Image<'_>) -> Result<Value, RuntimeError> {
         let entry = image.modules[image.entry_module as usize].initializer_index as usize;
         let mut frames = vec![Frame::initializer(entry, image.functions[entry].clone())];
         loop {
-            let Some(frame) = frames.last_mut() else {
+            let Some(frame) = frames.last() else {
                 return Ok(Value::Null);
             };
             let stack_depth = self.runtime.stack.len().saturating_sub(frame.stack_base);
@@ -146,23 +167,62 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 ));
             }
             let instruction_offset = frame.ip;
-            let span = image.span(
-                frame.function_index,
-                frame.function.code_offset + instruction_offset,
-            );
-            let instruction = decode_instruction(image, frame, span, &self.runtime)?;
-            match instruction {
-                Instruction::PushConstant(index) => {
-                    let value = image.constants.get(index as usize).ok_or_else(|| {
-                        self.runtime.error(
-                            RuntimeErrorKind::CompileError("constant index out of range".into()),
-                            span,
-                        )
-                    })?;
-                    match value {
-                        Constant::Value(value) => self.runtime.stack.push(value.clone()),
-                        Constant::FunctionRef(function_index) => {
-                            let function = image
+            let function_index = frame.function_index;
+            let absolute_code_offset = frame.function.code_offset + instruction_offset;
+            self.expire_pending_exceptions(frames.last_mut().expect("active frame"));
+            self.activate_exception_regions(image, frames.last_mut().expect("active frame"));
+            let span = image.span(function_index, absolute_code_offset);
+            let instruction = {
+                let frame = frames.last_mut().expect("active frame");
+                decode_instruction(image, frame, span, &self.runtime)?
+            };
+            match self.execute_instruction(
+                image,
+                &mut frames,
+                instruction,
+                instruction_offset,
+                span,
+            ) {
+                Ok(Some(value)) => return Ok(value),
+                Ok(None) => {}
+                Err(error) => {
+                    if self.dispatch_exception(
+                        image,
+                        &mut frames,
+                        instruction_offset,
+                        error.clone(),
+                    ) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+            self.runtime.collect_if_needed();
+        }
+    }
+
+    fn execute_instruction(
+        &mut self,
+        image: &Image<'_>,
+        frames: &mut Vec<Frame>,
+        instruction: Instruction,
+        instruction_offset: usize,
+        span: Span,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let frame_index = frames.len().saturating_sub(1);
+        match instruction {
+            Instruction::PushConstant(index) => {
+                let value = image.constants.get(index as usize).ok_or_else(|| {
+                    self.runtime.error(
+                        RuntimeErrorKind::CompileError("constant index out of range".into()),
+                        span,
+                    )
+                })?;
+                match value {
+                    Constant::Value(value) => self.runtime.stack.push(value.clone()),
+                    Constant::FunctionRef(function_index) => {
+                        let function =
+                            image
                                 .functions
                                 .get(*function_index as usize)
                                 .ok_or_else(|| {
@@ -173,103 +233,245 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                                         span,
                                     )
                                 })?;
-                            let Some(id) = function.id.clone() else {
-                                return Err(self.runtime.error(
-                                    RuntimeErrorKind::ReferenceError(
-                                        "initializer is not a function value",
-                                    ),
-                                    span,
-                                ));
-                            };
-                            self.runtime.stack.push(Value::Function(FunctionRef {
-                                module_index: function.module_index,
-                                id,
-                            }));
-                        }
-                        Constant::TypeRef => {
-                            return Err(self.unsupported(span, "type constant values"));
-                        }
+                        let Some(id) = function.id.clone() else {
+                            return Err(self.runtime.error(
+                                RuntimeErrorKind::ReferenceError(
+                                    "initializer is not a function value",
+                                ),
+                                span,
+                            ));
+                        };
+                        self.runtime.stack.push(Value::Function(FunctionRef {
+                            module_index: function.module_index,
+                            id,
+                        }));
+                    }
+                    Constant::TypeRef => {
+                        return Err(self.unsupported(span, "type constant values"));
                     }
                 }
-                Instruction::Intrinsic(id) => {
-                    let operation = IrOp::from_intrinsic_id(id).ok_or_else(|| {
+            }
+            Instruction::Intrinsic(id) => {
+                let operation = IrOp::from_intrinsic_id(id).ok_or_else(|| {
+                    self.runtime.error(
+                        RuntimeErrorKind::CompileError("unknown intrinsic ID".into()),
+                        span,
+                    )
+                })?;
+                self.check_capability(operation, span)?;
+                let module_index = frames[frame_index].module_index;
+                if let Some(request) = self.call_intrinsic(operation, span, module_index, image)? {
+                    self.enter_function(request, span, instruction_offset, image, frames)?;
+                }
+            }
+            Instruction::Jump { target, unwind } => {
+                let frame = frames.last_mut().expect("active frame");
+                self.unwind_scopes(frame, unwind as usize, span)?;
+                frame.ip = target as usize;
+            }
+            Instruction::BranchIfFalse {
+                false_target,
+                true_target,
+            } => {
+                let condition = self.runtime.pop(span)?;
+                let Value::Bool(condition) = condition else {
+                    return Err(self.runtime.type_error("Bool", &condition, span));
+                };
+                frames.last_mut().expect("active frame").ip =
+                    if condition { true_target } else { false_target };
+            }
+            Instruction::ForInit(loop_id) => {
+                let frame = frames.last_mut().expect("active frame");
+                self.for_init(loop_id, frame, span)?;
+            }
+            Instruction::ForNext {
+                loop_id,
+                body_target,
+                exit_target,
+            } => {
+                let frame = frames.last_mut().expect("active frame");
+                self.for_next(loop_id, body_target, exit_target, frame, span)?;
+            }
+            Instruction::ScopeEnter => self.runtime.scopes.push(HashMap::new()),
+            Instruction::ScopeExit => {
+                let frame = frames.last_mut().expect("active frame");
+                self.scope_exit(frame, span)?;
+            }
+            Instruction::ReturnTop(unwind) => {
+                let frame = frames.last_mut().expect("active frame");
+                if frame.initializer {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::CompileError("RETURN_TOP in module initializer".into()),
+                        span,
+                    ));
+                }
+                let action = frame.return_action.clone();
+                let value = self.return_frame(unwind as usize, span, frame)?;
+                frames.pop();
+                self.runtime.call_trace.pop();
+                if frames.is_empty() {
+                    return Ok(Some(value));
+                }
+                match action {
+                    ReturnAction::PushResult => self.runtime.stack.push(value),
+                    ReturnAction::PushValue(value) => self.runtime.stack.push(value),
+                }
+            }
+            Instruction::Halt => {
+                if !frames[frame_index].initializer {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::CompileError("HALT outside module initializer".into()),
+                        span,
+                    ));
+                }
+                return Ok(Some(Value::Null));
+            }
+            Instruction::Trap => {
+                return Err(self
+                    .runtime
+                    .error(RuntimeErrorKind::Unsupported("reached compiler TRAP"), span));
+            }
+            Instruction::Rethrow => {
+                let error = frames[frame_index]
+                    .pending_exceptions
+                    .iter()
+                    .rev()
+                    .find(|pending| {
+                        instruction_offset >= pending.handler_start
+                            && instruction_offset < pending.handler_end
+                    })
+                    .map(|pending| pending.error.clone())
+                    .ok_or_else(|| {
                         self.runtime.error(
-                            RuntimeErrorKind::CompileError("unknown intrinsic ID".into()),
+                            RuntimeErrorKind::CompileError(
+                                "RETHROW without a pending exception".into(),
+                            ),
                             span,
                         )
                     })?;
-                    self.check_capability(operation, span)?;
-                    if let Some(request) =
-                        self.call_intrinsic(operation, span, frame.module_index, image)?
-                    {
-                        self.enter_function(request, span, image, &mut frames)?;
-                    }
-                }
-                Instruction::Jump { target, unwind } => {
-                    self.unwind_scopes(frame, unwind as usize, span)?;
-                    frame.ip = target as usize;
-                }
-                Instruction::BranchIfFalse {
-                    false_target,
-                    true_target,
-                } => {
-                    let condition = self.runtime.pop(span)?;
-                    let Value::Bool(condition) = condition else {
-                        return Err(self.runtime.type_error("Bool", &condition, span));
-                    };
-                    frame.ip = if condition { true_target } else { false_target };
-                }
-                Instruction::ForInit(loop_id) => self.for_init(loop_id, frame, span)?,
-                Instruction::ForNext {
-                    loop_id,
-                    body_target,
-                    exit_target,
-                } => {
-                    if self.for_next(loop_id, body_target, exit_target, frame, span)? {
-                        continue;
-                    }
-                }
-                Instruction::ScopeEnter => self.runtime.scopes.push(HashMap::new()),
-                Instruction::ScopeExit => self.scope_exit(frame, span)?,
-                Instruction::ReturnTop(unwind) => {
-                    if frame.initializer {
-                        return Err(self.runtime.error(
-                            RuntimeErrorKind::CompileError(
-                                "RETURN_TOP in module initializer".into(),
-                            ),
-                            span,
-                        ));
-                    }
-                    let action = frame.return_action.clone();
-                    let value = self.return_frame(unwind as usize, span, frame)?;
-                    frames.pop();
-                    if frames.is_empty() {
-                        return Ok(value);
-                    }
-                    match action {
-                        ReturnAction::PushResult => self.runtime.stack.push(value),
-                        ReturnAction::PushValue(value) => self.runtime.stack.push(value),
-                    }
-                }
-                Instruction::Halt => {
-                    if !frame.initializer {
-                        return Err(self.runtime.error(
-                            RuntimeErrorKind::CompileError(
-                                "HALT outside module initializer".into(),
-                            ),
-                            span,
-                        ));
-                    }
-                    return Ok(Value::Null);
-                }
-                Instruction::Trap => {
-                    return Err(self
-                        .runtime
-                        .error(RuntimeErrorKind::Unsupported("reached compiler TRAP"), span));
-                }
+                return Err(error);
             }
-            self.runtime.collect_if_needed();
         }
+        Ok(None)
+    }
+
+    fn activate_exception_regions(&mut self, image: &Image<'_>, frame: &mut Frame) {
+        frame.active_exceptions.retain(|index, _| {
+            image.exceptions.get(*index).is_some_and(|region| {
+                region.function_index as usize == frame.function_index
+                    && frame.ip >= region.protected_start
+                    && frame.ip < region.protected_end
+            })
+        });
+        let active = image
+            .exceptions
+            .iter()
+            .enumerate()
+            .filter(|(_, region)| {
+                region.function_index as usize == frame.function_index
+                    && frame.ip >= region.protected_start
+                    && frame.ip < region.protected_end
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let snapshot = self.runtime.execution_snapshot();
+        for index in active {
+            frame
+                .active_exceptions
+                .entry(index)
+                .or_insert_with(|| snapshot.clone());
+        }
+    }
+
+    fn expire_pending_exceptions(&self, frame: &mut Frame) {
+        frame
+            .pending_exceptions
+            .retain(|pending| frame.ip >= pending.handler_start && frame.ip < pending.handler_end);
+    }
+
+    fn dispatch_exception(
+        &mut self,
+        image: &Image<'_>,
+        frames: &mut Vec<Frame>,
+        instruction_offset: usize,
+        error: RuntimeError,
+    ) -> bool {
+        if error.kind.is_fatal() || frames.is_empty() {
+            return false;
+        }
+        let mut target = None;
+        for frame_index in (0..frames.len()).rev() {
+            let site = if frame_index + 1 == frames.len() {
+                instruction_offset
+            } else {
+                frames[frame_index + 1].call_site_offset
+            };
+            let frame = &frames[frame_index];
+            target = image
+                .exceptions
+                .iter()
+                .enumerate()
+                .filter(|(index, region)| {
+                    region.function_index as usize == frame.function_index
+                        && site >= region.protected_start
+                        && site < region.protected_end
+                        && frame.active_exceptions.contains_key(index)
+                })
+                .min_by_key(|(_, region)| {
+                    region.protected_end.saturating_sub(region.protected_start)
+                })
+                .map(|(index, region)| (frame_index, index, region.handler_offset));
+            if target.is_some() {
+                break;
+            }
+        }
+        let Some((target_frame, region_index, handler_offset)) = target else {
+            return false;
+        };
+
+        let expected_stack_depth = image.exceptions[region_index].stack_depth as usize;
+        let stack_base = frames[target_frame].stack_base;
+        let Some(snapshot) = frames[target_frame].active_exceptions.get(&region_index) else {
+            return false;
+        };
+        if snapshot.stack.len().saturating_sub(stack_base) != expected_stack_depth {
+            return false;
+        }
+
+        while frames.len() > target_frame + 1 {
+            if let Some(frame) = frames.pop() {
+                self.unwind_exception_frame(&frame);
+            }
+        }
+        let frame = frames.last_mut().expect("exception target frame exists");
+        let Some(snapshot) = frame.active_exceptions.remove(&region_index) else {
+            return false;
+        };
+        let restored_scope_depth = snapshot.scope_depth;
+        self.runtime.restore_execution_snapshot(&snapshot);
+        frame.ip = handler_offset;
+        frame
+            .loop_states
+            .retain(|_, state| state.scope_depth < restored_scope_depth);
+        frame.pending_exceptions.retain(|pending| {
+            handler_offset >= pending.handler_start && handler_offset < pending.handler_end
+        });
+        frame.pending_exceptions.push(PendingException {
+            handler_start: handler_offset,
+            handler_end: image.exceptions[region_index].handler_end,
+            error,
+        });
+        true
+    }
+
+    fn unwind_exception_frame(&mut self, frame: &Frame) {
+        self.runtime.stack.truncate(frame.stack_base);
+        self.runtime.scopes.truncate(frame.scope_floor);
+        self.runtime.scope_floors.pop();
+        self.runtime.frame_stack_bases.pop();
+        self.runtime.capture_vectors.pop();
+        self.runtime.call_depth = self.runtime.call_depth.saturating_sub(1);
+        self.runtime.call_trace.pop();
     }
 
     fn error_for(
@@ -469,6 +671,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         &mut self,
         request: CallRequest,
         span: Span,
+        call_site_offset: usize,
         image: &Image<'_>,
         frames: &mut Vec<Frame>,
     ) -> Result<(), RuntimeError> {
@@ -537,6 +740,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.scopes.push(parameters);
         self.runtime.capture_vectors.push(Vec::new());
         self.runtime.call_depth += 1;
+        self.runtime
+            .call_trace
+            .push(crate::runtime::StackTraceFrame {
+                function_id: request.function_id.clone(),
+                call_site: span,
+            });
         frames.push(Frame::function(
             function_index,
             function,
@@ -544,6 +753,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             scope_floor,
             self.runtime.scopes.len(),
             request.return_action,
+            call_site_offset,
         ));
         Ok(())
     }
@@ -1276,8 +1486,26 @@ struct Image<'a> {
     constants: Vec<Constant>,
     functions: Vec<FunctionRecord>,
     modules: Vec<ModuleRecord>,
+    exceptions: Vec<ExceptionRegion>,
     entry_module: u32,
     source_spans: HashMap<(usize, usize), Span>,
+}
+
+#[derive(Clone, Debug)]
+struct ExceptionRegion {
+    function_index: u32,
+    protected_start: usize,
+    protected_end: usize,
+    handler_offset: usize,
+    handler_end: usize,
+    stack_depth: u32,
+}
+
+#[derive(Clone, Debug)]
+struct PendingException {
+    handler_start: usize,
+    handler_end: usize,
+    error: RuntimeError,
 }
 
 impl<'a> Image<'a> {
@@ -1293,6 +1521,7 @@ impl<'a> Image<'a> {
             return Err("module imports are not implemented by this runtime slice".into());
         }
         let functions = parse_functions(section(bytes, &sections, 3)?, &constants)?;
+        let exceptions = parse_exceptions(section(bytes, &sections, 6)?)?;
         let code = section(bytes, &sections, 4)?;
         let entry_function = functions
             .get(modules[entry_module as usize].initializer_index as usize)
@@ -1312,6 +1541,7 @@ impl<'a> Image<'a> {
             constants,
             functions,
             modules,
+            exceptions,
             entry_module,
             source_spans,
         })
@@ -1337,6 +1567,9 @@ struct Frame {
     initializer: bool,
     return_action: ReturnAction,
     loop_states: HashMap<u32, LoopState>,
+    call_site_offset: usize,
+    pending_exceptions: Vec<PendingException>,
+    active_exceptions: HashMap<usize, super::ExecutionSnapshot>,
 }
 
 impl Frame {
@@ -1351,6 +1584,9 @@ impl Frame {
             initializer: true,
             return_action: ReturnAction::PushResult,
             loop_states: HashMap::new(),
+            call_site_offset: 0,
+            pending_exceptions: Vec::new(),
+            active_exceptions: HashMap::new(),
             function,
         }
     }
@@ -1362,6 +1598,7 @@ impl Frame {
         scope_floor: usize,
         base_scope_depth: usize,
         return_action: ReturnAction,
+        call_site_offset: usize,
     ) -> Self {
         Self {
             function_index,
@@ -1373,6 +1610,9 @@ impl Frame {
             initializer: false,
             return_action,
             loop_states: HashMap::new(),
+            call_site_offset,
+            pending_exceptions: Vec::new(),
+            active_exceptions: HashMap::new(),
             function,
         }
     }
@@ -1420,6 +1660,7 @@ enum Instruction {
     ScopeExit,
     ReturnTop(u32),
     Trap,
+    Rethrow,
     Halt,
 }
 
@@ -1513,6 +1754,42 @@ fn parse_constants(bytes: &[u8]) -> Result<Vec<Constant>, String> {
     }
     reader.finish("ConstantPool")?;
     Ok(constants)
+}
+
+fn parse_exceptions(bytes: &[u8]) -> Result<Vec<ExceptionRegion>, String> {
+    let mut reader = Cursor::new(bytes);
+    let count = reader.count()?;
+    let mut regions = Vec::with_capacity(count);
+    for _ in 0..count {
+        let function_index = reader.u32()?;
+        let protected_start =
+            usize::try_from(reader.u64()?).map_err(|_| "exception start offset overflow")?;
+        let protected_end =
+            usize::try_from(reader.u64()?).map_err(|_| "exception end offset overflow")?;
+        let handler_offset =
+            usize::try_from(reader.u64()?).map_err(|_| "exception handler offset overflow")?;
+        let handler_end =
+            usize::try_from(reader.u64()?).map_err(|_| "exception handler end overflow")?;
+        let stack_depth = reader.u32()?;
+        let type_constant_index = reader.u32()?;
+        let flags = reader.u32()?;
+        if type_constant_index != u32::MAX {
+            return Err("typed exception handlers are not supported by this runtime slice".into());
+        }
+        if flags != 0 {
+            return Err("exception flags must be zero".into());
+        }
+        regions.push(ExceptionRegion {
+            function_index,
+            protected_start,
+            protected_end,
+            handler_offset,
+            handler_end,
+            stack_depth,
+        });
+    }
+    reader.finish("ExceptionTable")?;
+    Ok(regions)
 }
 
 fn parse_modules(bytes: &[u8]) -> Result<(Vec<ModuleRecord>, u32), String> {
@@ -1711,6 +1988,7 @@ fn decode_instruction<R: BufRead, W: Write>(
                 })?)
             }
             0xE8 => Instruction::Trap,
+            0xE9 => Instruction::Rethrow,
             0xFF => Instruction::Halt,
             _ => {
                 return Err(runtime.error(

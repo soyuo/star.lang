@@ -111,6 +111,9 @@ The bit pattern column for a basic instruction records its source-symbol sequenc
 | `0x77` | `01110111` | `object.implement` | `IMPLEMENT` | `''***'***"` | `27 27 2A 2A 2A 27 2A 2A 2A 22` |
 | `0x78` | `01111000` | `object.is` | `OBJECT_IS` | `''****'''"` | `27 27 2A 2A 2A 2A 27 27 27 22` |
 | `0x79` | `01111001` | `object.clone` | `OBJECT_CLONE` | `''****''*"` | `27 27 2A 2A 2A 2A 27 27 2A 22` |
+| `0x87` | `10000111` | `exception.try` | `TRY` | `'*''''***"` | `27 2A 27 27 27 27 2A 2A 2A 22` |
+| `0x88` | `10001000` | `exception.catch` | `CATCH` | `'*'''*'''"` | `27 2A 27 27 27 2A 27 27 27 22` |
+| `0x89` | `10001001` | `exception.finally` | `FINALLY` | `'*'''*''*"` | `27 2A 27 27 27 2A 27 27 2A 22` |
 | `0x90` | `10010000` | `module.import` | `IMPORT` | `'*''*''''"` | `27 2A 27 27 2A 27 27 27 27 22` |
 | `0x91` | `10010001` | `module.export` | `EXPORT` | `'*''*'''*"` | `27 2A 27 27 2A 27 27 27 2A 22` |
 | `0x92` | `10010010` | `module.get` | `MODULE_GET` | `'*''*''*'"` | `27 2A 27 27 2A 27 27 2A 27 22` |
@@ -136,10 +139,9 @@ The bit pattern column for a basic instruction records its source-symbol sequenc
 | `0xB3` | `10110011` | `ffi.native_close` | `NATIVE_CLOSE` | `'*'**''**"` | `27 2A 27 2A 2A 27 27 2A 2A 22` |
 | `0xB4` | `10110100` | `ffi.native_callback` | `NATIVE_CALLBACK` | `'*'**'*''"` | `27 2A 27 2A 2A 27 2A 27 27 22` |
 | `0xB5` | `10110101` | `ffi.native_buffer` | `NATIVE_BUFFER` | `'*'**'*'*"` | `27 2A 27 2A 2A 27 2A 27 2A 22` |
-
 ## Unassigned and pending values
 
-Only entries listed in `spec/opcodes.toml` are assigned source instructions. Gaps within an allocation family and ranges marked reserved are invalid as source opcodes until assigned in that catalog. The exception-handling candidates `0x80-0x86` remain pending: the referenced exception document labels them as VM opcodes, and no source mapping has been approved. They therefore have no source spelling in this document. The `0xFF` page prefix is reserved and is not currently an instruction.
+Only entries listed in `spec/opcodes.toml` are assigned source instructions. Gaps within an allocation family and ranges marked reserved are invalid as source opcodes until assigned in that catalog. Historical VM candidates `0x80-0x86` remain unassigned in the source namespace. Source `TRY`, `CATCH`, and `FINALLY` use the separate source opcodes `0x87-0x89`. The `0xFF` page prefix is reserved and is not currently an instruction.
 
 ## Source and bytecode separation
 

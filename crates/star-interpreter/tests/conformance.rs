@@ -81,6 +81,7 @@ fn module(blocks: Vec<BasicBlock>, max_stack: u32) -> ModuleIr {
             entry: 0,
             max_stack,
             blocks,
+            exception_regions: Vec::new(),
         },
         functions: Vec::new(),
     }
