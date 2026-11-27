@@ -36,13 +36,29 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
 
     /// Sets the maximum number of executed bytecode instructions.
     pub fn with_execution_limit(mut self, limit: u64) -> Self {
-        self.runtime.execution_limit = limit.max(1);
+        self.runtime.limits.max_instructions = limit.max(1);
         self
     }
 
     /// Sets the maximum number of nested bytecode function calls.
     pub fn with_call_depth_limit(mut self, limit: usize) -> Self {
-        self.runtime.call_depth_limit = limit.max(1);
+        self.runtime.limits.max_call_depth = limit.max(1);
+        self
+    }
+
+    /// Sets all runtime resource ceilings and narrows verifier stack/instruction limits.
+    pub fn with_execution_limits(mut self, limits: super::ExecutionLimits) -> Self {
+        self.policy.limits.max_instructions = self
+            .policy
+            .limits
+            .max_instructions
+            .min(limits.max_instructions);
+        self.policy.limits.max_stack_depth = self
+            .policy
+            .limits
+            .max_stack_depth
+            .min(u32::try_from(limits.max_stack_values).unwrap_or(u32::MAX));
+        self.runtime.limits = limits;
         self
     }
 
@@ -62,6 +78,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     /// Verifies and executes a `.starc` program, returning the module result.
     pub fn execute(&mut self, bytes: &[u8]) -> Result<Value, RuntimeError> {
         self.reset_state();
+        self.runtime.begin_execution();
         let result = (|| {
             let verified = verify_bytecode(bytes, &self.policy).map_err(|error| {
                 self.runtime.error(
@@ -142,6 +159,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 return Ok(Value::Null);
             };
             let stack_depth = self.runtime.stack.len().saturating_sub(frame.stack_base);
+            if self.runtime.stack.len() > self.runtime.limits.max_stack_values {
+                return Err(self.runtime.error(
+                    RuntimeErrorKind::ResourceLimit("operand stack"),
+                    image.span(frame.function_index, frame.function.code_offset + frame.ip),
+                ));
+            }
             if stack_depth > frame.function.max_stack as usize
                 || stack_depth
                     > usize::try_from(self.policy.limits.max_stack_depth).unwrap_or(usize::MAX)
@@ -160,7 +183,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 ));
             }
             self.runtime.executed_steps = self.runtime.executed_steps.saturating_add(1);
-            if self.runtime.executed_steps > self.runtime.execution_limit {
+            if self.runtime.executed_steps > self.runtime.limits.max_instructions {
                 return Err(self.runtime.error(
                     RuntimeErrorKind::ExecutionLimit,
                     image.span(frame.function_index, frame.function.code_offset + frame.ip),
@@ -172,6 +195,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             self.expire_pending_exceptions(frames.last_mut().expect("active frame"));
             self.activate_exception_regions(image, frames.last_mut().expect("active frame"));
             let span = image.span(function_index, absolute_code_offset);
+            self.runtime.check_resource_limits(span)?;
             let instruction = {
                 let frame = frames.last_mut().expect("active frame");
                 decode_instruction(image, frame, span, &self.runtime)?
@@ -183,8 +207,11 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 instruction_offset,
                 span,
             ) {
-                Ok(Some(value)) => return Ok(value),
-                Ok(None) => {}
+                Ok(Some(value)) => {
+                    self.runtime.check_resource_limits(span)?;
+                    return Ok(value);
+                }
+                Ok(None) => self.runtime.check_resource_limits(span)?,
                 Err(error) => {
                     if self.dispatch_exception(
                         image,
@@ -509,15 +536,9 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         };
         for capability in required {
             if !self.policy.granted_capabilities.contains(capability) {
-                let name = match capability {
-                    Capability::FsRead => "fs.read",
-                    Capability::EnvRead => "env.read",
-                    Capability::Clock => "clock",
-                    Capability::Ffi => "ffi",
-                };
                 return Err(self
                     .runtime
-                    .error(RuntimeErrorKind::PermissionError(name), span));
+                    .error(RuntimeErrorKind::PermissionError(capability.name()), span));
             }
         }
         Ok(())
@@ -692,7 +713,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         if function.asynchronous {
             return Err(self.unsupported(span, "async task scheduling"));
         }
-        if self.runtime.call_depth >= self.runtime.call_depth_limit {
+        if self.runtime.call_depth >= self.runtime.limits.max_call_depth {
             return Err(self.runtime.error(RuntimeErrorKind::StackOverflow, span));
         }
         let required = if function.rest_parameter_code == 0 {
@@ -774,9 +795,10 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Mod => self.runtime.arithmetic(5, span)?,
             Print => {
                 let value = self.runtime.pop(span)?;
+                let formatted = self.runtime.format_value(&value, span)?;
                 self.runtime
                     .output
-                    .write_all(value.to_string().as_bytes())
+                    .write_all(formatted.as_bytes())
                     .map_err(|error| {
                         self.runtime
                             .error(RuntimeErrorKind::IOError(error.to_string()), span)
@@ -912,7 +934,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Utf8Decode => self.runtime.utf8_decode(span)?,
             ToString => {
                 let value = self.runtime.pop(span)?;
-                self.runtime.stack.push(Value::String(value.to_string()));
+                let formatted = self.runtime.format_value(&value, span)?;
+                self.runtime.stack.push(Value::String(formatted));
             }
             ToChar => self.runtime.to_char(span)?,
             ToByte => self.runtime.to_byte(span)?,
@@ -1222,6 +1245,9 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 span,
             ));
         }
+        let value_bytes = usize::try_from(value.bits().saturating_add(7) / 8).unwrap_or(usize::MAX);
+        self.runtime
+            .ensure_memory_budget(width.saturating_add(value_bytes), span)?;
         let (_, mut bytes) = value.to_bytes_be();
         if value.is_zero() && width == 0 {
             bytes.clear();
@@ -1292,10 +1318,22 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 return Err(self.runtime.error(RuntimeErrorKind::ExecutionLimit, span));
             };
             let max_bits = self.policy.limits.max_file_bytes.saturating_mul(8) as u64;
-            let base_bytes = base_int.to_bytes_be().1.len() as u64;
-            if base_bytes.saturating_mul(power as u64) > max_bits.saturating_add(8) {
+            let result_bits = base_int.bits().saturating_mul(power as u64);
+            if result_bits > max_bits.saturating_add(8) {
                 return Err(self.runtime.error(RuntimeErrorKind::ExecutionLimit, span));
             }
+            let result_bytes =
+                usize::try_from(result_bits.saturating_add(7) / 8).unwrap_or(usize::MAX);
+            let operand_bytes = usize::try_from(
+                base_int
+                    .bits()
+                    .saturating_add(exponent_int.bits())
+                    .saturating_add(7)
+                    / 8,
+            )
+            .unwrap_or(usize::MAX);
+            self.runtime
+                .ensure_memory_budget(result_bytes.saturating_add(operand_bytes), span)?;
             self.runtime.stack.push(Value::Int(base_int.pow(power)));
             return Ok(());
         }

@@ -3,7 +3,10 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::io::{BufRead, Write};
+use std::mem::size_of;
+use std::time::{Duration, Instant};
 
 use num_bigint::Sign;
 use num_traits::Zero;
@@ -55,6 +58,8 @@ pub enum RuntimeErrorKind {
     StackOverflow,
     /// The configured statement execution limit was exceeded.
     ExecutionLimit,
+    /// A configured runtime memory, operand-stack, or wall-clock ceiling was exceeded.
+    ResourceLimit(&'static str),
     /// The instruction is valid source but not implemented by this execution slice.
     UnsupportedInstruction(InstructionOpcode),
     /// The parsed construct belongs to a later reference-execution slice.
@@ -81,6 +86,7 @@ impl fmt::Display for RuntimeErrorKind {
             Self::CompileError(reason) => write!(formatter, "compile error: {reason}"),
             Self::StackOverflow => formatter.write_str("function call-depth limit exceeded"),
             Self::ExecutionLimit => formatter.write_str("execution step limit exceeded"),
+            Self::ResourceLimit(resource) => write!(formatter, "{resource} limit exceeded"),
             Self::UnsupportedInstruction(opcode) => {
                 write!(formatter, "unsupported instruction: {opcode:?}")
             }
@@ -94,10 +100,38 @@ impl RuntimeErrorKind {
         matches!(
             self,
             Self::ExecutionLimit
+                | Self::ResourceLimit(_)
                 | Self::CompileError(_)
                 | Self::UnsupportedInstruction(_)
                 | Self::Unsupported(_)
         )
+    }
+}
+
+/// Host-configurable ceilings enforced during one interpreter or VM execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionLimits {
+    /// Estimated guest runtime storage, including managed values and containers.
+    pub max_memory_bytes: usize,
+    /// Maximum total operand values across active call frames.
+    pub max_stack_values: usize,
+    /// Maximum nested function calls.
+    pub max_call_depth: usize,
+    /// Maximum executed source statements or bytecode instructions.
+    pub max_instructions: u64,
+    /// Cooperative wall-clock deadline, checked between statements/instructions.
+    pub max_execution_time: Duration,
+}
+
+impl Default for ExecutionLimits {
+    fn default() -> Self {
+        Self {
+            max_memory_bytes: 256 * 1024 * 1024,
+            max_stack_values: 65_536,
+            max_call_depth: 512,
+            max_instructions: 10_000_000,
+            max_execution_time: Duration::from_secs(30),
+        }
     }
 }
 
@@ -142,6 +176,28 @@ impl fmt::Display for RuntimeError {
     }
 }
 
+struct LimitedString {
+    value: String,
+    limit: usize,
+}
+
+impl fmt::Write for LimitedString {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let required = self.value.len().saturating_add(text.len());
+        if required > self.limit {
+            return Err(fmt::Error);
+        }
+        self.value
+            .try_reserve_exact(text.len())
+            .map_err(|_| fmt::Error)?;
+        if self.value.capacity() > self.limit {
+            return Err(fmt::Error);
+        }
+        self.value.push_str(text);
+        Ok(())
+    }
+}
+
 impl std::error::Error for RuntimeError {}
 
 /// An interpreter instance with injectable standard input and output.
@@ -164,9 +220,9 @@ pub struct Interpreter<R: BufRead, W: Write> {
     gc: GcHeap,
     call_depth: usize,
     call_trace: Vec<StackTraceFrame>,
-    call_depth_limit: usize,
+    limits: ExecutionLimits,
+    execution_started: Option<Instant>,
     executed_steps: u64,
-    execution_limit: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -205,21 +261,27 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             gc: GcHeap::default(),
             call_depth: 0,
             call_trace: Vec::new(),
-            call_depth_limit: 512,
+            limits: ExecutionLimits::default(),
+            execution_started: None,
             executed_steps: 0,
-            execution_limit: 10_000_000,
         }
+    }
+
+    /// Sets all runtime resource ceilings for subsequent executions.
+    pub fn with_execution_limits(mut self, limits: ExecutionLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Sets the maximum number of nested direct calls accepted by this instance.
     pub fn with_call_depth_limit(mut self, limit: usize) -> Self {
-        self.call_depth_limit = limit.max(1);
+        self.limits.max_call_depth = limit.max(1);
         self
     }
 
     /// Sets the maximum number of executed statements accepted by this instance.
     pub fn with_execution_limit(mut self, limit: u64) -> Self {
-        self.execution_limit = limit.max(1);
+        self.limits.max_instructions = limit.max(1);
         self
     }
 
@@ -241,6 +303,94 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         if self.gc.should_collect() {
             let _ = self.collect_garbage();
         }
+    }
+
+    fn begin_execution(&mut self) {
+        self.executed_steps = 0;
+        self.execution_started = Some(Instant::now());
+    }
+
+    fn check_resource_limits(&mut self, span: Span) -> Result<(), RuntimeError> {
+        if self.stack.len() > self.limits.max_stack_values {
+            return Err(self.error(RuntimeErrorKind::ResourceLimit("operand stack"), span));
+        }
+        if self
+            .execution_started
+            .is_some_and(|started| started.elapsed() >= self.limits.max_execution_time)
+        {
+            return Err(self.error(RuntimeErrorKind::ResourceLimit("execution time"), span));
+        }
+        if self.executed_steps != 0 && self.executed_steps % 32 != 0 {
+            return Ok(());
+        }
+
+        self.ensure_memory_budget(0, span)?;
+        Ok(())
+    }
+
+    fn ensure_memory_budget(&mut self, additional: usize, span: Span) -> Result<(), RuntimeError> {
+        let mut estimated = self
+            .gc
+            .estimated_memory_bytes(
+                &self.stack,
+                &self.scopes,
+                &self.capture_vectors,
+                self.limits.max_memory_bytes,
+            )
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span))?;
+        if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
+            self.collect_garbage().map_err(|_| {
+                self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
+            })?;
+            estimated = self
+                .gc
+                .estimated_memory_bytes(
+                    &self.stack,
+                    &self.scopes,
+                    &self.capture_vectors,
+                    self.limits.max_memory_bytes,
+                )
+                .map_err(|_| {
+                    self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
+                })?;
+        }
+        if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
+            return Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span));
+        }
+        Ok(())
+    }
+
+    fn available_memory_bytes(&mut self, span: Span) -> Result<usize, RuntimeError> {
+        self.ensure_memory_budget(0, span)?;
+        self.gc
+            .estimated_memory_bytes(
+                &self.stack,
+                &self.scopes,
+                &self.capture_vectors,
+                self.limits.max_memory_bytes,
+            )
+            .map(|estimated| self.limits.max_memory_bytes.saturating_sub(estimated))
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span))
+    }
+
+    pub(crate) fn format_value(
+        &mut self,
+        value: &Value,
+        span: Span,
+    ) -> Result<String, RuntimeError> {
+        let input_bytes = estimated_unmanaged_payload_bytes(value, 0);
+        self.ensure_memory_budget(input_bytes, span)?;
+        let output_limit = self
+            .available_memory_bytes(span)?
+            .saturating_sub(input_bytes);
+        let mut output = LimitedString {
+            value: String::new(),
+            limit: output_limit,
+        };
+        if output.write_fmt(format_args!("{value}")).is_err() {
+            return Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span));
+        }
+        Ok(output.value)
     }
 
     fn allocate_array(&mut self, values: Vec<Value>) -> Value {
@@ -273,6 +423,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     /// Executes supported statements in source order.
     pub fn execute(&mut self, program: &Program) -> Result<(), RuntimeError> {
+        self.begin_execution();
         let stack_base = self.stack.len();
         let scope_base = self.scopes.len();
         let scope_floor_base = self.scope_floors.len();
@@ -294,7 +445,6 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     fn execute_program(&mut self, program: &Program) -> Result<(), RuntimeError> {
-        self.executed_steps = 0;
         self.structs.clear();
         self.interfaces.clear();
         self.capture_vectors = vec![Vec::new()];
@@ -308,8 +458,20 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             .into_iter()
             .map(|function| (function.id.clone(), function))
             .collect();
+        self.check_resource_limits(
+            program
+                .statements
+                .first()
+                .map(statement_span)
+                .unwrap_or_else(empty_span),
+        )?;
+        let final_span = program
+            .statements
+            .last()
+            .map(statement_span)
+            .unwrap_or_else(empty_span);
         match self.execute_statements(&program.statements)? {
-            ControlFlow::Normal => Ok(()),
+            ControlFlow::Normal => self.check_resource_limits(final_span),
             ControlFlow::Break => Err(self.error(
                 RuntimeErrorKind::CompileError("BREAK outside a loop".to_owned()),
                 program
@@ -416,6 +578,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 }
                 Statement::Function(block) => self.consume_function_header(block)?,
             }
+            self.check_resource_limits(statement_span(statement))?;
         }
         Ok(ControlFlow::Normal)
     }
@@ -668,7 +831,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         }
-        if self.call_depth >= self.call_depth_limit {
+        if self.call_depth >= self.limits.max_call_depth {
             return Err(self.error(RuntimeErrorKind::StackOverflow, span));
         }
 
@@ -1126,8 +1289,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Basic(opcode @ 1..=5) => self.arithmetic(opcode, span),
             InstructionOpcode::Basic(6) => {
                 let value = self.pop(span)?;
+                let formatted = self.format_value(&value, span)?;
                 self.output
-                    .write_all(value.to_string().as_bytes())
+                    .write_all(formatted.as_bytes())
                     .map_err(|error| self.error(RuntimeErrorKind::IOError(error.to_string()), span))
             }
             InstructionOpcode::Basic(7) => {
@@ -1177,7 +1341,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x15) => self.utf8_decode(span),
             InstructionOpcode::Extended(0x13) => {
                 let value = self.pop(span)?;
-                self.stack.push(Value::String(value.to_string()));
+                let formatted = self.format_value(&value, span)?;
+                self.stack.push(Value::String(formatted));
                 Ok(())
             }
             InstructionOpcode::Extended(0x1D) => self.to_char(span),
@@ -1383,6 +1548,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         }
+        self.ensure_memory_budget(count.saturating_mul(size_of::<Value>()), span)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
             values.push(self.pop(span)?);
@@ -1420,6 +1586,21 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         }
+        let first_key_index = self.stack.len() - operand_count;
+        let duplicated_key_bytes = (0..count).fold(0usize, |total, pair_index| {
+            total.saturating_add(estimated_key_clone_bytes(
+                &self.stack[first_key_index + pair_index * 2],
+                0,
+            ))
+        });
+        let table_bytes = count.saturating_mul(
+            size_of::<(RuntimeKey, Value, Value)>()
+                .saturating_add(size_of::<(RuntimeKey, Value)>().saturating_mul(4)),
+        );
+        self.ensure_memory_budget(
+            table_bytes.saturating_add(duplicated_key_bytes.saturating_mul(2)),
+            span,
+        )?;
         let mut pairs = Vec::with_capacity(count);
         for _ in 0..count {
             let value = self.pop(span)?;
@@ -1446,6 +1627,23 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn set_new(&mut self, span: Span) -> Result<(), RuntimeError> {
         let values = self.pop_collection_items(span)?;
+        let collection_bytes = values.len().saturating_mul(
+            size_of::<Value>()
+                .saturating_add(size_of::<RuntimeKey>())
+                .saturating_mul(3),
+        );
+        let duplicated_key_bytes = values.iter().fold(0usize, |total, value| {
+            total.saturating_add(estimated_key_clone_bytes(value, 0))
+        });
+        let temporary_payload_bytes = values.iter().fold(0usize, |total, value| {
+            total.saturating_add(estimated_unmanaged_payload_bytes(value, 0))
+        });
+        self.ensure_memory_budget(
+            collection_bytes
+                .saturating_add(duplicated_key_bytes.saturating_mul(2))
+                .saturating_add(temporary_payload_bytes),
+            span,
+        )?;
         let mut set = SetState {
             members: HashSet::with_capacity(values.len()),
             order: Vec::with_capacity(values.len()),
@@ -1473,6 +1671,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         }
+        self.ensure_memory_budget(count.saturating_mul(size_of::<Value>()), span)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
             values.push(self.pop(span)?);
@@ -1758,15 +1957,61 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn advance_step(&mut self, span: Span) -> Result<(), RuntimeError> {
         self.executed_steps = self.executed_steps.saturating_add(1);
-        if self.executed_steps > self.execution_limit {
+        if self.executed_steps > self.limits.max_instructions {
             return Err(self.error(RuntimeErrorKind::ExecutionLimit, span));
         }
-        Ok(())
+        self.check_resource_limits(span)
     }
 
     fn concat(&mut self, span: Span) -> Result<(), RuntimeError> {
         let right = self.pop(span)?;
         let left = self.pop(span)?;
+        let additional_bytes = match (&left, &right) {
+            (Value::String(left), Value::String(right)) => left
+                .capacity()
+                .saturating_add(right.capacity())
+                .saturating_add(left.len())
+                .saturating_add(right.len()),
+            (Value::Bytes(left), Value::Bytes(right)) => left
+                .capacity()
+                .saturating_add(right.capacity())
+                .saturating_add(left.len())
+                .saturating_add(right.len()),
+            (Value::Array(left), Value::Array(right)) => {
+                let left_values = left.borrow();
+                let right_values = right.borrow();
+                let result_len = left_values.len().saturating_add(right_values.len());
+                let result_capacity_bytes = result_len
+                    .saturating_mul(2)
+                    .saturating_mul(size_of::<Value>());
+                let temporary_clone_bytes =
+                    left_values.capacity().saturating_mul(size_of::<Value>());
+                let cloned_payload_bytes = estimate_cloned_value_payloads(&left_values)
+                    .saturating_add(estimate_cloned_value_payloads(&right_values));
+                result_capacity_bytes
+                    .saturating_add(temporary_clone_bytes)
+                    .saturating_add(cloned_payload_bytes)
+            }
+            (Value::Tuple(left), Value::Tuple(right)) => {
+                let left_values = left.values.borrow();
+                let right_values = right.values.borrow();
+                let result_len = left_values.len().saturating_add(right_values.len());
+                let result_capacity_bytes = result_len
+                    .saturating_mul(2)
+                    .saturating_mul(size_of::<Value>());
+                let temporary_clone_bytes =
+                    left_values.capacity().saturating_mul(size_of::<Value>());
+                let cloned_payload_bytes = estimate_cloned_value_payloads(&left_values)
+                    .saturating_add(estimate_cloned_value_payloads(&right_values));
+                result_capacity_bytes
+                    .saturating_add(temporary_clone_bytes)
+                    .saturating_add(cloned_payload_bytes)
+            }
+            _ => 0,
+        };
+        if additional_bytes > 0 {
+            self.ensure_memory_budget(additional_bytes, span)?;
+        }
         let result = match (left, right) {
             (Value::String(mut left), Value::String(right)) => {
                 left.push_str(&right);
@@ -1817,6 +2062,15 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             if right == &BigInt::from(0) {
                 return Err(self.error(RuntimeErrorKind::DivisionByZero, span));
             }
+            let input_bytes =
+                estimated_bigint_bytes(left).saturating_add(estimated_bigint_bytes(right));
+            let max_operand_bytes =
+                usize::try_from(left.bits().max(right.bits()).saturating_add(7) / 8)
+                    .unwrap_or(usize::MAX);
+            self.ensure_memory_budget(
+                input_bytes.saturating_add(max_operand_bytes.saturating_mul(3)),
+                span,
+            )?;
             let quotient = left / right;
             self.stack.push(Value::Int(left - quotient * right));
             return Ok(());
@@ -1827,6 +2081,17 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 if opcode == 4 && b == &BigInt::from(0) {
                     return Err(self.error(RuntimeErrorKind::DivisionByZero, span));
                 }
+                let input_bytes =
+                    estimated_bigint_bytes(a).saturating_add(estimated_bigint_bytes(b));
+                let result_bits = match opcode {
+                    1 | 2 => a.bits().max(b.bits()).saturating_add(1),
+                    3 => a.bits().saturating_add(b.bits()),
+                    4 => a.bits(),
+                    _ => unreachable!("basic arithmetic opcode was range-checked"),
+                };
+                let result_bytes =
+                    usize::try_from(result_bits.saturating_add(7) / 8).unwrap_or(usize::MAX);
+                self.ensure_memory_budget(input_bytes.saturating_add(result_bytes), span)?;
                 let result = match opcode {
                     1 => a + b,
                     2 => a - b,
@@ -2070,6 +2335,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     }
 
     fn read_input_line(&mut self, span: Span) -> Result<Option<Vec<u8>>, RuntimeError> {
+        let max_line_bytes = self.available_memory_bytes(span)?;
+        let memory_error = self.error(RuntimeErrorKind::ResourceLimit("memory"), span);
         let mut line = Vec::new();
         loop {
             let buffer = match self.input.fill_buf() {
@@ -2086,6 +2353,9 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .position(|byte| *byte == b'\n' || *byte == b'\r')
             {
                 let terminator = buffer[index];
+                if Self::reserve_input_bytes(&mut line, index, max_line_bytes).is_err() {
+                    return Err(memory_error);
+                }
                 line.extend_from_slice(&buffer[..index]);
                 self.input.consume(index + 1);
                 if terminator == b'\r' {
@@ -2104,9 +2374,27 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 return Ok(Some(line));
             }
             let length = buffer.len();
+            if Self::reserve_input_bytes(&mut line, length, max_line_bytes).is_err() {
+                return Err(memory_error);
+            }
             line.extend_from_slice(buffer);
             self.input.consume(length);
         }
+    }
+
+    fn reserve_input_bytes(
+        line: &mut Vec<u8>,
+        additional: usize,
+        max_line_bytes: usize,
+    ) -> Result<(), ()> {
+        if line.len().saturating_add(additional) > max_line_bytes {
+            return Err(());
+        }
+        line.try_reserve_exact(additional).map_err(|_| ())?;
+        if line.capacity() > max_line_bytes {
+            return Err(());
+        }
+        Ok(())
     }
 
     fn type_error(&self, expected: &'static str, found: &Value, span: Span) -> RuntimeError {
@@ -2139,6 +2427,76 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::Scope(block) => block.span,
         Statement::Try(block) => block.span,
     }
+}
+
+fn estimated_key_clone_bytes(value: &Value, depth: usize) -> usize {
+    if depth >= 256 {
+        return usize::MAX;
+    }
+    match value {
+        Value::Int(value) => {
+            usize::try_from(value.bits().saturating_add(7) / 8).unwrap_or(usize::MAX)
+        }
+        Value::String(value) => value.capacity(),
+        Value::Bytes(value) => value.capacity(),
+        Value::Tuple(values) => {
+            let values = values.values.borrow();
+            values
+                .len()
+                .saturating_mul(size_of::<RuntimeKey>())
+                .saturating_add(values.iter().fold(0usize, |total, child| {
+                    total.saturating_add(estimated_key_clone_bytes(child, depth + 1))
+                }))
+        }
+        Value::Float(_)
+        | Value::Bool(_)
+        | Value::Byte(_)
+        | Value::Char(_)
+        | Value::Null
+        | Value::Array(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::Iterator(_)
+        | Value::Function(_)
+        | Value::Closure(_)
+        | Value::Object(_) => 0,
+    }
+}
+
+fn estimated_unmanaged_payload_bytes(value: &Value, depth: usize) -> usize {
+    if depth >= 256 {
+        return usize::MAX;
+    }
+    match value {
+        Value::Int(value) => estimated_bigint_bytes(value),
+        Value::String(value) => value.capacity(),
+        Value::Bytes(value) => value.capacity(),
+        Value::Function(function) => {
+            usize::try_from(function.id.bits().saturating_add(7) / 8).unwrap_or(usize::MAX)
+        }
+        Value::Float(_)
+        | Value::Bool(_)
+        | Value::Byte(_)
+        | Value::Char(_)
+        | Value::Null
+        | Value::Array(_)
+        | Value::Tuple(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::Iterator(_)
+        | Value::Closure(_)
+        | Value::Object(_) => 0,
+    }
+}
+
+fn estimated_bigint_bytes(value: &BigInt) -> usize {
+    usize::try_from(value.bits().saturating_add(7) / 8).unwrap_or(usize::MAX)
+}
+
+fn estimate_cloned_value_payloads(values: &[Value]) -> usize {
+    values.iter().fold(0usize, |total, value| {
+        total.saturating_add(estimated_unmanaged_payload_bytes(value, 0))
+    })
 }
 
 fn empty_span() -> Span {
