@@ -251,7 +251,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                             super::estimated_unmanaged_payload_bytes(value, 0),
                             span,
                         )?;
-                        self.runtime.stack.push(value.clone());
+                        self.runtime.push_value(value.clone(), span)?;
                     }
                     Constant::FunctionRef(function_index) => {
                         let function =
@@ -279,10 +279,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                             span,
                         )?;
                         let id = function_id.clone();
-                        self.runtime.stack.push(Value::Function(FunctionRef {
-                            module_index: function.module_index,
-                            id,
-                        }));
+                        self.runtime.push_value(
+                            Value::Function(FunctionRef {
+                                module_index: function.module_index,
+                                id,
+                            }),
+                            span,
+                        )?;
                     }
                     Constant::TypeRef => {
                         return Err(self.unsupported(span, "type constant values"));
@@ -351,8 +354,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     return Ok(Some(value));
                 }
                 match action {
-                    ReturnAction::PushResult => self.runtime.stack.push(value),
-                    ReturnAction::PushValue(value) => self.runtime.stack.push(value),
+                    ReturnAction::PushResult => self.runtime.push_value(value, span)?,
+                    ReturnAction::PushValue(value) => self.runtime.push_value(value, span)?,
                 }
             }
             Instruction::Halt => {
@@ -730,21 +733,22 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     span,
                 )
             })?;
-        let function = image.functions[function_index].clone();
-        if function.asynchronous {
+        let function_record = &image.functions[function_index];
+        if function_record.asynchronous {
             return Err(self.unsupported(span, "async task scheduling"));
         }
         if self.runtime.call_depth >= self.runtime.limits.max_call_depth {
             return Err(self.runtime.error(RuntimeErrorKind::StackOverflow, span));
         }
-        let required = if function.rest_parameter_code == 0 {
-            function.parameter_ids.len()
+        let parameter_count = function_record.parameter_ids.len();
+        let required = if function_record.rest_parameter_code == 0 {
+            parameter_count
         } else {
-            function.parameter_ids.len().saturating_sub(1)
+            parameter_count.saturating_sub(1)
         };
         if request.arguments.len() < required
-            || (function.rest_parameter_code == 0
-                && request.arguments.len() != function.parameter_ids.len())
+            || (function_record.rest_parameter_code == 0
+                && request.arguments.len() != parameter_count)
         {
             return Err(self.runtime.error(
                 RuntimeErrorKind::TypeError {
@@ -754,6 +758,99 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 span,
             ));
         }
+        let fixed_count = if function_record.rest_parameter_code == 0 {
+            parameter_count
+        } else {
+            parameter_count.saturating_sub(1)
+        };
+        let rest_count = request.arguments.len().saturating_sub(fixed_count);
+        let function_copy_bytes = size_of::<FunctionRecord>()
+            .saturating_add(
+                function_record
+                    .parameter_ids
+                    .capacity()
+                    .saturating_mul(size_of::<BigInt>()),
+            )
+            .saturating_add(
+                function_record
+                    .parameter_ids
+                    .iter()
+                    .map(super::estimated_bigint_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                function_record
+                    .id
+                    .as_ref()
+                    .map_or(0, super::estimated_bigint_bytes),
+            );
+        let argument_storage_bytes = request
+            .arguments
+            .capacity()
+            .saturating_mul(size_of::<Value>())
+            .saturating_add(super::estimate_cloned_value_payloads(&request.arguments));
+        let capture_storage_bytes = request
+            .captures
+            .capacity()
+            .saturating_mul(size_of::<(BigInt, BindingCell)>())
+            .saturating_add(
+                request
+                    .captures
+                    .iter()
+                    .map(|(id, _)| super::estimated_bigint_bytes(id))
+                    .fold(0usize, usize::saturating_add),
+            );
+        let capture_scope_bytes = if request.captures.is_empty() {
+            0
+        } else {
+            request
+                .captures
+                .len()
+                .saturating_mul(size_of::<(BigInt, BindingCell)>() + 2 * size_of::<usize>())
+                .saturating_add(
+                    request
+                        .captures
+                        .iter()
+                        .map(|(id, _)| super::estimated_bigint_bytes(id))
+                        .fold(0usize, usize::saturating_add),
+                )
+        };
+        let parameter_storage_bytes = parameter_count
+            .saturating_mul(size_of::<(BigInt, BindingCell)>() + 2 * size_of::<usize>())
+            .saturating_add(
+                function_record
+                    .parameter_ids
+                    .iter()
+                    .map(super::estimated_bigint_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                parameter_count.saturating_mul(size_of::<Value>() + 4 * size_of::<usize>()),
+            )
+            .saturating_add(super::estimate_cloned_value_payloads(
+                &request.arguments[..fixed_count],
+            ));
+        let rest_array_bytes = if function_record.rest_parameter_code == 0 {
+            0
+        } else {
+            rest_count
+                .saturating_mul(size_of::<Value>())
+                .saturating_add(super::estimate_cloned_value_payloads(
+                    &request.arguments[fixed_count..],
+                ))
+                .saturating_add(size_of::<RefCell<Vec<Value>>>() + 2 * size_of::<usize>())
+        };
+        self.runtime.ensure_memory_budget(
+            function_copy_bytes
+                .saturating_add(argument_storage_bytes)
+                .saturating_add(capture_storage_bytes)
+                .saturating_add(capture_scope_bytes)
+                .saturating_add(parameter_storage_bytes)
+                .saturating_add(rest_array_bytes)
+                .saturating_add(size_of::<Frame>()),
+            span,
+        )?;
+        let function = function_record.clone();
         let scope_floor = self.runtime.scopes.len();
         let stack_base = self.runtime.stack.len();
         if !request.captures.is_empty() {
@@ -827,23 +924,28 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             }
             Input => {
                 let line = self.runtime.read_input_line(span)?;
-                self.runtime.stack.push(match line {
-                    Some(bytes) => Value::String(String::from_utf8(bytes).map_err(|_| {
-                        self.runtime.error(
-                            RuntimeErrorKind::IOError("standard input is not valid UTF-8".into()),
-                            span,
-                        )
-                    })?),
-                    None => Value::Null,
-                });
+                self.runtime.push_value(
+                    match line {
+                        Some(bytes) => Value::String(String::from_utf8(bytes).map_err(|_| {
+                            self.runtime.error(
+                                RuntimeErrorKind::IOError(
+                                    "standard input is not valid UTF-8".into(),
+                                ),
+                                span,
+                            )
+                        })?),
+                        None => Value::Null,
+                    },
+                    span,
+                )?;
             }
             Store => self.runtime.store(span)?,
             Load => self.runtime.load(span, false)?,
             Eq => self.runtime.equal(span)?,
             Gt => self.runtime.greater_than(span)?,
-            PushNull => self.runtime.stack.push(Value::Null),
-            PushTrue => self.runtime.stack.push(Value::Bool(true)),
-            PushFalse => self.runtime.stack.push(Value::Bool(false)),
+            PushNull => self.runtime.push_value(Value::Null, span)?,
+            PushTrue => self.runtime.push_value(Value::Bool(true), span)?,
+            PushFalse => self.runtime.push_value(Value::Bool(false), span)?,
             ToFloat => {
                 let value = self.runtime.pop(span)?;
                 let converted = match &value {
@@ -868,7 +970,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                             .type_error("Float-convertible value", other, span))
                     }
                 };
-                self.runtime.stack.push(Value::Float(converted));
+                self.runtime.push_value(Value::Float(converted), span)?;
             }
             ToBool => self.runtime.to_bool(span)?,
             FloatFromBits => {
@@ -885,7 +987,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         span,
                     )
                 })?;
-                self.runtime.stack.push(Value::Float(f64::from_bits(bits)));
+                self.runtime
+                    .push_value(Value::Float(f64::from_bits(bits)), span)?;
             }
             TypeOf => {
                 let value = self.runtime.pop(span)?;
@@ -946,7 +1049,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Not => {
                 let value = self.runtime.pop(span)?;
                 match value {
-                    Value::Bool(value) => self.runtime.stack.push(Value::Bool(!value)),
+                    Value::Bool(value) => self.runtime.push_value(Value::Bool(!value), span)?,
                     other => return Err(self.runtime.type_error("Bool", &other, span)),
                 }
             }
@@ -956,7 +1059,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             ToString => {
                 let value = self.runtime.pop(span)?;
                 let formatted = self.runtime.format_value(&value, span)?;
-                self.runtime.stack.push(Value::String(formatted));
+                self.runtime.push_value(Value::String(formatted), span)?;
             }
             ToChar => self.runtime.to_char(span)?,
             ToByte => self.runtime.to_byte(span)?,
@@ -1026,6 +1129,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > self.runtime.stack.len() {
                     return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
                 }
+                self.runtime
+                    .ensure_memory_budget(count.saturating_mul(size_of::<Value>()), span)?;
                 let mut arguments = Vec::with_capacity(count);
                 for _ in 0..count {
                     arguments.push(self.runtime.pop(span)?);
@@ -1059,6 +1164,16 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     if function.asynchronous {
                         return Err(self.unsupported(span, "async constructor scheduling"));
                     }
+                    self.runtime.ensure_memory_budget(
+                        arguments
+                            .capacity()
+                            .saturating_mul(size_of::<Value>())
+                            .saturating_add(super::estimate_cloned_value_payloads(&arguments))
+                            .saturating_add(
+                                count.saturating_add(1).saturating_mul(size_of::<Value>()),
+                            ),
+                        span,
+                    )?;
                     let mut arguments_with_receiver = Vec::with_capacity(count + 1);
                     arguments_with_receiver.push(object.clone());
                     arguments_with_receiver.extend(arguments);
@@ -1079,7 +1194,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         span,
                     ));
                 }
-                self.runtime.stack.push(object);
+                self.runtime.push_value(object, span)?;
             }
             FieldGet => self.runtime.field_get(span)?,
             FieldSet => self.runtime.field_set(span)?,
@@ -1102,6 +1217,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > self.runtime.stack.len() {
                     return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
                 }
+                self.runtime.ensure_memory_budget(
+                    count
+                        .saturating_add(1)
+                        .saturating_mul(size_of::<Value>())
+                        .saturating_add(super::estimated_unmanaged_payload_bytes(&receiver, 0)),
+                    span,
+                )?;
                 let mut arguments = Vec::with_capacity(count + 1);
                 for _ in 0..count {
                     arguments.push(self.runtime.pop(span)?);
@@ -1177,13 +1299,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     id: body_id,
                 };
                 if captures.is_empty() {
-                    self.runtime.stack.push(Value::Function(function));
+                    self.runtime.push_value(Value::Function(function), span)?;
                 } else {
                     let closure = self.runtime.allocate_closure(ClosureState {
                         function,
                         captures: RefCell::new(captures),
                     });
-                    self.runtime.stack.push(closure);
+                    self.runtime.push_value(closure, span)?;
                 }
             }
             CallValue => {
@@ -1194,6 +1316,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > self.runtime.stack.len() {
                     return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
                 }
+                self.runtime
+                    .ensure_memory_budget(count.saturating_mul(size_of::<Value>()), span)?;
                 let mut arguments = Vec::with_capacity(count);
                 for _ in 0..count {
                     arguments.push(self.runtime.pop(span)?);
@@ -1224,6 +1348,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > self.runtime.stack.len() {
                     return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
                 }
+                self.runtime
+                    .ensure_memory_budget(count.saturating_mul(size_of::<Value>()), span)?;
                 let mut arguments = Vec::with_capacity(count);
                 for _ in 0..count {
                     arguments.push(self.runtime.pop(span)?);
@@ -1287,7 +1413,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             padded.extend(bytes);
             bytes = padded;
         }
-        self.runtime.stack.push(Value::Bytes(bytes));
+        self.runtime.push_value(Value::Bytes(bytes), span)?;
         Ok(())
     }
 
@@ -1300,39 +1426,37 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     return Err(self.runtime.error(RuntimeErrorKind::DivisionByZero, span));
                 }
                 if base_int == &BigInt::one() {
-                    self.runtime.stack.push(Value::Int(BigInt::one()));
+                    self.runtime.push_value(Value::Int(BigInt::one()), span)?;
                 } else if base_int == &BigInt::from(-1) {
                     let odd = (exponent_int % BigInt::from(2)) != BigInt::zero();
-                    self.runtime.stack.push(Value::Int(if odd {
-                        BigInt::from(-1)
-                    } else {
-                        BigInt::one()
-                    }));
+                    self.runtime.push_value(
+                        Value::Int(if odd { BigInt::from(-1) } else { BigInt::one() }),
+                        span,
+                    )?;
                 } else {
                     let result = super::to_float(&base).powf(super::to_float(&exponent));
-                    self.runtime.stack.push(Value::Float(result));
+                    self.runtime.push_value(Value::Float(result), span)?;
                 }
                 return Ok(());
             }
             if exponent_int.is_zero() {
-                self.runtime.stack.push(Value::Int(BigInt::one()));
+                self.runtime.push_value(Value::Int(BigInt::one()), span)?;
                 return Ok(());
             }
             if base_int.is_zero() {
-                self.runtime.stack.push(Value::Int(BigInt::zero()));
+                self.runtime.push_value(Value::Int(BigInt::zero()), span)?;
                 return Ok(());
             }
             if base_int == &BigInt::one() {
-                self.runtime.stack.push(Value::Int(BigInt::one()));
+                self.runtime.push_value(Value::Int(BigInt::one()), span)?;
                 return Ok(());
             }
             if base_int == &BigInt::from(-1) {
                 let odd = (exponent_int % BigInt::from(2)) != BigInt::zero();
-                self.runtime.stack.push(Value::Int(if odd {
-                    BigInt::from(-1)
-                } else {
-                    BigInt::one()
-                }));
+                self.runtime.push_value(
+                    Value::Int(if odd { BigInt::from(-1) } else { BigInt::one() }),
+                    span,
+                )?;
                 return Ok(());
             }
             let Some(power) = exponent_int.to_u32() else {
@@ -1355,7 +1479,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             .unwrap_or(usize::MAX);
             self.runtime
                 .ensure_memory_budget(result_bytes.saturating_add(operand_bytes), span)?;
-            self.runtime.stack.push(Value::Int(base_int.pow(power)));
+            self.runtime
+                .push_value(Value::Int(base_int.pow(power)), span)?;
             return Ok(());
         }
         let base_is_numeric = matches!(base, Value::Int(_) | Value::Float(_));
@@ -1370,15 +1495,15 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         if super::to_float(&base) == 0.0 && super::to_float(&exponent) < 0.0 {
             return Err(self.runtime.error(RuntimeErrorKind::DivisionByZero, span));
         }
-        self.runtime.stack.push(Value::Float(result));
+        self.runtime.push_value(Value::Float(result), span)?;
         Ok(())
     }
 
     fn negate(&mut self, span: Span) -> Result<(), RuntimeError> {
         let value = self.runtime.pop(span)?;
         match value {
-            Value::Int(value) => self.runtime.stack.push(Value::Int(-value)),
-            Value::Float(value) => self.runtime.stack.push(Value::Float(-value)),
+            Value::Int(value) => self.runtime.push_value(Value::Int(-value), span)?,
+            Value::Float(value) => self.runtime.push_value(Value::Float(-value), span)?,
             other => return Err(self.runtime.type_error("Int or Float", &other, span)),
         }
         Ok(())
@@ -1387,8 +1512,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     fn absolute(&mut self, span: Span) -> Result<(), RuntimeError> {
         let value = self.runtime.pop(span)?;
         match value {
-            Value::Int(value) => self.runtime.stack.push(Value::Int(value.abs())),
-            Value::Float(value) => self.runtime.stack.push(Value::Float(value.abs())),
+            Value::Int(value) => self.runtime.push_value(Value::Int(value.abs()), span)?,
+            Value::Float(value) => self.runtime.push_value(Value::Float(value.abs()), span)?,
             other => return Err(self.runtime.type_error("Int or Float", &other, span)),
         }
         Ok(())
@@ -1411,7 +1536,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             IrOp::Xor => left ^ right,
             _ => return Err(self.unsupported(span, "invalid boolean intrinsic")),
         };
-        self.runtime.stack.push(Value::Bool(result));
+        self.runtime.push_value(Value::Bool(result), span)?;
         Ok(())
     }
 
@@ -1426,7 +1551,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 payload_bytes.saturating_add(payload_bytes.saturating_add(1)),
                 span,
             )?;
-            self.runtime.stack.push(Value::Int(!value));
+            self.runtime.push_value(Value::Int(!value), span)?;
             return Ok(());
         }
         let right = self.runtime.pop(span)?;
@@ -1469,11 +1594,14 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > limit {
                     if operation == IrOp::Shr {
                         self.runtime.ensure_memory_budget(operand_bytes, span)?;
-                        self.runtime.stack.push(Value::Int(if left.is_negative() {
-                            BigInt::from(-1)
-                        } else {
-                            BigInt::zero()
-                        }));
+                        self.runtime.push_value(
+                            Value::Int(if left.is_negative() {
+                                BigInt::from(-1)
+                            } else {
+                                BigInt::zero()
+                            }),
+                            span,
+                        )?;
                         return Ok(());
                     }
                     return Err(self.runtime.error(RuntimeErrorKind::ExecutionLimit, span));
@@ -1494,7 +1622,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             }
             _ => return Err(self.unsupported(span, "invalid bitwise intrinsic")),
         };
-        self.runtime.stack.push(Value::Int(result));
+        self.runtime.push_value(Value::Int(result), span)?;
         Ok(())
     }
 }

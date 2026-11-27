@@ -360,6 +360,44 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         Ok(())
     }
 
+    pub(crate) fn push_value(&mut self, value: Value, span: Span) -> Result<(), RuntimeError> {
+        let next_len =
+            self.stack.len().checked_add(1).ok_or_else(|| {
+                self.error(RuntimeErrorKind::ResourceLimit("operand stack"), span)
+            })?;
+        if next_len > self.limits.max_stack_values {
+            return Err(self.error(RuntimeErrorKind::ResourceLimit("operand stack"), span));
+        }
+        let current_capacity = self.stack.capacity();
+        let target_capacity = if next_len > current_capacity {
+            if current_capacity == 0 {
+                next_len
+            } else {
+                current_capacity
+                    .saturating_mul(2)
+                    .max(next_len)
+                    .min(self.limits.max_stack_values)
+            }
+        } else {
+            current_capacity
+        };
+        let growth_bytes = target_capacity
+            .saturating_sub(current_capacity)
+            .saturating_mul(size_of::<Value>());
+        let payload_bytes = estimated_unmanaged_payload_bytes(&value, 0);
+        self.ensure_memory_budget(growth_bytes.saturating_add(payload_bytes), span)?;
+        if target_capacity > current_capacity {
+            let reserve_result = self
+                .stack
+                .try_reserve_exact(target_capacity.saturating_sub(self.stack.len()));
+            if reserve_result.is_err() {
+                return Err(self.error(RuntimeErrorKind::ResourceLimit("operand stack"), span));
+            }
+        }
+        self.stack.push(value);
+        Ok(())
+    }
+
     fn available_memory_bytes(&mut self, span: Span) -> Result<usize, RuntimeError> {
         self.ensure_memory_budget(0, span)?;
         self.gc
@@ -796,6 +834,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         if argument_count > self.stack.len() {
             return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
         }
+        self.ensure_memory_budget(argument_count.saturating_mul(size_of::<Value>()), span)?;
         let mut arguments = Vec::with_capacity(argument_count);
         for _ in 0..argument_count {
             arguments.push(self.pop(span)?);
@@ -808,7 +847,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             )
         })?;
         let value = self.invoke_function(function, arguments, Vec::new(), span)?;
-        self.stack.push(value);
+        self.push_value(value, span)?;
         Ok(())
     }
 
@@ -844,6 +883,66 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         if self.call_depth >= self.limits.max_call_depth {
             return Err(self.error(RuntimeErrorKind::StackOverflow, span));
         }
+
+        let fixed_count = if function.variadic {
+            parameter_count.saturating_sub(1)
+        } else {
+            parameter_count
+        };
+        let rest_count = argument_count.saturating_sub(fixed_count);
+        let argument_storage_bytes = arguments
+            .capacity()
+            .saturating_mul(size_of::<Value>())
+            .saturating_add(estimate_cloned_value_payloads(&arguments));
+        let capture_storage_bytes = captures
+            .capacity()
+            .saturating_mul(size_of::<(BigInt, BindingCell)>())
+            .saturating_add(
+                captures
+                    .iter()
+                    .map(|(id, _)| estimated_bigint_bytes(id))
+                    .fold(0usize, usize::saturating_add),
+            );
+        let capture_scope_bytes = if captures.is_empty() {
+            0
+        } else {
+            captures
+                .len()
+                .saturating_mul(size_of::<(BigInt, BindingCell)>() + 2 * size_of::<usize>())
+                .saturating_add(
+                    captures
+                        .iter()
+                        .map(|(id, _)| estimated_bigint_bytes(id))
+                        .fold(0usize, usize::saturating_add),
+                )
+        };
+        let parameter_storage_bytes = parameter_count
+            .saturating_mul(size_of::<(BigInt, BindingCell)>() + 2 * size_of::<usize>())
+            .saturating_add(
+                function
+                    .parameter_ids
+                    .iter()
+                    .map(estimated_bigint_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                parameter_count.saturating_mul(size_of::<Value>() + 4 * size_of::<usize>()),
+            )
+            .saturating_add(estimate_cloned_value_payloads(&arguments[..fixed_count]));
+        let rest_vector_bytes = if function.variadic {
+            rest_count.saturating_mul(size_of::<Value>())
+        } else {
+            0
+        };
+        self.ensure_memory_budget(
+            argument_storage_bytes
+                .saturating_add(capture_storage_bytes)
+                .saturating_add(capture_scope_bytes)
+                .saturating_add(parameter_storage_bytes)
+                .saturating_add(rest_vector_bytes)
+                .saturating_add(3 * size_of::<usize>()),
+            span,
+        )?;
 
         let stack_base = self.stack.len();
         let scope_base = self.scopes.len();
@@ -974,13 +1073,13 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             id: body_id,
         };
         if captures.is_empty() {
-            self.stack.push(Value::Function(function));
+            self.push_value(Value::Function(function), span)?;
         } else {
             let closure = self.allocate_closure(ClosureState {
                 function,
                 captures: RefCell::new(captures),
             });
-            self.stack.push(closure);
+            self.push_value(closure, span)?;
         }
         Ok(())
     }
@@ -991,6 +1090,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         if argument_count > self.stack.len() {
             return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
         }
+        self.ensure_memory_budget(argument_count.saturating_mul(size_of::<Value>()), span)?;
         let mut arguments = Vec::with_capacity(argument_count);
         for _ in 0..argument_count {
             arguments.push(self.pop(span)?);
@@ -1016,7 +1116,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             ));
         };
         let result = self.invoke_function(function, arguments, captures, span)?;
-        self.stack.push(result);
+        self.push_value(result, span)?;
         Ok(())
     }
 
@@ -1164,6 +1264,18 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     span,
                 ));
             };
+            self.ensure_memory_budget(
+                arguments
+                    .capacity()
+                    .saturating_mul(size_of::<Value>())
+                    .saturating_add(estimate_cloned_value_payloads(&arguments))
+                    .saturating_add(
+                        argument_count
+                            .saturating_add(1)
+                            .saturating_mul(size_of::<Value>()),
+                    ),
+                span,
+            )?;
             let mut constructor_args = Vec::with_capacity(argument_count + 1);
             constructor_args.push(object.clone());
             constructor_args.extend(arguments);
@@ -1177,7 +1289,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         }
-        self.stack.push(object);
+        self.push_value(object, span)?;
         Ok(())
     }
 
@@ -1193,7 +1305,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         };
-        self.stack.push(value);
+        self.push_value(value, span)?;
         Ok(())
     }
 
@@ -1231,6 +1343,13 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         if argument_count > self.stack.len() {
             return Err(self.error(RuntimeErrorKind::StackUnderflow, span));
         }
+        self.ensure_memory_budget(
+            argument_count
+                .saturating_add(1)
+                .saturating_mul(size_of::<Value>())
+                .saturating_add(estimated_unmanaged_payload_bytes(&receiver, 0)),
+            span,
+        )?;
         let mut arguments = Vec::with_capacity(argument_count + 1);
         for _ in 0..argument_count {
             arguments.push(self.pop(span)?);
@@ -1256,7 +1375,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             ));
         };
         let result = self.invoke_function(function, arguments, Vec::new(), span)?;
-        self.stack.push(result);
+        self.push_value(result, span)?;
         Ok(())
     }
 
@@ -1278,7 +1397,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .structs
                 .get(&object.struct_id)
                 .is_some_and(|descriptor| descriptor.interfaces.contains(&type_id));
-        self.stack.push(Value::Bool(matches));
+        self.push_value(Value::Bool(matches), span)?;
         Ok(())
     }
 
@@ -1309,7 +1428,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         self.ensure_memory_budget(clone_bytes, span)?;
         let cloned = object.borrow().clone();
         let object = self.allocate_object(cloned);
-        self.stack.push(object);
+        self.push_value(object, span)?;
         Ok(())
     }
 
@@ -1326,17 +1445,20 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
             InstructionOpcode::Basic(7) => {
                 let line = self.read_input_line(span)?;
-                self.stack.push(match line {
-                    Some(bytes) => Value::String(String::from_utf8(bytes).map_err(|_| {
-                        self.error(
-                            RuntimeErrorKind::IOError(
-                                "standard input is not valid UTF-8".to_owned(),
-                            ),
-                            span,
-                        )
-                    })?),
-                    None => Value::Null,
-                });
+                self.push_value(
+                    match line {
+                        Some(bytes) => Value::String(String::from_utf8(bytes).map_err(|_| {
+                            self.error(
+                                RuntimeErrorKind::IOError(
+                                    "standard input is not valid UTF-8".to_owned(),
+                                ),
+                                span,
+                            )
+                        })?),
+                        None => Value::Null,
+                    },
+                    span,
+                )?;
                 Ok(())
             }
             InstructionOpcode::Basic(8) => self.store(span),
@@ -1347,22 +1469,22 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 let value = self.pop(span)?;
                 match value {
                     Value::Bool(value) => {
-                        self.stack.push(Value::Bool(!value));
+                        self.push_value(Value::Bool(!value), span)?;
                         Ok(())
                     }
                     other => Err(self.type_error("Bool", &other, span)),
                 }
             }
             InstructionOpcode::Extended(0x18) => {
-                self.stack.push(Value::Null);
+                self.push_value(Value::Null, span)?;
                 Ok(())
             }
             InstructionOpcode::Extended(0x19) => {
-                self.stack.push(Value::Bool(true));
+                self.push_value(Value::Bool(true), span)?;
                 Ok(())
             }
             InstructionOpcode::Extended(0x1A) => {
-                self.stack.push(Value::Bool(false));
+                self.push_value(Value::Bool(false), span)?;
                 Ok(())
             }
             InstructionOpcode::Extended(0x10) => self.to_int(span),
@@ -1372,7 +1494,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             InstructionOpcode::Extended(0x13) => {
                 let value = self.pop(span)?;
                 let formatted = self.format_value(&value, span)?;
-                self.stack.push(Value::String(formatted));
+                self.push_value(Value::String(formatted), span)?;
                 Ok(())
             }
             InstructionOpcode::Extended(0x1D) => self.to_char(span),
@@ -1459,7 +1581,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 ))
             }
         };
-        self.stack.push(Value::Int(integer));
+        self.push_value(Value::Int(integer), span)?;
         Ok(())
     }
 
@@ -1483,7 +1605,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             | Value::Closure(_)
             | Value::Object(_) => true,
         };
-        self.stack.push(Value::Bool(truthy));
+        self.push_value(Value::Bool(truthy), span)?;
         Ok(())
     }
 
@@ -1502,7 +1624,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         };
-        self.stack.push(Value::Char(character));
+        self.push_value(Value::Char(character), span)?;
         Ok(())
     }
 
@@ -1520,14 +1642,14 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         };
-        self.stack.push(Value::Byte(byte));
+        self.push_value(Value::Byte(byte), span)?;
         Ok(())
     }
 
     fn utf8_encode(&mut self, span: Span) -> Result<(), RuntimeError> {
         match self.pop(span)? {
             Value::String(value) => {
-                self.stack.push(Value::Bytes(value.into_bytes()));
+                self.push_value(Value::Bytes(value.into_bytes()), span)?;
                 Ok(())
             }
             other => Err(self.type_error("String", &other, span)),
@@ -1538,7 +1660,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         match self.pop(span)? {
             Value::Bytes(value) => match String::from_utf8(value) {
                 Ok(value) => {
-                    self.stack.push(Value::String(value));
+                    self.push_value(Value::String(value), span)?;
                     Ok(())
                 }
                 Err(_) => Err(self.error(
@@ -1563,7 +1685,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
             _ => return Err(self.type_error("numeric operands", &left, span)),
         };
-        self.stack.push(Value::Bool(result));
+        self.push_value(Value::Bool(result), span)?;
         Ok(())
     }
 
@@ -1585,14 +1707,14 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         }
         values.reverse();
         let array = self.allocate_array(values);
-        self.stack.push(array);
+        self.push_value(array, span)?;
         Ok(())
     }
 
     fn tuple_new(&mut self, span: Span) -> Result<(), RuntimeError> {
         let values = self.pop_collection_items(span)?;
         let tuple = self.allocate_tuple(values);
-        self.stack.push(tuple);
+        self.push_value(tuple, span)?;
         Ok(())
     }
 
@@ -1651,7 +1773,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             map.entries.insert(key, value);
         }
         let map = self.allocate_map(map);
-        self.stack.push(map);
+        self.push_value(map, span)?;
         Ok(())
     }
 
@@ -1686,7 +1808,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
         }
         let set = self.allocate_set(set);
-        self.stack.push(set);
+        self.push_value(set, span)?;
         Ok(())
     }
 
@@ -1781,7 +1903,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
             other => return Err(self.type_error("indexable collection or Map", &other, span)),
         };
-        self.stack.push(item);
+        self.push_value(item, span)?;
         Ok(())
     }
 
@@ -1897,7 +2019,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
             other => return Err(self.type_error("mutable Array, Map, or Set", &other, span)),
         };
-        self.stack.push(result);
+        self.push_value(result, span)?;
         Ok(())
     }
 
@@ -1937,7 +2059,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 ))
             }
         };
-        self.stack.push(Value::Bool(found));
+        self.push_value(Value::Bool(found), span)?;
         Ok(())
     }
 
@@ -1987,7 +2109,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 ))
             }
         };
-        self.stack.push(Value::Int(BigInt::from(count)));
+        self.push_value(Value::Int(BigInt::from(count)), span)?;
         Ok(())
     }
 
@@ -2023,7 +2145,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             values,
             next_index: 0,
         });
-        self.stack.push(iterator);
+        self.push_value(iterator, span)?;
         Ok(())
     }
 
@@ -2085,7 +2207,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             }
             other => return Err(self.type_error("Array, Tuple, String, or Bytes", &other, span)),
         };
-        self.stack.push(sliced);
+        self.push_value(sliced, span)?;
         Ok(())
     }
 
@@ -2113,8 +2235,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             value
         };
         let found = value.is_some();
-        self.stack.push(value.unwrap_or(Value::Null));
-        self.stack.push(Value::Bool(found));
+        self.push_value(value.unwrap_or(Value::Null), span)?;
+        self.push_value(Value::Bool(found), span)?;
         Ok(())
     }
 
@@ -2202,7 +2324,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 ));
             }
         };
-        self.stack.push(result);
+        self.push_value(result, span)?;
         Ok(())
     }
 
@@ -2235,7 +2357,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             )?;
             let quotient = left / right;
-            self.stack.push(Value::Int(left - quotient * right));
+            self.push_value(Value::Int(left - quotient * right), span)?;
             return Ok(());
         }
 
@@ -2262,7 +2384,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     4 => a / b,
                     _ => unreachable!("basic arithmetic opcode was range-checked"),
                 };
-                self.stack.push(Value::Int(result));
+                self.push_value(Value::Int(result), span)?;
             }
             (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
                 let a = to_float(&left);
@@ -2277,7 +2399,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     4 => a / b,
                     _ => unreachable!("basic arithmetic opcode was range-checked"),
                 };
-                self.stack.push(Value::Float(result));
+                self.push_value(Value::Float(result), span)?;
             }
             (_, _) if !matches!(left, Value::Int(_) | Value::Float(_)) => {
                 return Err(self.type_error("Int or Float", &left, span));
@@ -2290,7 +2412,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     fn equal(&mut self, span: Span) -> Result<(), RuntimeError> {
         let right = self.pop(span)?;
         let left = self.pop(span)?;
-        self.stack.push(Value::Bool(left == right));
+        self.push_value(Value::Bool(left == right), span)?;
         Ok(())
     }
 
@@ -2311,7 +2433,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 ))
             }
         };
-        self.stack.push(Value::Bool(result));
+        self.push_value(Value::Bool(result), span)?;
         Ok(())
     }
 
@@ -2393,7 +2515,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             estimated_unmanaged_payload_bytes(&binding.value, 0)
         };
         self.ensure_memory_budget(payload_bytes, span)?;
-        self.stack.push(binding.borrow().value.clone());
+        self.push_value(binding.borrow().value.clone(), span)?;
         Ok(())
     }
 
@@ -2511,7 +2633,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 value += 1;
             }
         }
-        self.stack.push(Value::Int(value));
+        self.push_value(Value::Int(value), literal.span)?;
         Ok(())
     }
 
