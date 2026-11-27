@@ -1247,13 +1247,16 @@ enum InstructionKind {
         unwind_to_frame_base: u32,
     },
     Trap,
+    Rethrow,
     Halt,
 }
 
 impl InstructionKind {
     fn is_terminal(&self) -> bool {
-        matches!(self, Self::ReturnTop { .. } | Self::Trap | Self::Halt)
-            || matches!(self, Self::Intrinsic(IrOp::TailCall))
+        matches!(
+            self,
+            Self::ReturnTop { .. } | Self::Trap | Self::Rethrow | Self::Halt
+        ) || matches!(self, Self::Intrinsic(IrOp::TailCall))
     }
 }
 
@@ -1368,6 +1371,7 @@ fn decode_functions(
                     unwind_to_frame_base: reader.u32()?,
                 },
                 0xE8 => InstructionKind::Trap,
+                0xE9 => InstructionKind::Rethrow,
                 0xFF => InstructionKind::Halt,
                 _ => {
                     return Err(failure(
@@ -1995,7 +1999,7 @@ fn verify_function_flow(
                     }
                     terminal = true;
                 }
-                InstructionKind::Trap => terminal = true,
+                InstructionKind::Trap | InstructionKind::Rethrow => terminal = true,
                 InstructionKind::Halt => {
                     if !function.initializer {
                         return Err(failure(

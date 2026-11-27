@@ -149,7 +149,7 @@ exception_type_constant_index:u32  # 0xFFFFFFFF means catch-all
 flags:u32                          # zero in version 1.0
 ```
 
-Offsets are relative to the start of the referenced function's code range. Protected ranges are half-open. Start, end, and handler offsets must be instruction boundaries; `protected_start < protected_end`. Handler records for a function are ordered by start then end. The verifier rejects overlapping ranges unless one range is properly nested in the other. A catch-all uses the sentinel; otherwise the type index refers to a TypeRef constant.
+Offsets are relative to the start of the referenced function's code range. Protected ranges are half-open. Start, end, and handler offsets must be instruction boundaries; `protected_start < protected_end`. `stack_depth` is the number of operand slots retained from the exception-region entry snapshot when entering the handler; it cannot exceed the function's declared `max_stack`. Handler records for a function are ordered by start then end. The verifier rejects overlapping ranges unless one range is properly nested in the other. A catch-all uses the sentinel; otherwise the type index refers to a TypeRef constant.
 
 ## Debug information and checksum
 

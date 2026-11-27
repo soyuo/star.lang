@@ -57,13 +57,16 @@ The names in the grammar below are aliases for extended instructions with these 
 |---|---:|---|
 | `IF` | `0x30` | Begin conditional |
 | `ELSE` | `0x31` | Separate conditional branches |
-| `END` | `0x32` | Close an `IF`, `LOOP`, `FOR`, `FUNC`, or `ASYNC_FUNC` block |
+| `END` | `0x32` | Close an `IF`, `LOOP`, `FOR`, `FUNC`, `ASYNC_FUNC`, or `TRY` block |
 | `LOOP` | `0x33` | Begin loop |
 | `WHILE` | `0x34` | Separate loop condition from loop body |
 | `FOR` | `0x37` | Begin iterator loop |
 | `FUNC` | `0x40` | Begin function definition |
 | `SCOPE_BEGIN` | `0x55` | Begin lexical scope |
 | `SCOPE_END` | `0x56` | Close lexical scope |
+| `TRY` | `0x87` | Begin a protected region |
+| `CATCH` | `0x88` | Begin a catch-all handler |
+| `FINALLY` | `0x89` | Begin a finalizer |
 | `ASYNC_FUNC` | `0xA0` | Begin asynchronous function definition |
 
 These aliases are structural terminals and are excluded from `ordinary_extended_instruction`. Other assigned instructions, including `BREAK`, `CONTINUE`, and `RETURN`, remain ordinary instructions in this grammar.
@@ -76,6 +79,7 @@ structured_block         = conditional_block
                          | for_block
                          | function_block
                          | async_function_block
+                         | try_block
                          | scope_block ;
 
 conditional_block        = IF, { statement }, [ ELSE, { statement } ], END ;
@@ -91,6 +95,10 @@ function_block           = FUNC, { statement }, END ;
 async_function_block     = ASYNC_FUNC, { statement }, END ;
 
 scope_block              = SCOPE_BEGIN, { statement }, SCOPE_END ;
+
+try_block                = TRY, { statement }, CATCH, { statement },
+                           [ FINALLY, { statement } ], END
+                         | TRY, { statement }, FINALLY, { statement }, END ;
 ```
 
 When present, the non-empty statement sequence before `WHILE` produces the loop condition, and the optional sequence after it is the body. Omitting `WHILE` denotes the condition-free loop described in the control-flow specification. `FOR` iterator and variable inputs, and function identifiers and parameter metadata, are established by preceding instructions as described in their respective specifications; function parameter IDs, counts, and the rest-parameter code are defined in `spec/function-abi.md`, and are not grammar-level operands.
@@ -101,11 +109,13 @@ When present, the non-empty statement sequence before `WHILE` produces the loop 
 - Every structural block must use its matching closer. `END` cannot close a lexical scope, and `SCOPE_END` cannot close another block.
 - An `IF` may contain at most one `ELSE`; `ELSE` is valid only directly inside its matching `IF`.
 - `WHILE` is optional and may occur at most once at the direct level of a `LOOP`; it separates the loop condition from the body. It is not a standalone statement.
+- `TRY` must contain at least one direct `CATCH` or `FINALLY`; it may contain one of each, with `CATCH` before `FINALLY`. `CATCH` catches any non-fatal runtime error. The catch handler and finalizer use the `TRY` block's surrounding lexical scope.
+- `CATCH` and `FINALLY` are valid only directly within their matching `TRY`; they cannot repeat. `FINALLY` is also valid without `CATCH`.
 - `END` and `SCOPE_END` are closers, not standalone statements. A block opener without its matching closer is invalid.
 - `BREAK` and `CONTINUE` are syntactically ordinary instructions; they are valid only within a loop. Their placement is checked during semantic validation.
 - Each `ordinary_extended_instruction` must resolve to an assigned source opcode. Syntax alone does not make reserved or pending opcodes valid.
 - The object specification assigns struct, method, and interface opcodes but defines no block delimiters for them. They remain ordinary instruction tokens until their source syntax is specified.
-- The exception document currently describes `0x80–0x86` as VM instructions, and `spec/opcodes.toml` leaves that family pending source-level assignment. Exception markers therefore are not source structural terminals in this grammar.
+- Historical VM candidates `0x80-0x86` remain unassigned. Source exception aliases use `0x87-0x89` and remain separate from the `.starc` bytecode namespace.
 
 ## References
 

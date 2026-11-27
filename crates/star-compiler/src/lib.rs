@@ -64,6 +64,10 @@ pub enum Terminator {
         unwind_to_frame_base: u32,
         span: Span,
     },
+    /// Rethrow the active catch-all exception to an enclosing handler.
+    Rethrow {
+        span: Span,
+    },
     Halt {
         span: Span,
     },
@@ -79,6 +83,7 @@ impl Terminator {
             | Self::BranchIfFalse { span, .. }
             | Self::ForNext { span, .. }
             | Self::ReturnTop { span, .. }
+            | Self::Rethrow { span }
             | Self::Halt { span }
             | Self::Unreachable { span } => *span,
         }
@@ -94,6 +99,18 @@ pub struct BasicBlock {
     pub terminator: Terminator,
 }
 
+/// A function-local catch-all handler range. The protected interval starts at
+/// `protected_start` and ends at `protected_end` (exclusive), or at function
+/// end when `protected_end` is `None`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExceptionRegionIr {
+    pub protected_start: BlockId,
+    pub protected_end: Option<BlockId>,
+    pub handler: BlockId,
+    /// Operand-stack depth restored before control enters the handler.
+    pub stack_depth: u32,
+}
+
 /// One Star function in stack-based control-flow-graph IR.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionIr {
@@ -107,6 +124,8 @@ pub struct FunctionIr {
     /// Maximum operand-stack depth computed by semantic analysis.
     pub max_stack: u32,
     pub blocks: Vec<BasicBlock>,
+    /// Catch-all regions, serialized into this function's ExceptionTable records.
+    pub exception_regions: Vec<ExceptionRegionIr>,
 }
 
 /// The single-module IR accepted by this compiler slice.
@@ -187,11 +206,21 @@ pub fn compile(
     let mut code = Vec::new();
     let mut records: Vec<FunctionRecordData> = Vec::with_capacity(functions.len());
     let mut locations = Vec::new();
+    let mut exception_records = Vec::new();
     for (function_index, metadata) in functions.iter().enumerate() {
         let function_index = checked_u32(function_index, "function index")?;
         let function_offset = checked_u64(code.len(), "function code offset")?;
         let encoded = encode_function(metadata.function, metadata.is_initializer, &mut pool)?;
         let function_length = checked_u64(encoded.code.len(), "function code length")?;
+        exception_records.extend(encoded.exception_regions.into_iter().map(|region| {
+            ExceptionRecordData {
+                function_index,
+                protected_start: region.protected_start,
+                protected_end: region.protected_end,
+                handler_offset: region.handler_offset,
+                stack_depth: region.stack_depth,
+            }
+        }));
         for location in encoded.locations {
             let absolute_code_offset = function_offset
                 .checked_add(checked_u64(location.offset, "debug code offset")?)
@@ -218,6 +247,7 @@ pub fn compile(
     let constant_pool = pool.encode()?;
     let module_table = encode_module_table(module_name_index, records.len())?;
     let function_table = encode_function_table(&records)?;
+    let exception_table = encode_exception_table(&exception_records)?;
     let debug_info = encode_debug_info(source_file_index, &locations)?;
     let sections = vec![
         (1, true, constant_pool),
@@ -225,7 +255,7 @@ pub fn compile(
         (3, true, function_table),
         (4, true, code),
         (5, true, 0_u32.to_le_bytes().to_vec()),
-        (6, true, 0_u32.to_le_bytes().to_vec()),
+        (6, true, exception_table),
         (7, false, debug_info),
         (u32::MAX, true, vec![0; 32]),
     ];
@@ -332,6 +362,23 @@ struct EncodedLocation {
 struct EncodedFunction {
     code: Vec<u8>,
     locations: Vec<EncodedLocation>,
+    exception_regions: Vec<EncodedExceptionRegion>,
+}
+
+#[derive(Clone)]
+struct EncodedExceptionRegion {
+    protected_start: u64,
+    protected_end: u64,
+    handler_offset: u64,
+    stack_depth: u32,
+}
+
+struct ExceptionRecordData {
+    function_index: u32,
+    protected_start: u64,
+    protected_end: u64,
+    handler_offset: u64,
+    stack_depth: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -409,6 +456,18 @@ fn validate_function(function: &FunctionIr, is_initializer: bool) -> Result<(), 
     }
     if !blocks.contains_key(&function.entry) {
         return Err(CompileError::new("entry block does not exist"));
+    }
+    for region in &function.exception_regions {
+        require_target(&blocks, region.protected_start)?;
+        if let Some(end) = region.protected_end {
+            require_target(&blocks, end)?;
+        }
+        require_target(&blocks, region.handler)?;
+        if region.stack_depth > function.max_stack {
+            return Err(CompileError::new(
+                "exception stack depth exceeds function max_stack",
+            ));
+        }
     }
     for block in &function.blocks {
         match &block.terminator {
@@ -501,7 +560,7 @@ fn terminator_size(terminator: &Terminator) -> usize {
         Terminator::Jump { .. } | Terminator::BranchIfFalse { .. } => 9,
         Terminator::ForNext { .. } => 13,
         Terminator::ReturnTop { .. } => 5,
-        Terminator::Halt { .. } | Terminator::Unreachable { .. } => 1,
+        Terminator::Halt { .. } | Terminator::Unreachable { .. } | Terminator::Rethrow { .. } => 1,
     }
 }
 
@@ -531,6 +590,54 @@ fn encode_function(
 
     let mut code = Vec::with_capacity(next_offset);
     let mut locations = Vec::new();
+    let mut exception_regions = Vec::with_capacity(function.exception_regions.len());
+    for region in &function.exception_regions {
+        let protected_start = u64::from(block_offset(&offsets, region.protected_start)?);
+        let protected_end = match region.protected_end {
+            Some(end) => u64::from(block_offset(&offsets, end)?),
+            None => checked_u64(next_offset, "exception range end")?,
+        };
+        let handler_offset = u64::from(block_offset(&offsets, region.handler)?);
+        if protected_start >= protected_end {
+            return Err(CompileError::new(
+                "exception protected range must be nonempty and forward ordered",
+            ));
+        }
+        if (protected_start..protected_end).contains(&handler_offset) {
+            return Err(CompileError::new(
+                "exception handler must be outside its protected range",
+            ));
+        }
+        exception_regions.push(EncodedExceptionRegion {
+            protected_start,
+            protected_end,
+            handler_offset,
+            stack_depth: region.stack_depth,
+        });
+    }
+    let mut ranges = exception_regions
+        .iter()
+        .map(|region| (region.protected_start, region.protected_end))
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|(start, end)| (*start, std::cmp::Reverse(*end)));
+    let mut nesting = Vec::<(u64, u64)>::new();
+    for (start, end) in ranges {
+        while nesting
+            .last()
+            .is_some_and(|(_, parent_end)| start >= *parent_end)
+        {
+            nesting.pop();
+        }
+        if nesting.last().is_some_and(|(parent_start, parent_end)| {
+            (start == *parent_start && end == *parent_end) || end > *parent_end
+        }) {
+            return Err(CompileError::new(
+                "exception ranges overlap without proper nesting",
+            ));
+        }
+        nesting.push((start, end));
+    }
+    exception_regions.sort_by_key(|region| (region.protected_start, region.protected_end));
     for block in blocks {
         for operation in &block.operations {
             locations.push(EncodedLocation {
@@ -548,7 +655,11 @@ fn encode_function(
     if code.len() != next_offset {
         return Err(CompileError::new("internal bytecode sizing mismatch"));
     }
-    Ok(EncodedFunction { code, locations })
+    Ok(EncodedFunction {
+        code,
+        locations,
+        exception_regions,
+    })
 }
 
 fn encode_operation(
@@ -629,6 +740,7 @@ fn encode_terminator(
             }
             output.push(0xFF);
         }
+        Terminator::Rethrow { .. } => output.push(0xE9),
         Terminator::Unreachable { .. } => output.push(0xE8),
     }
     Ok(())
@@ -650,6 +762,24 @@ struct FunctionRecordData {
     max_stack: u32,
     code_offset: u64,
     code_length: u64,
+}
+
+fn encode_exception_table(records: &[ExceptionRecordData]) -> Result<Vec<u8>, CompileError> {
+    let mut output = Vec::new();
+    write_u32(
+        &mut output,
+        checked_u32(records.len(), "exception handler count")?,
+    );
+    for record in records {
+        write_u32(&mut output, record.function_index);
+        write_u64(&mut output, record.protected_start);
+        write_u64(&mut output, record.protected_end);
+        write_u64(&mut output, record.handler_offset);
+        write_u32(&mut output, record.stack_depth);
+        write_u32(&mut output, u32::MAX); // catch-all handler
+        write_u32(&mut output, 0); // version 1.0 flags
+    }
+    Ok(output)
 }
 
 fn encode_module_table(

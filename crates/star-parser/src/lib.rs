@@ -33,6 +33,8 @@ pub enum Statement {
     Function(FunctionBlock),
     /// A lexical scope delimited by `SCOPE_BEGIN` and `SCOPE_END`.
     Scope(ScopeBlock),
+    /// A catch-all exception region with an optional finalizer.
+    Try(TryBlock),
 }
 
 /// An ordinary instruction. Structural opcodes are represented by block nodes.
@@ -122,6 +124,19 @@ pub struct ScopeBlock {
     pub span: Span,
 }
 
+/// A catch-all exception region. Caught errors are consumed by the handler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TryBlock {
+    /// Statements protected by the handler.
+    pub try_body: Vec<Statement>,
+    /// Statements run after any runtime error from `try_body`.
+    pub catch_body: Option<Vec<Statement>>,
+    /// Statements run after normal completion, control transfer, or an error.
+    pub finally_body: Option<Vec<Statement>>,
+    /// Original source range including `TRY` and its matching `END`.
+    pub span: Span,
+}
+
 /// A block closer expected by the grammar.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockCloser {
@@ -178,6 +193,8 @@ pub enum ParseErrorKind {
     DuplicateWhile,
     /// `WHILE` appeared before a loop condition statement.
     EmptyLoopCondition,
+    /// A `TRY` block must include `CATCH` or `FINALLY`.
+    TryRequiresHandler,
     /// End of input occurred before the block's required closer.
     UnclosedBlock { expected: BlockCloser },
     /// A block was closed with the other block family's closer.
@@ -224,6 +241,9 @@ impl fmt::Display for ParseErrorKind {
             Self::DuplicateWhile => formatter.write_str("LOOP contains more than one WHILE"),
             Self::EmptyLoopCondition => {
                 formatter.write_str("WHILE requires at least one condition statement")
+            }
+            Self::TryRequiresHandler => {
+                formatter.write_str("TRY requires a CATCH or FINALLY handler")
             }
             Self::UnclosedBlock { expected } => write!(formatter, "block is missing {expected}"),
             Self::MismatchedBlockCloser { expected, found } => {
@@ -274,6 +294,9 @@ enum StructuralOpcode {
     ScopeBegin,
     ScopeEnd,
     AsyncFunction,
+    Try,
+    Catch,
+    Finally,
 }
 
 impl StructuralOpcode {
@@ -289,6 +312,9 @@ impl StructuralOpcode {
             Self::ScopeBegin => 0x55,
             Self::ScopeEnd => 0x56,
             Self::AsyncFunction => 0xA0,
+            Self::Try => 0x87,
+            Self::Catch => 0x88,
+            Self::Finally => 0x89,
         }
     }
 }
@@ -341,9 +367,12 @@ impl<'a> Parser<'a> {
                         statements.push(self.parse_function(token, FunctionKind::Asynchronous)?)
                     }
                     StructuralOpcode::ScopeBegin => statements.push(self.parse_scope(token)?),
+                    StructuralOpcode::Try => statements.push(self.parse_try(token)?),
                     StructuralOpcode::Else
                     | StructuralOpcode::End
                     | StructuralOpcode::While
+                    | StructuralOpcode::Catch
+                    | StructuralOpcode::Finally
                     | StructuralOpcode::ScopeEnd => {
                         return Ok(Sequence {
                             statements,
@@ -597,6 +626,53 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_try(&mut self, opener: StructuralToken) -> Result<Statement, ParseError> {
+        let protected = self.parse_sequence()?;
+        let (try_body, catch_body, finally_body, closer) = match protected.stop {
+            Some(separator) if separator.kind == StructuralOpcode::Catch => {
+                let caught = self.parse_sequence()?;
+                match caught.stop {
+                    Some(separator) if separator.kind == StructuralOpcode::Finally => {
+                        let finalizer = self.parse_sequence()?;
+                        match finalizer.stop {
+                            Some(end) if end.kind == StructuralOpcode::End => (
+                                protected.statements,
+                                Some(caught.statements),
+                                Some(finalizer.statements),
+                                end,
+                            ),
+                            other => return Err(self.error_for_end_block(other, &opener)),
+                        }
+                    }
+                    Some(end) if end.kind == StructuralOpcode::End => {
+                        (protected.statements, Some(caught.statements), None, end)
+                    }
+                    other => return Err(self.error_for_end_block(other, &opener)),
+                }
+            }
+            Some(separator) if separator.kind == StructuralOpcode::Finally => {
+                let finalizer = self.parse_sequence()?;
+                match finalizer.stop {
+                    Some(end) if end.kind == StructuralOpcode::End => {
+                        (protected.statements, None, Some(finalizer.statements), end)
+                    }
+                    other => return Err(self.error_for_end_block(other, &opener)),
+                }
+            }
+            Some(end) if end.kind == StructuralOpcode::End => {
+                return Err(self.error(ParseErrorKind::TryRequiresHandler, end.span));
+            }
+            other => return Err(self.error_for_end_block(other, &opener)),
+        };
+
+        Ok(Statement::Try(TryBlock {
+            try_body,
+            catch_body,
+            finally_body,
+            span: joined_span(opener.span, closer.span),
+        }))
+    }
+
     fn parse_end_body(
         &mut self,
         opener: StructuralToken,
@@ -712,6 +788,9 @@ fn structural_opcode(opcode: u8) -> Option<StructuralOpcode> {
         0x40 => Some(StructuralOpcode::Function),
         0x55 => Some(StructuralOpcode::ScopeBegin),
         0x56 => Some(StructuralOpcode::ScopeEnd),
+        0x87 => Some(StructuralOpcode::Try),
+        0x88 => Some(StructuralOpcode::Catch),
+        0x89 => Some(StructuralOpcode::Finally),
         0xA0 => Some(StructuralOpcode::AsyncFunction),
         _ => None,
     }

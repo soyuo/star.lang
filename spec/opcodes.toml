@@ -663,6 +663,27 @@ family = "objects"
 reference = "programming/objects.md"
 
 [[extended]]
+id = "exception.try"
+mnemonic = "TRY"
+opcode = 0x87
+family = "exceptions"
+reference = "programming/exceptions.md"
+
+[[extended]]
+id = "exception.catch"
+mnemonic = "CATCH"
+opcode = 0x88
+family = "exceptions"
+reference = "programming/exceptions.md"
+
+[[extended]]
+id = "exception.finally"
+mnemonic = "FINALLY"
+opcode = 0x89
+family = "exceptions"
+reference = "programming/exceptions.md"
+
+[[extended]]
 id = "module.import"
 mnemonic = "IMPORT"
 opcode = 0x90
@@ -839,9 +860,9 @@ reference = "platform/ffi.md"
 
 # Opcodes such as NE, GTE, LTE, INC, and DEC are expressible through existing
 # instructions and do not receive dedicated values in this catalog.
-# The exception specification currently labels 0x80-0x86 as VM instructions.
-# Keep these out of the source namespace until the source-to-bytecode mapping
-# is explicitly resolved.
+# The historical 0x80-0x86 VM candidates are not source assignments.
+# TRY/CATCH/FINALLY use source-only values 0x87-0x89; bytecode regions are
+# represented by ExceptionTable records rather than these source opcode values.
 [[pending_assignments]]
 family = "exceptions"
 candidate_opcodes = [0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86]

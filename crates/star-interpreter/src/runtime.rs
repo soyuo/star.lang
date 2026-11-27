@@ -11,7 +11,7 @@ use star_common::SourcePosition;
 use star_parser::Span;
 use star_parser::{
     DataLiteral, ForBlock, FunctionBlock, FunctionKind, IfBlock, Instruction, InstructionOpcode,
-    LoopBlock, Program, ScopeBlock, Statement,
+    LoopBlock, Program, ScopeBlock, Statement, TryBlock,
 };
 
 use crate::{
@@ -89,6 +89,18 @@ impl fmt::Display for RuntimeErrorKind {
     }
 }
 
+impl RuntimeErrorKind {
+    fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::ExecutionLimit
+                | Self::CompileError(_)
+                | Self::UnsupportedInstruction(_)
+                | Self::Unsupported(_)
+        )
+    }
+}
+
 /// An execution failure associated with the source construct that caused it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeError {
@@ -163,6 +175,17 @@ enum ControlFlow {
     Break,
     Continue,
     Return(Value),
+}
+
+#[derive(Clone, Debug)]
+struct ExecutionSnapshot {
+    stack: Vec<Value>,
+    scope_depth: usize,
+    scope_floor_depth: usize,
+    frame_stack_depth: usize,
+    capture_lengths: Vec<usize>,
+    call_depth: usize,
+    call_trace_depth: usize,
 }
 
 impl<R: BufRead, W: Write> Interpreter<R, W> {
@@ -367,6 +390,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                         return Ok(flow);
                     }
                 }
+                Statement::Try(block) => {
+                    let flow = self.execute_try(block)?;
+                    if flow != ControlFlow::Normal {
+                        return Ok(flow);
+                    }
+                }
                 Statement::If(block) => {
                     let flow = self.execute_if(block)?;
                     if flow != ControlFlow::Normal {
@@ -396,6 +425,73 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let result = self.execute_statements(&scope.body);
         self.scopes.pop();
         result
+    }
+
+    fn execute_try(&mut self, block: &TryBlock) -> Result<ControlFlow, RuntimeError> {
+        let snapshot = self.execution_snapshot();
+        let mut outcome = match self.execute_statements(&block.try_body) {
+            Ok(flow) => Ok(flow),
+            Err(error) => {
+                self.restore_execution_snapshot(&snapshot);
+                if error.kind.is_fatal() {
+                    return Err(error);
+                }
+                match &block.catch_body {
+                    Some(body) => self.execute_statements(body),
+                    None => Err(error),
+                }
+            }
+        };
+
+        if let Some(finally_body) = &block.finally_body {
+            if let Err(error) = &outcome {
+                if error.kind.is_fatal() {
+                    return Err(error.clone());
+                }
+                self.restore_execution_snapshot(&snapshot);
+            }
+            let prior_outcome = outcome;
+            match self.execute_statements(finally_body) {
+                Ok(ControlFlow::Normal) => outcome = prior_outcome,
+                Ok(flow) => outcome = Ok(flow),
+                Err(error) => {
+                    self.restore_execution_snapshot(&snapshot);
+                    outcome = Err(error);
+                }
+            }
+        }
+
+        outcome
+    }
+
+    fn execution_snapshot(&self) -> ExecutionSnapshot {
+        ExecutionSnapshot {
+            stack: self.stack.clone(),
+            scope_depth: self.scopes.len(),
+            scope_floor_depth: self.scope_floors.len(),
+            frame_stack_depth: self.frame_stack_bases.len(),
+            capture_lengths: self.capture_vectors.iter().map(Vec::len).collect(),
+            call_depth: self.call_depth,
+            call_trace_depth: self.call_trace.len(),
+        }
+    }
+
+    fn restore_execution_snapshot(&mut self, snapshot: &ExecutionSnapshot) {
+        self.stack.clone_from(&snapshot.stack);
+        self.scopes.truncate(snapshot.scope_depth);
+        self.scope_floors.truncate(snapshot.scope_floor_depth);
+        self.frame_stack_bases.truncate(snapshot.frame_stack_depth);
+        self.capture_vectors
+            .truncate(snapshot.capture_lengths.len());
+        for (captures, length) in self
+            .capture_vectors
+            .iter_mut()
+            .zip(&snapshot.capture_lengths)
+        {
+            captures.truncate(*length);
+        }
+        self.call_depth = snapshot.call_depth;
+        self.call_trace.truncate(snapshot.call_trace_depth);
     }
 
     fn execute_if(&mut self, block: &IfBlock) -> Result<ControlFlow, RuntimeError> {
@@ -2041,6 +2137,7 @@ fn statement_span(statement: &Statement) -> Span {
         Statement::For(block) => block.span,
         Statement::Function(block) => block.span,
         Statement::Scope(block) => block.span,
+        Statement::Try(block) => block.span,
     }
 }
 
