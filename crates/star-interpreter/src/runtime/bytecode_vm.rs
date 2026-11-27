@@ -36,13 +36,29 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
 
     /// Sets the maximum number of executed bytecode instructions.
     pub fn with_execution_limit(mut self, limit: u64) -> Self {
-        self.runtime.execution_limit = limit.max(1);
+        self.runtime.limits.max_instructions = limit.max(1);
         self
     }
 
     /// Sets the maximum number of nested bytecode function calls.
     pub fn with_call_depth_limit(mut self, limit: usize) -> Self {
-        self.runtime.call_depth_limit = limit.max(1);
+        self.runtime.limits.max_call_depth = limit.max(1);
+        self
+    }
+
+    /// Sets all runtime resource ceilings and narrows verifier stack/instruction limits.
+    pub fn with_execution_limits(mut self, limits: super::ExecutionLimits) -> Self {
+        self.policy.limits.max_instructions = self
+            .policy
+            .limits
+            .max_instructions
+            .min(limits.max_instructions);
+        self.policy.limits.max_stack_depth = self
+            .policy
+            .limits
+            .max_stack_depth
+            .min(u32::try_from(limits.max_stack_values).unwrap_or(u32::MAX));
+        self.runtime.limits = limits;
         self
     }
 
@@ -62,6 +78,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     /// Verifies and executes a `.starc` program, returning the module result.
     pub fn execute(&mut self, bytes: &[u8]) -> Result<Value, RuntimeError> {
         self.reset_state();
+        self.runtime.begin_execution();
         let result = (|| {
             let verified = verify_bytecode(bytes, &self.policy).map_err(|error| {
                 self.runtime.error(
@@ -80,6 +97,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             })?;
             Ok(result)
         })();
+        self.runtime.set_external_memory_bytes(0);
         if result.is_err() {
             self.cleanup_after_error();
         }
@@ -118,6 +136,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.call_trace.clear();
         self.runtime.call_depth = 0;
         self.runtime.executed_steps = 0;
+        self.runtime.set_external_memory_bytes(0);
     }
 
     fn cleanup_after_error(&mut self) {
@@ -136,12 +155,42 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
 
     fn execute_image(&mut self, image: &Image<'_>) -> Result<Value, RuntimeError> {
         let entry = image.modules[image.entry_module as usize].initializer_index as usize;
-        let mut frames = vec![Frame::initializer(entry, image.functions[entry].clone())];
+        let entry_function = &image.functions[entry];
+        let entry_span = image.span(entry, entry_function.code_offset);
+        let frame_capacity = frame_capacity_after_push(
+            0,
+            0,
+            self.runtime.limits.max_call_depth.saturating_add(1).max(1),
+        )
+        .ok_or_else(|| {
+            self.runtime
+                .error(RuntimeErrorKind::StackOverflow, entry_span)
+        })?;
+        self.runtime.ensure_memory_budget(
+            frame_capacity
+                .saturating_mul(size_of::<Frame>())
+                .saturating_add(function_record_payload_bytes(entry_function)),
+            entry_span,
+        )?;
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(frame_capacity).map_err(|_| {
+            self.runtime
+                .error(RuntimeErrorKind::ResourceLimit("call frames"), entry_span)
+        })?;
+        frames.push(Frame::initializer(entry, entry_function.clone()));
+        self.update_external_frame_memory(&frames);
         loop {
+            self.update_external_frame_memory(&frames);
             let Some(frame) = frames.last() else {
                 return Ok(Value::Null);
             };
             let stack_depth = self.runtime.stack.len().saturating_sub(frame.stack_base);
+            if self.runtime.stack.len() > self.runtime.limits.max_stack_values {
+                return Err(self.runtime.error(
+                    RuntimeErrorKind::ResourceLimit("operand stack"),
+                    image.span(frame.function_index, frame.function.code_offset + frame.ip),
+                ));
+            }
             if stack_depth > frame.function.max_stack as usize
                 || stack_depth
                     > usize::try_from(self.policy.limits.max_stack_depth).unwrap_or(usize::MAX)
@@ -160,7 +209,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 ));
             }
             self.runtime.executed_steps = self.runtime.executed_steps.saturating_add(1);
-            if self.runtime.executed_steps > self.runtime.execution_limit {
+            if self.runtime.executed_steps > self.runtime.limits.max_instructions {
                 return Err(self.runtime.error(
                     RuntimeErrorKind::ExecutionLimit,
                     image.span(frame.function_index, frame.function.code_offset + frame.ip),
@@ -172,19 +221,20 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             self.expire_pending_exceptions(frames.last_mut().expect("active frame"));
             self.activate_exception_regions(image, frames.last_mut().expect("active frame"));
             let span = image.span(function_index, absolute_code_offset);
+            self.runtime.check_resource_limits(span)?;
             let instruction = {
                 let frame = frames.last_mut().expect("active frame");
                 decode_instruction(image, frame, span, &self.runtime)?
             };
-            match self.execute_instruction(
-                image,
-                &mut frames,
-                instruction,
-                instruction_offset,
-                span,
-            ) {
-                Ok(Some(value)) => return Ok(value),
-                Ok(None) => {}
+            let instruction_result =
+                self.execute_instruction(image, &mut frames, instruction, instruction_offset, span);
+            self.update_external_frame_memory(&frames);
+            match instruction_result {
+                Ok(Some(value)) => {
+                    self.runtime.check_resource_limits(span)?;
+                    return Ok(value);
+                }
+                Ok(None) => self.runtime.check_resource_limits(span)?,
                 Err(error) => {
                     if self.dispatch_exception(
                         image,
@@ -199,6 +249,11 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             }
             self.runtime.collect_if_needed();
         }
+    }
+
+    fn update_external_frame_memory(&mut self, frames: &Vec<Frame>) {
+        self.runtime
+            .set_external_memory_bytes(frame_storage_bytes(frames, frames.capacity()));
     }
 
     fn execute_instruction(
@@ -219,7 +274,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     )
                 })?;
                 match value {
-                    Constant::Value(value) => self.runtime.stack.push(value.clone()),
+                    Constant::Value(value) => {
+                        self.runtime.ensure_memory_budget(
+                            super::estimated_unmanaged_payload_bytes(value, 0),
+                            span,
+                        )?;
+                        self.runtime.push_value(value.clone(), span)?;
+                    }
                     Constant::FunctionRef(function_index) => {
                         let function =
                             image
@@ -233,7 +294,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                                         span,
                                     )
                                 })?;
-                        let Some(id) = function.id.clone() else {
+                        let Some(function_id) = function.id.as_ref() else {
                             return Err(self.runtime.error(
                                 RuntimeErrorKind::ReferenceError(
                                     "initializer is not a function value",
@@ -241,10 +302,18 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                                 span,
                             ));
                         };
-                        self.runtime.stack.push(Value::Function(FunctionRef {
-                            module_index: function.module_index,
-                            id,
-                        }));
+                        self.runtime.ensure_memory_budget(
+                            super::estimated_bigint_bytes(function_id),
+                            span,
+                        )?;
+                        let id = function_id.clone();
+                        self.runtime.push_value(
+                            Value::Function(FunctionRef {
+                                module_index: function.module_index,
+                                id,
+                            }),
+                            span,
+                        )?;
                     }
                     Constant::TypeRef => {
                         return Err(self.unsupported(span, "type constant values"));
@@ -313,8 +382,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     return Ok(Some(value));
                 }
                 match action {
-                    ReturnAction::PushResult => self.runtime.stack.push(value),
-                    ReturnAction::PushValue(value) => self.runtime.stack.push(value),
+                    ReturnAction::PushResult => self.runtime.push_value(value, span)?,
+                    ReturnAction::PushValue(value) => self.runtime.push_value(value, span)?,
                 }
             }
             Instruction::Halt => {
@@ -509,15 +578,9 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         };
         for capability in required {
             if !self.policy.granted_capabilities.contains(capability) {
-                let name = match capability {
-                    Capability::FsRead => "fs.read",
-                    Capability::EnvRead => "env.read",
-                    Capability::Clock => "clock",
-                    Capability::Ffi => "ffi",
-                };
                 return Err(self
                     .runtime
-                    .error(RuntimeErrorKind::PermissionError(name), span));
+                    .error(RuntimeErrorKind::PermissionError(capability.name()), span));
             }
         }
         Ok(())
@@ -607,6 +670,16 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         let iterator_ref = Rc::clone(&state.iterator);
         let variable_id = state.variable_id.clone();
         let scope_depth = state.scope_depth;
+        let next_payload_bytes = {
+            let iterator = iterator_ref.borrow();
+            iterator
+                .values
+                .get(iterator.next_index)
+                .map(|value| super::estimated_unmanaged_payload_bytes(value, 0))
+        };
+        if let Some(payload_bytes) = next_payload_bytes {
+            self.runtime.ensure_memory_budget(payload_bytes, span)?;
+        }
         let next = {
             let mut iterator = iterator_ref.borrow_mut();
             let value = iterator.values.get(iterator.next_index).cloned();
@@ -688,21 +761,22 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     span,
                 )
             })?;
-        let function = image.functions[function_index].clone();
-        if function.asynchronous {
+        let function_record = &image.functions[function_index];
+        if function_record.asynchronous {
             return Err(self.unsupported(span, "async task scheduling"));
         }
-        if self.runtime.call_depth >= self.runtime.call_depth_limit {
+        if self.runtime.call_depth >= self.runtime.limits.max_call_depth {
             return Err(self.runtime.error(RuntimeErrorKind::StackOverflow, span));
         }
-        let required = if function.rest_parameter_code == 0 {
-            function.parameter_ids.len()
+        let parameter_count = function_record.parameter_ids.len();
+        let required = if function_record.rest_parameter_code == 0 {
+            parameter_count
         } else {
-            function.parameter_ids.len().saturating_sub(1)
+            parameter_count.saturating_sub(1)
         };
         if request.arguments.len() < required
-            || (function.rest_parameter_code == 0
-                && request.arguments.len() != function.parameter_ids.len())
+            || (function_record.rest_parameter_code == 0
+                && request.arguments.len() != parameter_count)
         {
             return Err(self.runtime.error(
                 RuntimeErrorKind::TypeError {
@@ -712,6 +786,127 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 span,
             ));
         }
+        let fixed_count = if function_record.rest_parameter_code == 0 {
+            parameter_count
+        } else {
+            parameter_count.saturating_sub(1)
+        };
+        let rest_count = request.arguments.len().saturating_sub(fixed_count);
+        let function_copy_bytes = size_of::<FunctionRecord>()
+            .saturating_add(function_record_payload_bytes(function_record));
+        let argument_storage_bytes = request
+            .arguments
+            .capacity()
+            .saturating_mul(size_of::<Value>())
+            .saturating_add(super::estimate_cloned_value_payloads(&request.arguments));
+        let capture_storage_bytes = request
+            .captures
+            .capacity()
+            .saturating_mul(size_of::<(BigInt, BindingCell)>())
+            .saturating_add(
+                request
+                    .captures
+                    .iter()
+                    .map(|(id, _)| super::estimated_bigint_bytes(id))
+                    .fold(0usize, usize::saturating_add),
+            );
+        let capture_scope_bytes = if request.captures.is_empty() {
+            0
+        } else {
+            request
+                .captures
+                .len()
+                .saturating_mul(size_of::<(BigInt, BindingCell)>() + 2 * size_of::<usize>())
+                .saturating_add(
+                    request
+                        .captures
+                        .iter()
+                        .map(|(id, _)| super::estimated_bigint_bytes(id))
+                        .fold(0usize, usize::saturating_add),
+                )
+        };
+        let parameter_storage_bytes = parameter_count
+            .saturating_mul(size_of::<(BigInt, BindingCell)>() + 2 * size_of::<usize>())
+            .saturating_add(
+                function_record
+                    .parameter_ids
+                    .iter()
+                    .map(super::estimated_bigint_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                parameter_count.saturating_mul(size_of::<Value>() + 4 * size_of::<usize>()),
+            )
+            .saturating_add(super::estimate_cloned_value_payloads(
+                &request.arguments[..fixed_count],
+            ));
+        let rest_array_bytes = if function_record.rest_parameter_code == 0 {
+            0
+        } else {
+            rest_count
+                .saturating_mul(size_of::<Value>())
+                .saturating_add(super::estimate_cloned_value_payloads(
+                    &request.arguments[fixed_count..],
+                ))
+                .saturating_add(size_of::<RefCell<Vec<Value>>>() + 2 * size_of::<usize>())
+        };
+        let frame_capacity = frame_capacity_after_push(
+            frames.capacity(),
+            frames.len(),
+            self.runtime.limits.max_call_depth.saturating_add(1).max(1),
+        )
+        .ok_or_else(|| self.runtime.error(RuntimeErrorKind::StackOverflow, span))?;
+        let frame_capacity_growth = frame_capacity
+            .saturating_sub(frames.capacity())
+            .saturating_mul(size_of::<Frame>());
+        let call_trace_capacity = frame_capacity_after_push(
+            self.runtime.call_trace.capacity(),
+            self.runtime.call_trace.len(),
+            self.runtime.limits.max_call_depth.max(1),
+        )
+        .ok_or_else(|| self.runtime.error(RuntimeErrorKind::StackOverflow, span))?;
+        let call_trace_capacity_growth = call_trace_capacity
+            .saturating_sub(self.runtime.call_trace.capacity())
+            .saturating_mul(size_of::<crate::runtime::StackTraceFrame>());
+        self.runtime.ensure_memory_budget(
+            function_copy_bytes
+                .saturating_add(
+                    super::estimated_bigint_bytes(&request.function_id).saturating_mul(3),
+                )
+                .saturating_add(argument_storage_bytes)
+                .saturating_add(capture_storage_bytes)
+                .saturating_add(capture_scope_bytes)
+                .saturating_add(parameter_storage_bytes)
+                .saturating_add(rest_array_bytes)
+                .saturating_add(size_of::<Frame>())
+                .saturating_add(frame_capacity_growth)
+                .saturating_add(call_trace_capacity_growth.saturating_mul(2))
+                .saturating_add(self.runtime.call_frame_bookkeeping_growth_bytes()),
+            span,
+        )?;
+        self.runtime.reserve_call_frame_bookkeeping(span)?;
+        if call_trace_capacity > self.runtime.call_trace.capacity() {
+            self.runtime
+                .call_trace
+                .try_reserve_exact(
+                    call_trace_capacity.saturating_sub(self.runtime.call_trace.len()),
+                )
+                .map_err(|_| {
+                    self.runtime
+                        .error(RuntimeErrorKind::ResourceLimit("call trace"), span)
+                })?;
+            self.update_external_frame_memory(frames);
+        }
+        if frame_capacity > frames.capacity() {
+            frames
+                .try_reserve_exact(frame_capacity.saturating_sub(frames.len()))
+                .map_err(|_| {
+                    self.runtime
+                        .error(RuntimeErrorKind::ResourceLimit("call frames"), span)
+                })?;
+            self.update_external_frame_memory(frames);
+        }
+        let function = function_record.clone();
         let scope_floor = self.runtime.scopes.len();
         let stack_base = self.runtime.stack.len();
         if !request.captures.is_empty() {
@@ -755,6 +950,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             request.return_action,
             call_site_offset,
         ));
+        self.update_external_frame_memory(frames);
         Ok(())
     }
 
@@ -774,9 +970,10 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Mod => self.runtime.arithmetic(5, span)?,
             Print => {
                 let value = self.runtime.pop(span)?;
+                let formatted = self.runtime.format_value(&value, span)?;
                 self.runtime
                     .output
-                    .write_all(value.to_string().as_bytes())
+                    .write_all(formatted.as_bytes())
                     .map_err(|error| {
                         self.runtime
                             .error(RuntimeErrorKind::IOError(error.to_string()), span)
@@ -784,23 +981,28 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             }
             Input => {
                 let line = self.runtime.read_input_line(span)?;
-                self.runtime.stack.push(match line {
-                    Some(bytes) => Value::String(String::from_utf8(bytes).map_err(|_| {
-                        self.runtime.error(
-                            RuntimeErrorKind::IOError("standard input is not valid UTF-8".into()),
-                            span,
-                        )
-                    })?),
-                    None => Value::Null,
-                });
+                self.runtime.push_value(
+                    match line {
+                        Some(bytes) => Value::String(String::from_utf8(bytes).map_err(|_| {
+                            self.runtime.error(
+                                RuntimeErrorKind::IOError(
+                                    "standard input is not valid UTF-8".into(),
+                                ),
+                                span,
+                            )
+                        })?),
+                        None => Value::Null,
+                    },
+                    span,
+                )?;
             }
             Store => self.runtime.store(span)?,
             Load => self.runtime.load(span, false)?,
             Eq => self.runtime.equal(span)?,
             Gt => self.runtime.greater_than(span)?,
-            PushNull => self.runtime.stack.push(Value::Null),
-            PushTrue => self.runtime.stack.push(Value::Bool(true)),
-            PushFalse => self.runtime.stack.push(Value::Bool(false)),
+            PushNull => self.runtime.push_value(Value::Null, span)?,
+            PushTrue => self.runtime.push_value(Value::Bool(true), span)?,
+            PushFalse => self.runtime.push_value(Value::Bool(false), span)?,
             ToFloat => {
                 let value = self.runtime.pop(span)?;
                 let converted = match &value {
@@ -825,7 +1027,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                             .type_error("Float-convertible value", other, span))
                     }
                 };
-                self.runtime.stack.push(Value::Float(converted));
+                self.runtime.push_value(Value::Float(converted), span)?;
             }
             ToBool => self.runtime.to_bool(span)?,
             FloatFromBits => {
@@ -842,7 +1044,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         span,
                     )
                 })?;
-                self.runtime.stack.push(Value::Float(f64::from_bits(bits)));
+                self.runtime
+                    .push_value(Value::Float(f64::from_bits(bits)), span)?;
             }
             TypeOf => {
                 let value = self.runtime.pop(span)?;
@@ -903,7 +1106,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Not => {
                 let value = self.runtime.pop(span)?;
                 match value {
-                    Value::Bool(value) => self.runtime.stack.push(Value::Bool(!value)),
+                    Value::Bool(value) => self.runtime.push_value(Value::Bool(!value), span)?,
                     other => return Err(self.runtime.type_error("Bool", &other, span)),
                 }
             }
@@ -912,7 +1115,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Utf8Decode => self.runtime.utf8_decode(span)?,
             ToString => {
                 let value = self.runtime.pop(span)?;
-                self.runtime.stack.push(Value::String(value.to_string()));
+                let formatted = self.runtime.format_value(&value, span)?;
+                self.runtime.push_value(Value::String(formatted), span)?;
             }
             ToChar => self.runtime.to_char(span)?,
             ToByte => self.runtime.to_byte(span)?,
@@ -982,6 +1186,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > self.runtime.stack.len() {
                     return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
                 }
+                self.runtime
+                    .ensure_memory_budget(count.saturating_mul(size_of::<Value>()), span)?;
                 let mut arguments = Vec::with_capacity(count);
                 for _ in 0..count {
                     arguments.push(self.runtime.pop(span)?);
@@ -1015,6 +1221,16 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     if function.asynchronous {
                         return Err(self.unsupported(span, "async constructor scheduling"));
                     }
+                    self.runtime.ensure_memory_budget(
+                        arguments
+                            .capacity()
+                            .saturating_mul(size_of::<Value>())
+                            .saturating_add(super::estimate_cloned_value_payloads(&arguments))
+                            .saturating_add(
+                                count.saturating_add(1).saturating_mul(size_of::<Value>()),
+                            ),
+                        span,
+                    )?;
                     let mut arguments_with_receiver = Vec::with_capacity(count + 1);
                     arguments_with_receiver.push(object.clone());
                     arguments_with_receiver.extend(arguments);
@@ -1035,7 +1251,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         span,
                     ));
                 }
-                self.runtime.stack.push(object);
+                self.runtime.push_value(object, span)?;
             }
             FieldGet => self.runtime.field_get(span)?,
             FieldSet => self.runtime.field_set(span)?,
@@ -1058,6 +1274,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > self.runtime.stack.len() {
                     return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
                 }
+                self.runtime.ensure_memory_budget(
+                    count
+                        .saturating_add(1)
+                        .saturating_mul(size_of::<Value>())
+                        .saturating_add(super::estimated_unmanaged_payload_bytes(&receiver, 0)),
+                    span,
+                )?;
                 let mut arguments = Vec::with_capacity(count + 1);
                 for _ in 0..count {
                     arguments.push(self.runtime.pop(span)?);
@@ -1133,13 +1356,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     id: body_id,
                 };
                 if captures.is_empty() {
-                    self.runtime.stack.push(Value::Function(function));
+                    self.runtime.push_value(Value::Function(function), span)?;
                 } else {
                     let closure = self.runtime.allocate_closure(ClosureState {
                         function,
                         captures: RefCell::new(captures),
                     });
-                    self.runtime.stack.push(closure);
+                    self.runtime.push_value(closure, span)?;
                 }
             }
             CallValue => {
@@ -1150,6 +1373,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > self.runtime.stack.len() {
                     return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
                 }
+                self.runtime
+                    .ensure_memory_budget(count.saturating_mul(size_of::<Value>()), span)?;
                 let mut arguments = Vec::with_capacity(count);
                 for _ in 0..count {
                     arguments.push(self.runtime.pop(span)?);
@@ -1158,7 +1383,18 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 let (function, captures) = match callable {
                     Value::Function(function) => (function, Vec::new()),
                     Value::Closure(closure) => {
-                        (closure.function.clone(), closure.captures.borrow().clone())
+                        let captures = closure.captures.borrow();
+                        self.runtime.ensure_memory_budget(
+                            super::estimated_capture_clone_bytes(&captures)
+                                .saturating_add(size_of::<FunctionRef>())
+                                .saturating_add(super::estimated_bigint_bytes(&closure.function.id))
+                                .saturating_add(
+                                    arguments.capacity().saturating_mul(size_of::<Value>()),
+                                )
+                                .saturating_add(super::estimate_cloned_value_payloads(&arguments)),
+                            span,
+                        )?;
+                        (closure.function.clone(), captures.clone())
                     }
                     other => {
                         return Err(self.runtime.type_error("Function or Closure", &other, span))
@@ -1180,6 +1416,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > self.runtime.stack.len() {
                     return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
                 }
+                self.runtime
+                    .ensure_memory_budget(count.saturating_mul(size_of::<Value>()), span)?;
                 let mut arguments = Vec::with_capacity(count);
                 for _ in 0..count {
                     arguments.push(self.runtime.pop(span)?);
@@ -1222,6 +1460,9 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 span,
             ));
         }
+        let value_bytes = usize::try_from(value.bits().saturating_add(7) / 8).unwrap_or(usize::MAX);
+        self.runtime
+            .ensure_memory_budget(width.saturating_add(value_bytes), span)?;
         let (_, mut bytes) = value.to_bytes_be();
         if value.is_zero() && width == 0 {
             bytes.clear();
@@ -1240,7 +1481,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             padded.extend(bytes);
             bytes = padded;
         }
-        self.runtime.stack.push(Value::Bytes(bytes));
+        self.runtime.push_value(Value::Bytes(bytes), span)?;
         Ok(())
     }
 
@@ -1253,50 +1494,61 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                     return Err(self.runtime.error(RuntimeErrorKind::DivisionByZero, span));
                 }
                 if base_int == &BigInt::one() {
-                    self.runtime.stack.push(Value::Int(BigInt::one()));
+                    self.runtime.push_value(Value::Int(BigInt::one()), span)?;
                 } else if base_int == &BigInt::from(-1) {
                     let odd = (exponent_int % BigInt::from(2)) != BigInt::zero();
-                    self.runtime.stack.push(Value::Int(if odd {
-                        BigInt::from(-1)
-                    } else {
-                        BigInt::one()
-                    }));
+                    self.runtime.push_value(
+                        Value::Int(if odd { BigInt::from(-1) } else { BigInt::one() }),
+                        span,
+                    )?;
                 } else {
                     let result = super::to_float(&base).powf(super::to_float(&exponent));
-                    self.runtime.stack.push(Value::Float(result));
+                    self.runtime.push_value(Value::Float(result), span)?;
                 }
                 return Ok(());
             }
             if exponent_int.is_zero() {
-                self.runtime.stack.push(Value::Int(BigInt::one()));
+                self.runtime.push_value(Value::Int(BigInt::one()), span)?;
                 return Ok(());
             }
             if base_int.is_zero() {
-                self.runtime.stack.push(Value::Int(BigInt::zero()));
+                self.runtime.push_value(Value::Int(BigInt::zero()), span)?;
                 return Ok(());
             }
             if base_int == &BigInt::one() {
-                self.runtime.stack.push(Value::Int(BigInt::one()));
+                self.runtime.push_value(Value::Int(BigInt::one()), span)?;
                 return Ok(());
             }
             if base_int == &BigInt::from(-1) {
                 let odd = (exponent_int % BigInt::from(2)) != BigInt::zero();
-                self.runtime.stack.push(Value::Int(if odd {
-                    BigInt::from(-1)
-                } else {
-                    BigInt::one()
-                }));
+                self.runtime.push_value(
+                    Value::Int(if odd { BigInt::from(-1) } else { BigInt::one() }),
+                    span,
+                )?;
                 return Ok(());
             }
             let Some(power) = exponent_int.to_u32() else {
                 return Err(self.runtime.error(RuntimeErrorKind::ExecutionLimit, span));
             };
             let max_bits = self.policy.limits.max_file_bytes.saturating_mul(8) as u64;
-            let base_bytes = base_int.to_bytes_be().1.len() as u64;
-            if base_bytes.saturating_mul(power as u64) > max_bits.saturating_add(8) {
+            let result_bits = base_int.bits().saturating_mul(power as u64);
+            if result_bits > max_bits.saturating_add(8) {
                 return Err(self.runtime.error(RuntimeErrorKind::ExecutionLimit, span));
             }
-            self.runtime.stack.push(Value::Int(base_int.pow(power)));
+            let result_bytes =
+                usize::try_from(result_bits.saturating_add(7) / 8).unwrap_or(usize::MAX);
+            let operand_bytes = usize::try_from(
+                base_int
+                    .bits()
+                    .saturating_add(exponent_int.bits())
+                    .saturating_add(7)
+                    / 8,
+            )
+            .unwrap_or(usize::MAX);
+            self.runtime
+                .ensure_memory_budget(result_bytes.saturating_add(operand_bytes), span)?;
+            self.runtime
+                .push_value(Value::Int(base_int.pow(power)), span)?;
             return Ok(());
         }
         let base_is_numeric = matches!(base, Value::Int(_) | Value::Float(_));
@@ -1311,15 +1563,15 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         if super::to_float(&base) == 0.0 && super::to_float(&exponent) < 0.0 {
             return Err(self.runtime.error(RuntimeErrorKind::DivisionByZero, span));
         }
-        self.runtime.stack.push(Value::Float(result));
+        self.runtime.push_value(Value::Float(result), span)?;
         Ok(())
     }
 
     fn negate(&mut self, span: Span) -> Result<(), RuntimeError> {
         let value = self.runtime.pop(span)?;
         match value {
-            Value::Int(value) => self.runtime.stack.push(Value::Int(-value)),
-            Value::Float(value) => self.runtime.stack.push(Value::Float(-value)),
+            Value::Int(value) => self.runtime.push_value(Value::Int(-value), span)?,
+            Value::Float(value) => self.runtime.push_value(Value::Float(-value), span)?,
             other => return Err(self.runtime.type_error("Int or Float", &other, span)),
         }
         Ok(())
@@ -1328,8 +1580,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
     fn absolute(&mut self, span: Span) -> Result<(), RuntimeError> {
         let value = self.runtime.pop(span)?;
         match value {
-            Value::Int(value) => self.runtime.stack.push(Value::Int(value.abs())),
-            Value::Float(value) => self.runtime.stack.push(Value::Float(value.abs())),
+            Value::Int(value) => self.runtime.push_value(Value::Int(value.abs()), span)?,
+            Value::Float(value) => self.runtime.push_value(Value::Float(value.abs()), span)?,
             other => return Err(self.runtime.type_error("Int or Float", &other, span)),
         }
         Ok(())
@@ -1352,7 +1604,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             IrOp::Xor => left ^ right,
             _ => return Err(self.unsupported(span, "invalid boolean intrinsic")),
         };
-        self.runtime.stack.push(Value::Bool(result));
+        self.runtime.push_value(Value::Bool(result), span)?;
         Ok(())
     }
 
@@ -1362,7 +1614,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             let Value::Int(value) = value else {
                 return Err(self.runtime.type_error("Int", &value, span));
             };
-            self.runtime.stack.push(Value::Int(!value));
+            let payload_bytes = super::estimated_bigint_bytes(&value);
+            self.runtime.ensure_memory_budget(
+                payload_bytes.saturating_add(payload_bytes.saturating_add(1)),
+                span,
+            )?;
+            self.runtime.push_value(Value::Int(!value), span)?;
             return Ok(());
         }
         let right = self.runtime.pop(span)?;
@@ -1375,6 +1632,15 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Value::Int(value) => value,
             other => return Err(self.runtime.type_error("Int", &other, span)),
         };
+        let operand_bytes = super::estimated_bigint_bytes(&left)
+            .saturating_add(super::estimated_bigint_bytes(&right));
+        if matches!(operation, IrOp::BitAnd | IrOp::BitOr | IrOp::BitXor) {
+            let result_bits = left.bits().max(right.bits()).saturating_add(1);
+            let result_bytes =
+                usize::try_from(result_bits.saturating_add(7) / 8).unwrap_or(usize::MAX);
+            self.runtime
+                .ensure_memory_budget(operand_bytes.saturating_add(result_bytes), span)?;
+        }
         let result = match operation {
             IrOp::BitAnd => &left & &right,
             IrOp::BitOr => &left | &right,
@@ -1395,24 +1661,36 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 let limit = self.policy.limits.max_file_bytes.saturating_mul(8);
                 if count > limit {
                     if operation == IrOp::Shr {
-                        self.runtime.stack.push(Value::Int(if left.is_negative() {
-                            BigInt::from(-1)
-                        } else {
-                            BigInt::zero()
-                        }));
+                        self.runtime.ensure_memory_budget(operand_bytes, span)?;
+                        self.runtime.push_value(
+                            Value::Int(if left.is_negative() {
+                                BigInt::from(-1)
+                            } else {
+                                BigInt::zero()
+                            }),
+                            span,
+                        )?;
                         return Ok(());
                     }
                     return Err(self.runtime.error(RuntimeErrorKind::ExecutionLimit, span));
                 }
                 if operation == IrOp::Shl {
+                    let result_bits = left
+                        .bits()
+                        .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                    let result_bytes =
+                        usize::try_from(result_bits.saturating_add(7) / 8).unwrap_or(usize::MAX);
+                    self.runtime
+                        .ensure_memory_budget(operand_bytes.saturating_add(result_bytes), span)?;
                     &left << count
                 } else {
+                    self.runtime.ensure_memory_budget(operand_bytes, span)?;
                     &left >> count
                 }
             }
             _ => return Err(self.unsupported(span, "invalid bitwise intrinsic")),
         };
-        self.runtime.stack.push(Value::Int(result));
+        self.runtime.push_value(Value::Int(result), span)?;
         Ok(())
     }
 }
@@ -1616,6 +1894,132 @@ impl Frame {
             function,
         }
     }
+}
+
+fn frame_capacity_after_push(
+    current_capacity: usize,
+    current_length: usize,
+    maximum_frames: usize,
+) -> Option<usize> {
+    let required = current_length.checked_add(1)?;
+    if required > maximum_frames {
+        return None;
+    }
+    if required <= current_capacity {
+        return Some(current_capacity);
+    }
+    Some(
+        current_capacity
+            .saturating_mul(2)
+            .max(required)
+            .min(maximum_frames),
+    )
+}
+
+fn function_record_payload_bytes(function: &FunctionRecord) -> usize {
+    function
+        .parameter_ids
+        .capacity()
+        .saturating_mul(size_of::<BigInt>())
+        .saturating_add(
+            function
+                .id
+                .as_ref()
+                .map(super::estimated_bigint_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            function
+                .parameter_ids
+                .iter()
+                .map(super::estimated_bigint_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
+}
+
+fn snapshot_payload_bytes(snapshot: &super::ExecutionSnapshot) -> usize {
+    snapshot
+        .stack
+        .capacity()
+        .saturating_mul(size_of::<Value>())
+        .saturating_add(super::estimate_cloned_value_payloads(&snapshot.stack))
+        .saturating_add(
+            snapshot
+                .capture_lengths
+                .capacity()
+                .saturating_mul(size_of::<usize>()),
+        )
+}
+
+fn pending_exception_bytes(exception: &PendingException) -> usize {
+    exception
+        .error
+        .stack_trace
+        .capacity()
+        .saturating_mul(size_of::<super::StackTraceFrame>())
+        .saturating_add(
+            exception
+                .error
+                .stack_trace
+                .iter()
+                .map(|frame| super::estimated_bigint_bytes(&frame.function_id))
+                .fold(0usize, usize::saturating_add),
+        )
+}
+
+fn frame_storage_bytes(frames: &[Frame], capacity: usize) -> usize {
+    frames.iter().fold(
+        capacity.saturating_mul(size_of::<Frame>()),
+        |total, frame| {
+            let loop_bytes = frame
+                .loop_states
+                .capacity()
+                .saturating_mul(size_of::<(u32, LoopState)>() + 2 * size_of::<usize>())
+                .saturating_add(
+                    frame
+                        .loop_states
+                        .values()
+                        .map(|state| super::estimated_bigint_bytes(&state.variable_id))
+                        .fold(0usize, usize::saturating_add),
+                );
+            let pending_bytes = frame
+                .pending_exceptions
+                .capacity()
+                .saturating_mul(size_of::<PendingException>())
+                .saturating_add(
+                    frame
+                        .pending_exceptions
+                        .iter()
+                        .map(pending_exception_bytes)
+                        .fold(0usize, usize::saturating_add),
+                );
+            let active_bytes = frame
+                .active_exceptions
+                .capacity()
+                .saturating_mul(
+                    size_of::<(usize, super::ExecutionSnapshot)>() + 2 * size_of::<usize>(),
+                )
+                .saturating_add(
+                    frame
+                        .active_exceptions
+                        .values()
+                        .map(snapshot_payload_bytes)
+                        .fold(0usize, usize::saturating_add),
+                );
+            let return_payload = match &frame.return_action {
+                ReturnAction::PushResult => 0,
+                ReturnAction::PushValue(value) => {
+                    super::estimated_unmanaged_payload_bytes(value, 0)
+                }
+            };
+            total
+                .saturating_add(function_record_payload_bytes(&frame.function))
+                .saturating_add(loop_bytes)
+                .saturating_add(pending_bytes)
+                .saturating_add(active_bytes)
+                .saturating_add(return_payload)
+        },
+    )
 }
 
 #[derive(Clone, Debug)]

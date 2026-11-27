@@ -13,18 +13,28 @@ use crate::intrinsics::IrOp;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Capability {
     FsRead,
+    FsWrite,
+    NetConnect,
+    NetListen,
+    ProcessSpawn,
     EnvRead,
-    Clock,
     Ffi,
+    Clock,
+    Random,
 }
 
 impl Capability {
-    fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::FsRead => "fs.read",
+            Self::FsWrite => "fs.write",
+            Self::NetConnect => "net.connect",
+            Self::NetListen => "net.listen",
+            Self::ProcessSpawn => "process.spawn",
             Self::EnvRead => "env.read",
-            Self::Clock => "clock",
             Self::Ffi => "ffi",
+            Self::Clock => "clock",
+            Self::Random => "random",
         }
     }
 }

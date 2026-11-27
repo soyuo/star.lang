@@ -6,7 +6,7 @@ Status: draft
 
 ## Host policy
 
-The caller supplies finite limits for file bytes, aggregate table entries, decoded instructions, and operand-stack depth. Limits are checked before allocating from serialized counts and while decoding code. Limits are host policy and are not embedded in the bytecode. Runtime timeouts, memory accounting, and OS isolation remain the responsibility of the VM host.
+The caller supplies finite limits for file bytes, aggregate table entries, decoded instructions, and operand-stack depth. Limits are checked before allocating from serialized counts and while decoding code. Limits are host policy and are not embedded in the bytecode. The VM host also supplies runtime ceilings through `ExecutionLimits`; their accounting and cooperative timeout behavior are defined in `spec/resource-limits.md`.
 
 The caller also supplies granted capabilities. Verification rejects a resource-sensitive intrinsic when its required capability is absent:
 
@@ -17,6 +17,8 @@ The caller also supplies granted capabilities. Verification rejects a resource-s
 | `NATIVE_LOAD`, `NATIVE_SYMBOL`, `NATIVE_CALL`, `NATIVE_CLOSE`, `NATIVE_CALLBACK`, `NATIVE_BUFFER` | `ffi` |
 
 The VM must check capabilities again when an operation executes. Passing verification never grants a capability. Since the opcode alone cannot determine an import's resolution path, verification does not reject imports based on these path-dependent permissions; the module resolver enforces them before accessing the file or environment variable. The current reference VM has no module resolver and reports imports as unsupported without performing either access.
+
+The host capability vocabulary is `fs.read`, `fs.write`, `net.connect`, `net.listen`, `process.spawn`, `env.read`, `ffi`, `clock`, and `random`. The current bytecode slice uses `clock` for `SLEEP`, `ffi` for native operations, and the path-dependent import permissions above. Other listed capabilities are reserved for operations that are not yet implemented; granting one does not enable an unsupported operation. The source interpreter has no ambient filesystem, network, process, environment, native-library, or random-source access; its standard input and output are explicit host-provided streams.
 
 ## Container and table validation
 

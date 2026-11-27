@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 
 use crate::BigInt;
 use star_common::{SourcePosition, Span};
@@ -136,8 +137,8 @@ pub struct ResolvedFunction {
     pub variadic: bool,
     /// Whether the function is synchronous or asynchronous.
     pub kind: FunctionKind,
-    /// The function body statements.
-    pub body: Vec<Statement>,
+    /// Shared immutable function body statements; calls do not clone the AST.
+    pub body: Rc<Vec<Statement>>,
     /// Original source range of the function definition.
     pub span: Span,
 }
@@ -917,7 +918,7 @@ impl Analyzer {
                 parameter_ids: signature.2.iter().rev().map(identifier_to_bigint).collect(),
                 variadic: signature.1.variadic,
                 kind: block.kind,
-                body: block.body.clone(),
+                body: Rc::new(block.body.clone()),
                 span: block.span,
             });
         }

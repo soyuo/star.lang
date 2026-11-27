@@ -6,7 +6,7 @@ Status: draft
 
 An unhandled execution error is returned as a `RuntimeError` with a primary `RuntimeErrorKind`, a source `Span`, and a `stack_trace`. The primary span identifies the failing instruction or construct. Each stack-trace frame records the called function's stable ID and the source span of the call that entered it.
 
-Frames are stored outermost first. Displayed diagnostics print the innermost frame first, followed by callers, after the primary error and location. Errors retain the trace captured at the failure site while propagating; propagation does not duplicate frames or replace the primary span.
+Frames are stored outermost first. Displayed diagnostics print the innermost frame first, followed by callers, after the primary error and location. Errors retain the trace captured at the failure site while propagating; propagation does not duplicate frames or replace the primary span. When the configured memory limit cannot hold the complete diagnostic copy, the trace retains the innermost frames that fit and sets `stack_trace_truncated` to indicate omitted outer frames.
 
 Errors that occur before entering a callee, such as a bad argument count or unknown function ID, use the call instruction as the primary span and include only frames that were already active. Static verification errors have no runtime call frames.
 

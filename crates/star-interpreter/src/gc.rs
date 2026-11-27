@@ -7,11 +7,13 @@
 
 use std::cell::{BorrowError, BorrowMutError, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::rc::{Rc, Weak};
 use std::{error::Error, fmt};
 
 use crate::value::{
-    BindingCell, ClosureState, IteratorState, MapState, ObjectState, SetState, TupleState, Value,
+    Binding, BindingCell, ClosureState, IteratorState, MapState, ObjectState, RuntimeKey, SetState,
+    TupleState, Value,
 };
 use crate::BigInt;
 
@@ -328,6 +330,84 @@ impl GcHeap {
         self.threshold = threshold.max(1);
     }
 
+    /// Estimates guest-owned value and managed-heap storage, including capacity.
+    /// This is a deterministic accounting estimate, not the host process RSS.
+    pub(crate) fn estimated_memory_bytes(
+        &self,
+        stack: &Vec<Value>,
+        scopes: &Vec<HashMap<BigInt, BindingCell>>,
+        capture_vectors: &Vec<Vec<(BigInt, BindingCell)>>,
+        limit: usize,
+    ) -> Result<usize, GcError> {
+        let mut meter = MemoryEstimator::with_limit(limit);
+        meter.charge(size_of::<Self>());
+        meter.charge(self.nodes.capacity().saturating_mul(size_of::<WeakNode>()));
+        if meter.exceeded() {
+            return Ok(meter.bytes);
+        }
+        meter.charge(stack.capacity().saturating_mul(size_of::<Value>()));
+        for value in stack {
+            meter.value_payload(value, 0)?;
+            if meter.exceeded() {
+                return Ok(meter.bytes);
+            }
+        }
+        meter.charge(
+            scopes
+                .capacity()
+                .saturating_mul(size_of::<HashMap<BigInt, BindingCell>>()),
+        );
+        for scope in scopes {
+            meter.charge(
+                scope
+                    .capacity()
+                    .saturating_mul(size_of::<(BigInt, BindingCell)>()),
+            );
+            for (id, cell) in scope {
+                meter.bigint(id);
+                meter.binding(cell, 0)?;
+                if meter.exceeded() {
+                    return Ok(meter.bytes);
+                }
+            }
+        }
+        meter.charge(
+            capture_vectors
+                .capacity()
+                .saturating_mul(size_of::<Vec<(BigInt, BindingCell)>>()),
+        );
+        for captures in capture_vectors {
+            meter.charge(
+                captures
+                    .capacity()
+                    .saturating_mul(size_of::<(BigInt, BindingCell)>()),
+            );
+            for (id, cell) in captures {
+                meter.bigint(id);
+                meter.binding(cell, 0)?;
+                if meter.exceeded() {
+                    return Ok(meter.bytes);
+                }
+            }
+        }
+        for node in self.nodes.iter().filter_map(WeakNode::upgrade) {
+            let value = match node {
+                StrongNode::Array(value) => Value::Array(value),
+                StrongNode::Tuple(value) => Value::Tuple(value),
+                StrongNode::Map(value) => Value::Map(value),
+                StrongNode::Set(value) => Value::Set(value),
+                StrongNode::Iterator(value) => Value::Iterator(value),
+                StrongNode::Closure(value) => Value::Closure(value),
+                StrongNode::Object(value) => Value::Object(value),
+            };
+            meter.value_payload(&value, 0)?;
+            if meter.exceeded() {
+                break;
+            }
+        }
+        Ok(meter.bytes)
+    }
+
     pub(crate) fn allocate_array(&mut self, values: Vec<Value>) -> Value {
         let value = Rc::new(RefCell::new(values));
         self.register(WeakNode::Array(Rc::downgrade(&value)));
@@ -459,6 +539,269 @@ impl GcHeap {
             total_allocations: self.total_allocations,
             next_threshold: self.threshold,
         })
+    }
+}
+
+const MAX_MEMORY_WALK_DEPTH: usize = 256;
+const RC_CONTROL_BLOCK_BYTES: usize = 2 * size_of::<usize>();
+
+#[derive(Default)]
+struct MemoryEstimator {
+    bytes: usize,
+    limit: usize,
+    seen_nodes: HashSet<NodeKey>,
+    seen_cells: HashSet<usize>,
+}
+
+impl MemoryEstimator {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            bytes: 0,
+            limit,
+            seen_nodes: HashSet::new(),
+            seen_cells: HashSet::new(),
+        }
+    }
+
+    fn exceeded(&self) -> bool {
+        self.bytes > self.limit
+    }
+
+    fn charge(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn bigint(&mut self, value: &BigInt) {
+        let payload = usize::try_from(value.bits().saturating_add(7) / 8).unwrap_or(usize::MAX);
+        self.charge(payload);
+    }
+
+    fn binding(&mut self, cell: &BindingCell, depth: usize) -> Result<(), GcError> {
+        if self.exceeded() {
+            return Ok(());
+        }
+        if !self.seen_cells.insert(Rc::as_ptr(cell) as usize) {
+            return Ok(());
+        }
+        self.charge(size_of::<RefCell<Binding>>().saturating_add(RC_CONTROL_BLOCK_BYTES));
+        self.value_payload(&cell.try_borrow()?.value, depth + 1)
+    }
+
+    fn key(&mut self, key: &RuntimeKey, depth: usize) {
+        if self.exceeded() {
+            return;
+        }
+        if depth >= MAX_MEMORY_WALK_DEPTH {
+            self.charge(usize::MAX);
+            return;
+        }
+        match key {
+            RuntimeKey::Int(value) => self.bigint(value),
+            RuntimeKey::String(value) => self.charge(value.capacity()),
+            RuntimeKey::Bytes(value) => self.charge(value.capacity()),
+            RuntimeKey::Tuple(values) => {
+                self.charge(values.capacity().saturating_mul(size_of::<RuntimeKey>()));
+                for value in values {
+                    if self.exceeded() {
+                        break;
+                    }
+                    self.key(value, depth + 1);
+                }
+            }
+            RuntimeKey::Null
+            | RuntimeKey::Bool(_)
+            | RuntimeKey::Float(_)
+            | RuntimeKey::Char(_)
+            | RuntimeKey::Byte(_) => {}
+        }
+    }
+
+    fn value_payload(&mut self, value: &Value, depth: usize) -> Result<(), GcError> {
+        if self.exceeded() {
+            return Ok(());
+        }
+        if depth >= MAX_MEMORY_WALK_DEPTH {
+            self.charge(usize::MAX);
+            return Ok(());
+        }
+        match value {
+            Value::Int(value) => self.bigint(value),
+            Value::String(value) => self.charge(value.capacity()),
+            Value::Bytes(value) => self.charge(value.capacity()),
+            Value::Function(function) => self.bigint(&function.id),
+            Value::Array(value) => {
+                let key = NodeKey {
+                    kind: 0,
+                    pointer: Rc::as_ptr(value) as usize,
+                };
+                if self.seen_nodes.insert(key) {
+                    let values = value.try_borrow()?;
+                    self.charge(size_of::<RefCell<Vec<Value>>>() + RC_CONTROL_BLOCK_BYTES);
+                    self.charge(values.capacity().saturating_mul(size_of::<Value>()));
+                    for child in values.iter() {
+                        self.value_payload(child, depth + 1)?;
+                        if self.exceeded() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Value::Tuple(value) => {
+                let key = NodeKey {
+                    kind: 1,
+                    pointer: Rc::as_ptr(value) as usize,
+                };
+                if self.seen_nodes.insert(key) {
+                    let values = value.values.try_borrow()?;
+                    self.charge(size_of::<TupleState>() + RC_CONTROL_BLOCK_BYTES);
+                    self.charge(values.capacity().saturating_mul(size_of::<Value>()));
+                    for child in values.iter() {
+                        self.value_payload(child, depth + 1)?;
+                        if self.exceeded() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Value::Map(value) => {
+                let key = NodeKey {
+                    kind: 2,
+                    pointer: Rc::as_ptr(value) as usize,
+                };
+                if self.seen_nodes.insert(key) {
+                    let map = value.try_borrow()?;
+                    self.charge(size_of::<RefCell<MapState>>() + RC_CONTROL_BLOCK_BYTES);
+                    self.charge(
+                        map.entries
+                            .capacity()
+                            .saturating_mul(size_of::<(RuntimeKey, Value)>()),
+                    );
+                    self.charge(
+                        map.order
+                            .capacity()
+                            .saturating_mul(size_of::<(RuntimeKey, Value)>()),
+                    );
+                    for (key, child) in &map.entries {
+                        self.key(key, depth + 1);
+                        self.value_payload(child, depth + 1)?;
+                        if self.exceeded() {
+                            break;
+                        }
+                    }
+                    for (key, child) in &map.order {
+                        if self.exceeded() {
+                            break;
+                        }
+                        self.key(key, depth + 1);
+                        self.value_payload(child, depth + 1)?;
+                    }
+                }
+            }
+            Value::Set(value) => {
+                let key = NodeKey {
+                    kind: 3,
+                    pointer: Rc::as_ptr(value) as usize,
+                };
+                if self.seen_nodes.insert(key) {
+                    let set = value.try_borrow()?;
+                    self.charge(size_of::<RefCell<SetState>>() + RC_CONTROL_BLOCK_BYTES);
+                    self.charge(
+                        set.members
+                            .capacity()
+                            .saturating_mul(size_of::<RuntimeKey>()),
+                    );
+                    self.charge(
+                        set.order
+                            .capacity()
+                            .saturating_mul(size_of::<(RuntimeKey, Value)>()),
+                    );
+                    for key in &set.members {
+                        self.key(key, depth + 1);
+                        if self.exceeded() {
+                            break;
+                        }
+                    }
+                    for (key, child) in &set.order {
+                        if self.exceeded() {
+                            break;
+                        }
+                        self.key(key, depth + 1);
+                        self.value_payload(child, depth + 1)?;
+                    }
+                }
+            }
+            Value::Iterator(value) => {
+                let key = NodeKey {
+                    kind: 4,
+                    pointer: Rc::as_ptr(value) as usize,
+                };
+                if self.seen_nodes.insert(key) {
+                    let iterator = value.try_borrow()?;
+                    self.charge(size_of::<RefCell<IteratorState>>() + RC_CONTROL_BLOCK_BYTES);
+                    self.charge(
+                        iterator
+                            .values
+                            .capacity()
+                            .saturating_mul(size_of::<Value>()),
+                    );
+                    for child in &iterator.values {
+                        self.value_payload(child, depth + 1)?;
+                        if self.exceeded() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Value::Closure(value) => {
+                let key = NodeKey {
+                    kind: 5,
+                    pointer: Rc::as_ptr(value) as usize,
+                };
+                if self.seen_nodes.insert(key) {
+                    self.charge(size_of::<ClosureState>() + RC_CONTROL_BLOCK_BYTES);
+                    self.bigint(&value.function.id);
+                    let captures = value.captures.try_borrow()?;
+                    self.charge(
+                        captures
+                            .capacity()
+                            .saturating_mul(size_of::<(BigInt, BindingCell)>()),
+                    );
+                    for (id, cell) in captures.iter() {
+                        self.bigint(id);
+                        self.binding(cell, depth + 1)?;
+                        if self.exceeded() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Value::Object(value) => {
+                let key = NodeKey {
+                    kind: 6,
+                    pointer: Rc::as_ptr(value) as usize,
+                };
+                if self.seen_nodes.insert(key) {
+                    let object = value.try_borrow()?;
+                    self.charge(size_of::<RefCell<ObjectState>>() + RC_CONTROL_BLOCK_BYTES);
+                    self.bigint(&object.struct_id);
+                    self.charge(
+                        object
+                            .fields
+                            .capacity()
+                            .saturating_mul(size_of::<(BigInt, Value)>()),
+                    );
+                    for (id, child) in &object.fields {
+                        self.bigint(id);
+                        self.value_payload(child, depth + 1)?;
+                        if self.exceeded() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Value::Float(_) | Value::Bool(_) | Value::Char(_) | Value::Byte(_) | Value::Null => {}
+        }
+        Ok(())
     }
 }
 
