@@ -144,6 +144,8 @@ pub struct RuntimeError {
     pub span: Span,
     /// Active function frames from outermost to innermost at the failure site.
     pub stack_trace: Vec<StackTraceFrame>,
+    /// Whether the trace omits outer frames to remain within the memory limit.
+    pub stack_trace_truncated: bool,
 }
 
 /// A function frame recorded while propagating a runtime error.
@@ -171,6 +173,9 @@ impl fmt::Display for RuntimeError {
                 frame.call_site.start.column,
                 frame.call_site.start.byte_offset
             )?;
+        }
+        if self.stack_trace_truncated {
+            write!(formatter, "\n  <stack trace truncated by memory limit>")?;
         }
         Ok(())
     }
@@ -342,7 +347,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span))?;
         estimated = estimated
             .saturating_add(self.external_memory_bytes)
-            .saturating_add(self.call_trace_memory_bytes());
+            .saturating_add(self.call_trace_memory_bytes().saturating_mul(2))
+            .saturating_add(self.call_frame_bookkeeping_memory_bytes());
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             self.collect_garbage().map_err(|_| {
                 self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
@@ -360,7 +366,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 })?;
             estimated = estimated
                 .saturating_add(self.external_memory_bytes)
-                .saturating_add(self.call_trace_memory_bytes());
+                .saturating_add(self.call_trace_memory_bytes().saturating_mul(2))
+                .saturating_add(self.call_frame_bookkeeping_memory_bytes());
         }
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             return Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span));
@@ -382,6 +389,89 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     .map(|frame| estimated_bigint_bytes(&frame.function_id))
                     .fold(0usize, usize::saturating_add),
             )
+    }
+
+    fn call_frame_bookkeeping_memory_bytes(&self) -> usize {
+        self.scope_floors
+            .capacity()
+            .saturating_mul(size_of::<usize>())
+            .saturating_add(
+                self.frame_stack_bases
+                    .capacity()
+                    .saturating_mul(size_of::<usize>()),
+            )
+    }
+
+    pub(crate) fn call_frame_bookkeeping_growth_bytes(&self) -> usize {
+        let scope_capacity =
+            projected_capacity_after_push(self.scope_floors.len(), self.scope_floors.capacity());
+        let frame_capacity = projected_capacity_after_push(
+            self.frame_stack_bases.len(),
+            self.frame_stack_bases.capacity(),
+        );
+        let capture_capacity = projected_capacity_after_push(
+            self.capture_vectors.len(),
+            self.capture_vectors.capacity(),
+        );
+        scope_capacity
+            .saturating_sub(self.scope_floors.capacity())
+            .saturating_add(frame_capacity.saturating_sub(self.frame_stack_bases.capacity()))
+            .saturating_mul(size_of::<usize>())
+            .saturating_add(
+                capture_capacity
+                    .saturating_sub(self.capture_vectors.capacity())
+                    .saturating_mul(size_of::<Vec<(BigInt, BindingCell)>>()),
+            )
+    }
+
+    pub(crate) fn reserve_call_frame_bookkeeping(
+        &mut self,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        let scope_capacity =
+            projected_capacity_after_push(self.scope_floors.len(), self.scope_floors.capacity());
+        let frame_capacity = projected_capacity_after_push(
+            self.frame_stack_bases.len(),
+            self.frame_stack_bases.capacity(),
+        );
+        let capture_capacity = projected_capacity_after_push(
+            self.capture_vectors.len(),
+            self.capture_vectors.capacity(),
+        );
+        if scope_capacity > self.scope_floors.capacity()
+            && self
+                .scope_floors
+                .try_reserve_exact(scope_capacity.saturating_sub(self.scope_floors.len()))
+                .is_err()
+        {
+            return Err(self.error(
+                RuntimeErrorKind::ResourceLimit("call frame bookkeeping"),
+                span,
+            ));
+        }
+        if frame_capacity > self.frame_stack_bases.capacity()
+            && self
+                .frame_stack_bases
+                .try_reserve_exact(frame_capacity.saturating_sub(self.frame_stack_bases.len()))
+                .is_err()
+        {
+            return Err(self.error(
+                RuntimeErrorKind::ResourceLimit("call frame bookkeeping"),
+                span,
+            ));
+        }
+        if capture_capacity > self.capture_vectors.capacity()
+            && self
+                .capture_vectors
+                .try_reserve_exact(capture_capacity.saturating_sub(self.capture_vectors.len()))
+                .is_err()
+        {
+            return Err(self.error(
+                RuntimeErrorKind::ResourceLimit("call frame bookkeeping"),
+                span,
+            ));
+        }
+        self.ensure_memory_budget(0, span)
     }
 
     pub(crate) fn push_value(&mut self, value: Value, span: Span) -> Result<(), RuntimeError> {
@@ -993,11 +1083,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .saturating_add(capture_scope_bytes)
                 .saturating_add(parameter_storage_bytes)
                 .saturating_add(rest_vector_bytes)
-                .saturating_add(3 * size_of::<usize>())
-                .saturating_add(trace_capacity_growth)
-                .saturating_add(estimated_bigint_bytes(&function.id)),
+                .saturating_add(self.call_frame_bookkeeping_growth_bytes())
+                .saturating_add(trace_capacity_growth.saturating_mul(2))
+                .saturating_add(estimated_bigint_bytes(&function.id).saturating_mul(2)),
             span,
         )?;
+        self.reserve_call_frame_bookkeeping(span)?;
         if trace_capacity > self.call_trace.capacity() {
             self.call_trace
                 .try_reserve_exact(trace_capacity.saturating_sub(self.call_trace.len()))
@@ -2830,12 +2921,61 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         )
     }
 
+    fn bounded_error_stack_trace(&self) -> (Vec<StackTraceFrame>, bool) {
+        let current_memory = self
+            .gc
+            .estimated_memory_bytes(
+                &self.stack,
+                &self.scopes,
+                &self.capture_vectors,
+                self.limits.max_memory_bytes,
+            )
+            .map(|bytes| {
+                bytes
+                    .saturating_add(self.external_memory_bytes)
+                    .saturating_add(self.call_trace_memory_bytes())
+                    .saturating_add(self.call_frame_bookkeeping_memory_bytes())
+            })
+            .unwrap_or(usize::MAX);
+        let mut available = self.limits.max_memory_bytes.saturating_sub(current_memory);
+        let mut first = self.call_trace.len();
+        for (index, frame) in self.call_trace.iter().enumerate().rev() {
+            let frame_bytes = size_of::<StackTraceFrame>()
+                .saturating_add(estimated_bigint_bytes(&frame.function_id));
+            if frame_bytes > available {
+                break;
+            }
+            available = available.saturating_sub(frame_bytes);
+            first = index;
+        }
+        let mut stack_trace = Vec::new();
+        if stack_trace
+            .try_reserve_exact(self.call_trace.len().saturating_sub(first))
+            .is_err()
+        {
+            return (stack_trace, !self.call_trace.is_empty());
+        }
+        stack_trace.extend(self.call_trace[first..].iter().cloned());
+        (stack_trace, first > 0)
+    }
+
     fn error(&self, kind: RuntimeErrorKind, span: Span) -> RuntimeError {
+        let (stack_trace, stack_trace_truncated) = self.bounded_error_stack_trace();
         RuntimeError {
             kind,
             span,
-            stack_trace: self.call_trace.clone(),
+            stack_trace,
+            stack_trace_truncated,
         }
+    }
+}
+
+fn projected_capacity_after_push(length: usize, capacity: usize) -> usize {
+    let required = length.saturating_add(1);
+    if required <= capacity {
+        capacity
+    } else {
+        capacity.saturating_mul(2).max(required)
     }
 }
 

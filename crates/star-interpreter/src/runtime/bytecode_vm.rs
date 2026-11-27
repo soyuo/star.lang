@@ -871,7 +871,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.ensure_memory_budget(
             function_copy_bytes
                 .saturating_add(
-                    super::estimated_bigint_bytes(&request.function_id).saturating_mul(2),
+                    super::estimated_bigint_bytes(&request.function_id).saturating_mul(3),
                 )
                 .saturating_add(argument_storage_bytes)
                 .saturating_add(capture_storage_bytes)
@@ -880,9 +880,11 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 .saturating_add(rest_array_bytes)
                 .saturating_add(size_of::<Frame>())
                 .saturating_add(frame_capacity_growth)
-                .saturating_add(call_trace_capacity_growth),
+                .saturating_add(call_trace_capacity_growth.saturating_mul(2))
+                .saturating_add(self.runtime.call_frame_bookkeeping_growth_bytes()),
             span,
         )?;
+        self.runtime.reserve_call_frame_bookkeeping(span)?;
         if call_trace_capacity > self.runtime.call_trace.capacity() {
             self.runtime
                 .call_trace
