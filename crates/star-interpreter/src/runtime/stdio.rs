@@ -180,9 +180,14 @@ impl<R: BufRead> StandardInput<R> {
         let value = text
             .parse::<f64>()
             .map_err(|_| InputError::OutOfRange("float"))?;
-        if !value.is_finite()
-            || (value == 0.0 && token.iter().any(|byte| matches!(byte, b'1'..=b'9')))
-        {
+        let significand_end = token
+            .iter()
+            .position(|byte| matches!(byte, b'e' | b'E'))
+            .unwrap_or(token.len());
+        let nonzero_significand = token[..significand_end]
+            .iter()
+            .any(|byte| matches!(byte, b'1'..=b'9'));
+        if !value.is_finite() || (value == 0.0 && nonzero_significand) {
             return Err(InputError::OutOfRange("float"));
         }
         Ok(Some(value))
@@ -207,16 +212,29 @@ impl<W: Write> BufferedOutput<W> {
         }
     }
 
-    /// Flushes buffered bytes and returns the underlying writer.
-    pub fn into_inner(self) -> Result<W, io::Error> {
-        self.writer.into_inner().map_err(|error| error.into_error())
+    /// Flushes buffered bytes and returns the writer. On failure, returns the
+    /// still-buffered output wrapper together with the write error.
+    pub fn into_inner(mut self) -> Result<W, (Self, io::Error)> {
+        if let Err(error) = self.flush() {
+            return Err((self, error));
+        }
+        match self.writer.into_inner() {
+            Ok(writer) => Ok(writer),
+            Err(error) => {
+                let kind = error.error().kind();
+                let message = error.error().to_string();
+                Err((
+                    Self {
+                        writer: error.into_inner(),
+                    },
+                    io::Error::new(kind, message),
+                ))
+            }
+        }
     }
 
-    pub(crate) fn into_inner_after_execution(self) -> W {
-        match self.writer.into_inner() {
-            Ok(writer) => writer,
-            Err(error) => error.into_inner().into_parts().0,
-        }
+    pub(crate) fn into_inner_lossy(self) -> W {
+        self.writer.into_parts().0
     }
 }
 
@@ -239,6 +257,9 @@ fn append_limited(target: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<()
     target
         .try_reserve_exact(new_len.saturating_sub(target.len()))
         .map_err(|_| InputError::LimitExceeded)?;
+    if target.capacity() > limit {
+        return Err(InputError::LimitExceeded);
+    }
     target.extend_from_slice(bytes);
     Ok(())
 }

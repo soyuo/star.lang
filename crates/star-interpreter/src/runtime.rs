@@ -672,12 +672,25 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             .map(|binding| binding.borrow().value.clone())
     }
 
+    /// Returns the injected I/O objects after successfully flushing output.
+    /// On failure, returns the input, buffered output, and error so callers can retry.
+    pub fn try_into_io(self) -> Result<(R, W), (R, BufferedOutput<W>, std::io::Error)> {
+        let Self { input, output, .. } = self;
+        match output.into_inner() {
+            Ok(output) => Ok((input.into_inner(), output)),
+            Err((output, error)) => Err((input.into_inner(), output, error)),
+        }
+    }
+
     /// Returns the injected I/O objects after execution.
+    ///
+    /// This compatibility method discards any bytes still buffered if flushing
+    /// fails. Use [`Self::try_into_io`] when output delivery must be checked.
     pub fn into_io(self) -> (R, W) {
-        (
-            self.input.into_inner(),
-            self.output.into_inner_after_execution(),
-        )
+        match self.try_into_io() {
+            Ok(io) => io,
+            Err((input, output, _error)) => (input, output.into_inner_lossy()),
+        }
     }
 
     fn execute_statements(

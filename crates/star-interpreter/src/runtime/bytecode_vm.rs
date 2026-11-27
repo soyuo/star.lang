@@ -116,7 +116,18 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.global(id)
     }
 
+    /// Returns the injected I/O objects after successfully flushing output.
+    /// On failure, returns the input, buffered output, and error so callers can retry.
+    pub fn try_into_io(
+        self,
+    ) -> Result<(R, W), (R, super::stdio::BufferedOutput<W>, std::io::Error)> {
+        self.runtime.try_into_io()
+    }
+
     /// Returns the injected I/O objects after execution.
+    ///
+    /// This compatibility method discards any bytes still buffered if flushing
+    /// fails. Use [`Self::try_into_io`] when output delivery must be checked.
     pub fn into_io(self) -> (R, W) {
         self.runtime.into_io()
     }

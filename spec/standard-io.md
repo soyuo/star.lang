@@ -4,7 +4,7 @@ This document defines the reusable Rust I/O primitives used by the reference int
 
 ## Input
 
-`StandardInput<R: BufRead>` reads from one byte stream in order. Its read methods take a maximum byte count and return `InputError::LimitExceeded` before appending data beyond that limit.
+`StandardInput<R: BufRead>` reads from one byte stream in order. Its read methods take a maximum byte count and return `InputError::LimitExceeded` before appending data beyond that limit or retaining a vector capacity above the supplied limit.
 
 | Method | Behavior |
 |---|---|
@@ -21,9 +21,9 @@ Every `Option` result distinguishes EOF (`None`) from an empty line or empty inp
 
 ## Output
 
-`BufferedOutput<W: Write>` uses an 8 KiB buffer and implements `Write`. It forwards bytes unchanged: it adds no newline, trims no spaces, and performs no encoding conversion. `flush()` sends all buffered bytes to the underlying writer and returns host write failures.
+`BufferedOutput<W: Write>` uses an 8 KiB buffer and implements `Write`. It forwards bytes unchanged: it adds no newline, trims no spaces, and performs no encoding conversion. `flush()` sends all buffered bytes to the underlying writer and returns host write failures. `into_inner()` also flushes; on failure it returns both the still-buffered wrapper and the error so the caller can retry or retain the pending output.
 
-Both `Interpreter::execute` and `BytecodeVm::execute` attempt to flush on success and failure. If execution failed, that error is preserved after the flush attempt; if execution succeeded but flushing failed, execution returns `IOError`. `PRINT` formats its value as specified by the instruction semantics and writes those exact bytes through the buffer.
+Both `Interpreter::execute` and `BytecodeVm::execute` attempt to flush on success and failure. If execution failed, that error is preserved after the flush attempt; if execution succeeded but flushing failed, execution returns `IOError`. `PRINT` formats its value as specified by the instruction semantics and writes those exact bytes through the buffer. `try_into_io()` reports flush failure and retains the buffered output; the legacy `into_io()` method is best-effort and may discard pending bytes after such a failure.
 
 ## Scope
 
