@@ -32,7 +32,9 @@ use crate::{
 
 pub mod collections;
 pub mod host;
+pub mod json;
 pub mod math;
+pub mod network;
 pub mod path;
 pub mod stdio;
 pub mod strings;

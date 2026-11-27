@@ -17,6 +17,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 pub use star_compiler::Capability;
 
+use super::network::NetworkServices;
 use super::path::{normalize_relative, PathError};
 
 /// Host operation failed because it lacked a capability or the host operation
@@ -90,21 +91,29 @@ pub struct HostServices {
     capabilities: BTreeSet<Capability>,
     read_root: Option<Dir>,
     write_root: Option<Dir>,
+    network: NetworkServices,
 }
 
 impl HostServices {
     /// Creates host services with exactly the supplied capabilities.
     pub fn new(capabilities: BTreeSet<Capability>) -> Self {
+        let network = NetworkServices::new(capabilities.clone());
         Self {
             capabilities,
             read_root: None,
             write_root: None,
+            network,
         }
     }
 
     /// Returns the immutable capability grants used by this service set.
     pub fn capabilities(&self) -> &BTreeSet<Capability> {
         &self.capabilities
+    }
+
+    /// Returns the network services governed by this host's capability grants.
+    pub fn network(&self) -> &NetworkServices {
+        &self.network
     }
 
     /// Opens the host-selected root for guest file reads.
