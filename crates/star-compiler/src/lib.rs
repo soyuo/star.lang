@@ -138,6 +138,14 @@ pub struct ModuleIr {
     pub functions: Vec<FunctionIr>,
 }
 
+/// A module and the names written to its module and debug records.
+#[derive(Clone, Copy, Debug)]
+pub struct CompileModule<'a> {
+    pub ir: &'a ModuleIr,
+    pub name: &'a str,
+    pub source_file: &'a str,
+}
+
 /// Compiler error for malformed IR or a value that cannot fit the `.starc` format.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompileError {
@@ -169,47 +177,87 @@ pub fn compile(
     module_name: &str,
     source_file: &str,
 ) -> Result<Vec<u8>, CompileError> {
-    validate_function(&module.initializer, true)?;
-    if !module
-        .initializer
-        .blocks
-        .iter()
-        .any(|block| matches!(&block.terminator, Terminator::Halt { .. }))
-    {
-        return Err(CompileError::new(
-            "module initializer has no HALT terminator",
-        ));
-    }
+    compile_modules(
+        &[CompileModule {
+            ir: module,
+            name: module_name,
+            source_file,
+        }],
+        0,
+    )
+}
 
-    let mut ordered_functions: Vec<&FunctionIr> = module.functions.iter().collect();
-    ordered_functions.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut seen_function_ids = HashSet::new();
-    for function in &ordered_functions {
-        validate_function(function, false)?;
-        let id = function
-            .id
-            .as_ref()
-            .ok_or_else(|| CompileError::new("non-initializer function is missing its ID"))?;
-        if !seen_function_ids.insert(id.clone()) {
-            return Err(CompileError::new("duplicate function ID in module"));
-        }
+/// Compile multiple linked modules into one version 1.0 `.starc` image.
+///
+/// Module and function indexes follow the supplied order; the entry module is
+/// initialized first and imported modules are initialized on demand.
+pub fn compile_modules(
+    modules: &[CompileModule<'_>],
+    entry_module: u32,
+) -> Result<Vec<u8>, CompileError> {
+    if modules.is_empty() || entry_module as usize >= modules.len() {
+        return Err(CompileError::new("entry module index is out of range"));
     }
-
+    let mut module_names = HashSet::new();
     let mut pool = ConstantPool::default();
-    let module_name_index = pool.intern_string(module_name)?;
-    let source_file_index = pool.intern_string(source_file)?;
-
-    let mut functions = Vec::with_capacity(ordered_functions.len() + 1);
-    functions.push(FunctionMetadata::new(&module.initializer, true, &mut pool)?);
-    for function in ordered_functions {
-        functions.push(FunctionMetadata::new(function, false, &mut pool)?);
+    let mut source_file_indexes = Vec::with_capacity(modules.len());
+    let mut module_records = Vec::with_capacity(modules.len());
+    let mut functions = Vec::new();
+    for (module_index, module) in modules.iter().enumerate() {
+        if !module_names.insert(module.name) {
+            return Err(CompileError::new("duplicate module name"));
+        }
+        validate_function(&module.ir.initializer, true)?;
+        if !module
+            .ir
+            .initializer
+            .blocks
+            .iter()
+            .any(|block| matches!(&block.terminator, Terminator::Halt { .. }))
+        {
+            return Err(CompileError::new(
+                "module initializer has no HALT terminator",
+            ));
+        }
+        let mut ordered_functions: Vec<&FunctionIr> = module.ir.functions.iter().collect();
+        ordered_functions.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut seen_function_ids = HashSet::new();
+        for function in &ordered_functions {
+            validate_function(function, false)?;
+            let id = function
+                .id
+                .as_ref()
+                .ok_or_else(|| CompileError::new("non-initializer function is missing its ID"))?;
+            if !seen_function_ids.insert(id.clone()) {
+                return Err(CompileError::new("duplicate function ID in module"));
+            }
+        }
+        let module_name_index = pool.intern_string(module.name)?;
+        source_file_indexes.push(pool.intern_string(module.source_file)?);
+        let first_function_index = checked_u32(functions.len(), "initializer function index")?;
+        functions.push((
+            module_index as u32,
+            FunctionMetadata::new(&module.ir.initializer, true, &mut pool)?,
+        ));
+        for function in ordered_functions {
+            functions.push((
+                module_index as u32,
+                FunctionMetadata::new(function, false, &mut pool)?,
+            ));
+        }
+        module_records.push(ModuleRecordData {
+            name_index: module_name_index,
+            initializer_index: first_function_index,
+            first_function_index,
+            function_count: checked_u32(functions.len(), "function count")? - first_function_index,
+        });
     }
 
     let mut code = Vec::new();
     let mut records: Vec<FunctionRecordData> = Vec::with_capacity(functions.len());
     let mut locations = Vec::new();
     let mut exception_records = Vec::new();
-    for (function_index, metadata) in functions.iter().enumerate() {
+    for (function_index, (module_index, metadata)) in functions.iter().enumerate() {
         let function_index = checked_u32(function_index, "function index")?;
         let function_offset = checked_u64(code.len(), "function code offset")?;
         let encoded = encode_function(metadata.function, metadata.is_initializer, &mut pool)?;
@@ -231,11 +279,13 @@ pub fn compile(
             locations.push(DebugLocation {
                 function_index,
                 code_offset: absolute_code_offset,
+                source_file_index: *module_index,
                 span: location.span,
             });
         }
         code.extend_from_slice(&encoded.code);
         records.push(FunctionRecordData {
+            module_index: *module_index,
             id_index: metadata.id_index,
             parameter_indexes: metadata.parameter_indexes.clone(),
             asynchronous: metadata.function.asynchronous,
@@ -248,10 +298,10 @@ pub fn compile(
     }
 
     let constant_pool = pool.encode()?;
-    let module_table = encode_module_table(module_name_index, records.len())?;
+    let module_table = encode_module_table(&module_records, entry_module)?;
     let function_table = encode_function_table(&records)?;
     let exception_table = encode_exception_table(&exception_records)?;
-    let debug_info = encode_debug_info(source_file_index, &locations)?;
+    let debug_info = encode_debug_info(&source_file_indexes, &locations)?;
     let sections = vec![
         (1, true, constant_pool),
         (2, true, module_table),
@@ -390,6 +440,7 @@ struct ExceptionRecordData {
 struct DebugLocation {
     function_index: u32,
     code_offset: u64,
+    source_file_index: u32,
     span: Span,
 }
 
@@ -774,6 +825,7 @@ fn block_offset(offsets: &HashMap<BlockId, u32>, target: BlockId) -> Result<u32,
 }
 
 struct FunctionRecordData {
+    module_index: u32,
     id_index: Option<u32>,
     parameter_indexes: Vec<u32>,
     asynchronous: bool,
@@ -782,6 +834,13 @@ struct FunctionRecordData {
     max_stack: u32,
     code_offset: u64,
     code_length: u64,
+}
+
+struct ModuleRecordData {
+    name_index: u32,
+    initializer_index: u32,
+    first_function_index: u32,
+    function_count: u32,
 }
 
 fn encode_exception_table(records: &[ExceptionRecordData]) -> Result<Vec<u8>, CompileError> {
@@ -804,21 +863,22 @@ fn encode_exception_table(records: &[ExceptionRecordData]) -> Result<Vec<u8>, Co
 }
 
 fn encode_module_table(
-    module_name_index: u32,
-    function_count: usize,
+    modules: &[ModuleRecordData],
+    entry_module: u32,
 ) -> Result<Vec<u8>, CompileError> {
-    let function_count = checked_u32(function_count, "module function count")?;
     let mut output = Vec::new();
-    write_u32(&mut output, 1); // module_count
-    write_u32(&mut output, 0); // entry_module_index
-    write_u32(&mut output, module_name_index);
-    write_u32(&mut output, 0); // initializer_function_index
-    write_u32(&mut output, 0); // first_function_index
-    write_u32(&mut output, function_count);
-    write_u32(&mut output, 0); // flags
-    write_u32(&mut output, 0); // global_count
-    write_u32(&mut output, 0); // import_count
-    write_u32(&mut output, 0); // export_count
+    write_u32(&mut output, checked_u32(modules.len(), "module count")?);
+    write_u32(&mut output, entry_module);
+    for module in modules {
+        write_u32(&mut output, module.name_index);
+        write_u32(&mut output, module.initializer_index);
+        write_u32(&mut output, module.first_function_index);
+        write_u32(&mut output, module.function_count);
+        write_u32(&mut output, 0); // flags
+        write_u32(&mut output, 0); // globals are created by STORE_GLOBAL
+        write_u32(&mut output, 0); // imports are resolved by IMPORT instructions
+        write_u32(&mut output, 0); // exports are declared by EXPORT instructions
+    }
     Ok(output)
 }
 
@@ -826,7 +886,7 @@ fn encode_function_table(records: &[FunctionRecordData]) -> Result<Vec<u8>, Comp
     let mut output = Vec::new();
     write_u32(&mut output, checked_u32(records.len(), "function count")?);
     for record in records {
-        write_u32(&mut output, 0); // module_index
+        write_u32(&mut output, record.module_index);
         write_u32(&mut output, record.id_index.unwrap_or(u32::MAX));
         write_u32(&mut output, u32::MAX); // unnamed function
         let flags = (if record.asynchronous { 1 } else { 0 })
@@ -848,12 +908,17 @@ fn encode_function_table(records: &[FunctionRecordData]) -> Result<Vec<u8>, Comp
 }
 
 fn encode_debug_info(
-    source_file_index: u32,
+    source_file_indexes: &[u32],
     locations: &[DebugLocation],
 ) -> Result<Vec<u8>, CompileError> {
     let mut output = Vec::new();
-    write_u32(&mut output, 1); // source_file_count
-    write_u32(&mut output, source_file_index);
+    write_u32(
+        &mut output,
+        checked_u32(source_file_indexes.len(), "source file count")?,
+    );
+    for source_file_index in source_file_indexes {
+        write_u32(&mut output, *source_file_index);
+    }
     write_u32(
         &mut output,
         checked_u32(locations.len(), "debug location count")?,
@@ -861,7 +926,7 @@ fn encode_debug_info(
     for location in locations {
         write_u32(&mut output, location.function_index);
         write_u64(&mut output, location.code_offset);
-        write_u32(&mut output, 0); // source_file_index
+        write_u32(&mut output, location.source_file_index);
         write_u64(
             &mut output,
             checked_u64(location.span.start.byte_offset, "source byte offset")?,
