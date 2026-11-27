@@ -5,6 +5,7 @@ members = [
     "crates/star-parser",
     "crates/star-interpreter",
     "crates/star-compiler",
+    "crates/star-lsp",
     "crates/star-cli",
 ]
 resolver = "2"
@@ -31,3 +32,6 @@ sha2 = "0.11.2"
 tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
 ureq = { version = "=3.5.2", default-features = false, features = ["rustls"] }
 star-interpreter = { path = "crates/star-interpreter" }
+star-lsp = { path = "crates/star-lsp" }
+lsp-server = "0.10.0"
+lsp-types = "0.97.0"

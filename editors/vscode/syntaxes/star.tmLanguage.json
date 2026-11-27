@@ -1,0 +1,24 @@
+{
+  "scopeName": "source.star",
+  "patterns": [
+    { "include": "#literal" },
+    { "include": "#extended" },
+    { "include": "#basic" }
+  ],
+  "repository": {
+    "literal": {
+      "name": "string.quoted.double.star",
+      "begin": "\"(?=[ \\t\\r\\n]*[*'])",
+      "end": "\"",
+      "patterns": [{ "match": "[*']", "name": "constant.numeric.bit.star" }]
+    },
+    "extended": {
+      "name": "keyword.operator.star",
+      "match": "'(?:[ \\t\\r\\n]*[*']){8}[ \\t\\r\\n]*\""
+    },
+    "basic": {
+      "name": "keyword.operator.star",
+      "match": "\\*(?:[ \\t\\r\\n]*\\*){0,11}[ \\t\\r\\n]*'"
+    }
+  }
+}

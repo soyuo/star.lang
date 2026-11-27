@@ -27,6 +27,7 @@ are written to stderr.
 | `star repl` | Starts a persistent source-interpreter session. Incomplete instructions and blocks continue on the next line; `help`, `reset`, and `exit` are REPL commands. Globals, function/type definitions, and operand-stack values persist between submissions. |
 | `star debug <file.star>` | Runs the source debugger with an interactive command prompt. `--break LINE[:COLUMN]` may be repeated; `--input <file>` supplies guest input separately from debugger commands; `--strict` enables strict source whitespace validation. |
 | `star debug <file.star> --dap` | Runs the source debugger over Debug Adapter Protocol (DAP) messages on stdin/stdout. The adapter implements initialization, launch, line/column breakpoints, stack/scopes/variables inspection, continue, step in/over/out, and disconnect/terminate. Guest input must come from `--input`; guest output is emitted as DAP output events. |
+| `star lsp` | Starts the Star language server over stdio using the Language Server Protocol. Standard output is reserved for protocol messages. |
 | `star help` | Prints command usage and stable exit codes. |
 
 `check`, `build`, and `run` accept `--strict` for source whitespace handling.
