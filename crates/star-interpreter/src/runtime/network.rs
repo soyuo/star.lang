@@ -911,7 +911,14 @@ fn request_error_status(error: &NetworkError) -> u16 {
     match error {
         NetworkError::BodyTooLarge { .. } => 413,
         NetworkError::HeadersTooLarge { .. } | NetworkError::TooManyHeaders { .. } => 431,
-        NetworkError::Io(error) if error.kind() == io::ErrorKind::TimedOut => 408,
+        NetworkError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            408
+        }
         _ => 400,
     }
 }
