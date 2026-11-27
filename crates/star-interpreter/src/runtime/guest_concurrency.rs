@@ -4,12 +4,12 @@ use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::mem::size_of;
 
-use num_traits::ToPrimitive;
+use num_traits::{Signed, ToPrimitive};
 use star_parser::Span;
 
 use super::{
-    estimated_unmanaged_payload_bytes, projected_capacity_after_push, GuestChannel, GuestMutex,
-    Interpreter, RuntimeError, RuntimeErrorKind,
+    estimated_unmanaged_payload_bytes, projected_capacity_after_push, GuestChannel,
+    GuestChannelReceiver, GuestMutex, Interpreter, RuntimeError, RuntimeErrorKind,
 };
 use crate::value::Value;
 
@@ -19,6 +19,13 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let Value::Int(capacity) = value else {
             return Err(self.type_error("nonnegative Int channel capacity", &value, span));
         };
+        if capacity.is_negative() {
+            return Err(self.type_error(
+                "nonnegative Int channel capacity",
+                &Value::Int(capacity),
+                span,
+            ));
+        }
         let capacity = capacity
             .to_usize()
             .ok_or_else(|| self.error(RuntimeErrorKind::ResourceLimit("channel capacity"), span))?;
@@ -27,7 +34,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         })?;
         let target_capacity =
             projected_capacity_after_push(self.channels.len(), self.channels.capacity());
-        let queue_capacity = capacity.max(1);
+        let queue_capacity = capacity;
         let additional = size_of::<(u64, GuestChannel)>()
             .saturating_add(
                 target_capacity
@@ -50,7 +57,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             GuestChannel {
                 capacity,
                 queue,
-                waiting_receivers: 0,
+                waiting_receivers: VecDeque::new(),
             },
         );
         self.push_value(Value::Channel(id), span)
@@ -101,9 +108,27 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         };
-        let rendezvous_ready =
-            state.capacity == 0 && state.waiting_receivers > 0 && state.queue.is_empty();
-        if state.queue.len() >= state.capacity && !rendezvous_ready {
+        if state.capacity == 0 {
+            if !state
+                .waiting_receivers
+                .iter()
+                .any(|receiver| receiver.transfer.is_none())
+            {
+                return Ok(false);
+            }
+            self.ensure_memory_budget(estimated_unmanaged_payload_bytes(value, 0), span)?;
+            let receiver = self
+                .channels
+                .get_mut(&channel_id)
+                .expect("channel was checked above")
+                .waiting_receivers
+                .iter_mut()
+                .find(|receiver| receiver.transfer.is_none())
+                .expect("waiting receiver was checked above");
+            receiver.transfer = Some(value.clone());
+            return Ok(true);
+        }
+        if state.queue.len() >= state.capacity {
             return Ok(false);
         }
         self.ensure_memory_budget(estimated_unmanaged_payload_bytes(value, 0), span)?;
@@ -118,6 +143,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     pub(super) fn try_receive_channel(
         &mut self,
         channel_id: u64,
+        waiter_id: Option<u64>,
         span: Span,
     ) -> Result<Option<Value>, RuntimeError> {
         let Some(state) = self.channels.get_mut(&channel_id) else {
@@ -126,27 +152,75 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 span,
             ));
         };
+        if let Some(waiter_id) = waiter_id {
+            if let Some(receiver) = state
+                .waiting_receivers
+                .iter_mut()
+                .find(|receiver| receiver.waiter_id == waiter_id)
+            {
+                if receiver.transfer.is_some() {
+                    return Ok(receiver.transfer.take());
+                }
+            }
+        }
         Ok(state.queue.pop_front())
     }
 
     pub(super) fn register_channel_receiver(
         &mut self,
         channel_id: u64,
+        task_id: u64,
         span: Span,
-    ) -> Result<(), RuntimeError> {
-        let Some(state) = self.channels.get_mut(&channel_id) else {
+    ) -> Result<u64, RuntimeError> {
+        let Some(next_id) = self.next_channel_waiter_id.checked_add(1) else {
+            return Err(self.error(
+                RuntimeErrorKind::ResourceLimit("channel waiter identifiers"),
+                span,
+            ));
+        };
+        let Some(state) = self.channels.get(&channel_id) else {
             return Err(self.error(
                 RuntimeErrorKind::ReferenceError("channel does not exist"),
                 span,
             ));
         };
-        state.waiting_receivers = state.waiting_receivers.saturating_add(1);
-        Ok(())
+        let target_capacity = projected_capacity_after_push(
+            state.waiting_receivers.len(),
+            state.waiting_receivers.capacity(),
+        );
+        let additional = target_capacity
+            .saturating_sub(state.waiting_receivers.capacity())
+            .saturating_mul(size_of::<GuestChannelReceiver>());
+        self.ensure_memory_budget(additional, span)?;
+        self.channels
+            .get_mut(&channel_id)
+            .expect("channel was checked above")
+            .waiting_receivers
+            .try_reserve(1)
+            .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("channel waiters"), span))?;
+        let waiter_id = self.next_channel_waiter_id;
+        self.next_channel_waiter_id = next_id;
+        self.channels
+            .get_mut(&channel_id)
+            .expect("channel was checked above")
+            .waiting_receivers
+            .push_back(GuestChannelReceiver {
+                waiter_id,
+                task_id,
+                transfer: None,
+            });
+        Ok(waiter_id)
     }
 
-    pub(super) fn unregister_channel_receiver(&mut self, channel_id: u64) {
+    pub(super) fn unregister_channel_receiver(&mut self, channel_id: u64, waiter_id: u64) {
         if let Some(state) = self.channels.get_mut(&channel_id) {
-            state.waiting_receivers = state.waiting_receivers.saturating_sub(1);
+            if let Some(index) = state
+                .waiting_receivers
+                .iter()
+                .position(|receiver| receiver.waiter_id == waiter_id)
+            {
+                state.waiting_receivers.remove(index);
+            }
         }
     }
 
@@ -218,6 +292,19 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         Ok(())
     }
 
+    pub(super) fn cleanup_task_concurrency(&mut self, task_id: u64) {
+        for state in self.mutexes.values_mut() {
+            if state.owner == Some(task_id) {
+                state.owner = None;
+            }
+        }
+        for channel in self.channels.values_mut() {
+            channel
+                .waiting_receivers
+                .retain(|receiver| receiver.task_id != task_id);
+        }
+    }
+
     pub(super) fn send_channel(&mut self, span: Span) -> Result<(), RuntimeError> {
         let value = self.pop(span)?;
         let channel = self.pop(span)?;
@@ -251,42 +338,46 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let Value::Channel(channel_id) = channel else {
             return Err(self.type_error("Channel", &channel, span));
         };
-        self.check_async_context(span)?;
-        let mut waiting = false;
+        let task_id = self.check_async_context(span)?;
+        if let Some(value) = self.try_receive_channel(channel_id, None, span)? {
+            return self.push_value(value, span);
+        }
+        let waiter_id = self.register_channel_receiver(channel_id, task_id, span)?;
         let result = loop {
-            match self.try_receive_channel(channel_id, span) {
+            match self.try_receive_channel(channel_id, Some(waiter_id), span) {
                 Ok(Some(value)) => {
-                    if waiting {
-                        self.unregister_channel_receiver(channel_id);
-                    }
+                    self.unregister_channel_receiver(channel_id, waiter_id);
                     break Ok(value);
                 }
-                Ok(None) => {
-                    if !waiting {
-                        self.register_channel_receiver(channel_id, span)?;
-                        waiting = true;
-                    }
-                    match self.run_next_task(span) {
-                        Ok(true) => {
-                            if let Err(error) = self.check_resource_limits(span) {
-                                self.unregister_channel_receiver(channel_id);
+                Ok(None) => match self.run_next_task(span) {
+                    Ok(true) => {
+                        match self.try_receive_channel(channel_id, Some(waiter_id), span) {
+                            Ok(Some(value)) => {
+                                self.unregister_channel_receiver(channel_id, waiter_id);
+                                break Ok(value);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.unregister_channel_receiver(channel_id, waiter_id);
                                 break Err(error);
                             }
                         }
-                        Ok(false) => {
-                            self.unregister_channel_receiver(channel_id);
-                            break Err(self.error(RuntimeErrorKind::Deadlock, span));
-                        }
-                        Err(error) => {
-                            self.unregister_channel_receiver(channel_id);
+                        if let Err(error) = self.check_resource_limits(span) {
+                            self.unregister_channel_receiver(channel_id, waiter_id);
                             break Err(error);
                         }
                     }
-                }
-                Err(error) => {
-                    if waiting {
-                        self.unregister_channel_receiver(channel_id);
+                    Ok(false) => {
+                        self.unregister_channel_receiver(channel_id, waiter_id);
+                        break Err(self.error(RuntimeErrorKind::Deadlock, span));
                     }
+                    Err(error) => {
+                        self.unregister_channel_receiver(channel_id, waiter_id);
+                        break Err(error);
+                    }
+                },
+                Err(error) => {
+                    self.unregister_channel_receiver(channel_id, waiter_id);
                     break Err(error);
                 }
             }

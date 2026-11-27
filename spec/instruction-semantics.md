@@ -170,12 +170,12 @@ Constructor binding, method receivers, interface conformance, closure cells, and
 | `async.sleep` | `SLEEP` | `milliseconds: Int -> Null` | Suspends the current task for the specified nonnegative duration. | `TypeError` for a negative duration or use outside an async task. |
 | `async.join` | `JOIN` | `Task -> result` | Waits for task completion and pushes its result. | `TypeError` for a non-task; propagates task failure or cancellation. |
 | `async.cancel` | `CANCEL` | `Task -> Bool` | Requests task cancellation; returns whether the request was accepted. | `TypeError` for a non-task. |
-| `async.channel_new` | `CHANNEL_NEW` | `capacity: Int -> Channel` | Creates a channel; capacity zero creates a rendezvous channel. | `TypeError` for a negative capacity. |
+| `async.channel_new` | `CHANNEL_NEW` | `capacity: Int -> Channel` | Creates a bounded FIFO channel; capacity zero creates an unbuffered rendezvous channel that atomically pairs a send with an already-waiting receiver. | `TypeError` for a negative capacity; `ResourceLimit` when the capacity cannot be represented or reserved. |
 | `async.channel_send` | `CHANNEL_SEND` | `channel, value -> Null` | Sends one value, suspending while a bounded channel is full. | `TypeError` for an invalid channel or use outside an async task. |
 | `async.channel_recv` | `CHANNEL_RECV` | `channel -> value` | Receives one value, suspending while the channel is empty. | `TypeError` for an invalid channel or use outside an async task. |
 | `async.mutex_new` | `MUTEX_NEW` | `- -> Mutex` | Creates a mutex. | None beyond common failures. |
 | `async.mutex_lock` | `MUTEX_LOCK` | `Mutex -> Null` | Acquires the mutex, suspending while another task owns it. | `TypeError` for an invalid mutex or use outside an async task. |
-| `async.mutex_unlock` | `MUTEX_UNLOCK` | `Mutex -> Null` | Releases a mutex owned by the current task. | `TypeError` for an invalid mutex; `PermissionError` if the current task is not its owner. |
+| `async.mutex_unlock` | `MUTEX_UNLOCK` | `Mutex -> Null` | Releases a mutex owned by the current task. A task releases any mutexes it still owns when it exits. | `TypeError` for an invalid mutex; `PermissionError` if the current task is not its owner. |
 
 ## Native interface
 

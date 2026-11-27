@@ -258,6 +258,7 @@ pub struct Interpreter<R: BufRead, W: Write> {
     current_task_id: Option<u64>,
     channels: HashMap<u64, GuestChannel>,
     next_channel_id: u64,
+    next_channel_waiter_id: u64,
     mutexes: HashMap<u64, GuestMutex>,
     next_mutex_id: u64,
     pending_channel_message_bytes: usize,
@@ -267,7 +268,14 @@ pub struct Interpreter<R: BufRead, W: Write> {
 struct GuestChannel {
     capacity: usize,
     queue: VecDeque<Value>,
-    waiting_receivers: usize,
+    waiting_receivers: VecDeque<GuestChannelReceiver>,
+}
+
+#[derive(Debug)]
+struct GuestChannelReceiver {
+    waiter_id: u64,
+    task_id: u64,
+    transfer: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -348,6 +356,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             current_task_id: None,
             channels: HashMap::new(),
             next_channel_id: 1,
+            next_channel_waiter_id: 1,
             mutexes: HashMap::new(),
             next_mutex_id: 1,
             pending_channel_message_bytes: 0,
@@ -535,8 +544,22 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     .saturating_add(channel.queue.capacity().saturating_mul(size_of::<Value>()))
                     .saturating_add(
                         channel
+                            .waiting_receivers
+                            .capacity()
+                            .saturating_mul(size_of::<GuestChannelReceiver>()),
+                    )
+                    .saturating_add(
+                        channel
                             .queue
                             .iter()
+                            .map(|value| estimated_unmanaged_payload_bytes(value, 0))
+                            .fold(0usize, usize::saturating_add),
+                    )
+                    .saturating_add(
+                        channel
+                            .waiting_receivers
+                            .iter()
+                            .filter_map(|receiver| receiver.transfer.as_ref())
                             .map(|value| estimated_unmanaged_payload_bytes(value, 0))
                             .fold(0usize, usize::saturating_add),
                     )
@@ -1290,6 +1313,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         let previous_task = self.current_task_id.replace(id);
         let result = self.invoke_function_body(function, arguments, captures, span);
         self.current_task_id = previous_task;
+        self.cleanup_task_concurrency(id);
         let status_copy_bytes = match &result {
             Ok(value) => {
                 size_of::<Value>().saturating_add(estimated_unmanaged_payload_bytes(value, 0))

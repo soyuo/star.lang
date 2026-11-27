@@ -473,6 +473,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 self.unwind_exception_frame(&frame);
             }
         }
+        self.runtime.cleanup_task_concurrency(id);
         self.sync_external_memory();
 
         let status_copy_bytes = match &execution {
@@ -1448,7 +1449,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         let Value::Channel(channel_id) = channel else {
             return Err(self.runtime.type_error("Channel", &channel, span));
         };
-        if self.current_task_id.is_none() {
+        let Some(task_id) = self.current_task_id else {
             return Err(self.runtime.error(
                 RuntimeErrorKind::TypeError {
                     expected: "async task context",
@@ -1456,42 +1457,61 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 },
                 span,
             ));
+        };
+        if let Some(value) = self.runtime.try_receive_channel(channel_id, None, span)? {
+            return self.runtime.push_value(value, span);
         }
-        let mut waiting = false;
+        let waiter_id = self
+            .runtime
+            .register_channel_receiver(channel_id, task_id, span)?;
         let result = loop {
-            match self.runtime.try_receive_channel(channel_id, span) {
+            match self
+                .runtime
+                .try_receive_channel(channel_id, Some(waiter_id), span)
+            {
                 Ok(Some(value)) => {
-                    if waiting {
-                        self.runtime.unregister_channel_receiver(channel_id);
-                    }
+                    self.runtime
+                        .unregister_channel_receiver(channel_id, waiter_id);
                     break Ok(value);
                 }
-                Ok(None) => {
-                    if !waiting {
-                        self.runtime.register_channel_receiver(channel_id, span)?;
-                        waiting = true;
-                    }
-                    match self.run_next_task(image, span) {
-                        Ok(true) => {
-                            if let Err(error) = self.runtime.check_resource_limits(span) {
-                                self.runtime.unregister_channel_receiver(channel_id);
+                Ok(None) => match self.run_next_task(image, span) {
+                    Ok(true) => {
+                        match self
+                            .runtime
+                            .try_receive_channel(channel_id, Some(waiter_id), span)
+                        {
+                            Ok(Some(value)) => {
+                                self.runtime
+                                    .unregister_channel_receiver(channel_id, waiter_id);
+                                break Ok(value);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.runtime
+                                    .unregister_channel_receiver(channel_id, waiter_id);
                                 break Err(error);
                             }
                         }
-                        Ok(false) => {
-                            self.runtime.unregister_channel_receiver(channel_id);
-                            break Err(self.runtime.error(RuntimeErrorKind::Deadlock, span));
-                        }
-                        Err(error) => {
-                            self.runtime.unregister_channel_receiver(channel_id);
+                        if let Err(error) = self.runtime.check_resource_limits(span) {
+                            self.runtime
+                                .unregister_channel_receiver(channel_id, waiter_id);
                             break Err(error);
                         }
                     }
-                }
-                Err(error) => {
-                    if waiting {
-                        self.runtime.unregister_channel_receiver(channel_id);
+                    Ok(false) => {
+                        self.runtime
+                            .unregister_channel_receiver(channel_id, waiter_id);
+                        break Err(self.runtime.error(RuntimeErrorKind::Deadlock, span));
                     }
+                    Err(error) => {
+                        self.runtime
+                            .unregister_channel_receiver(channel_id, waiter_id);
+                        break Err(error);
+                    }
+                },
+                Err(error) => {
+                    self.runtime
+                        .unregister_channel_receiver(channel_id, waiter_id);
                     break Err(error);
                 }
             }
