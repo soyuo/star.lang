@@ -204,6 +204,7 @@ pub fn compile_modules(
     let mut module_records = Vec::with_capacity(modules.len());
     let mut functions = Vec::new();
     for (module_index, module) in modules.iter().enumerate() {
+        let module_index = checked_u32(module_index, "module index")?;
         if !module_names.insert(module.name) {
             return Err(CompileError::new("duplicate module name"));
         }
@@ -236,12 +237,12 @@ pub fn compile_modules(
         source_file_indexes.push(pool.intern_string(module.source_file)?);
         let first_function_index = checked_u32(functions.len(), "initializer function index")?;
         functions.push((
-            module_index as u32,
+            module_index,
             FunctionMetadata::new(&module.ir.initializer, true, &mut pool)?,
         ));
         for function in ordered_functions {
             functions.push((
-                module_index as u32,
+                module_index,
                 FunctionMetadata::new(function, false, &mut pool)?,
             ));
         }
