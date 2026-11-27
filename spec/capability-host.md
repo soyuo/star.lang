@@ -66,3 +66,9 @@ Granting `process.spawn` allows a child to use the host account's operating-
 system authority. It does not confine that process to the VM's filesystem roots
 or resource limits. Strong isolation requires an OS-isolated process, as
 specified by the sandbox security requirements.
+
+## Native FFI
+
+Native library access and synchronous callbacks are separately gated by the
+`ffi` capability; see `spec/native-ffi.md` for signatures and callback lifetime
+rules.

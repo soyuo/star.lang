@@ -43,7 +43,11 @@ Only the owning task can unlock a mutex; a wrong-owner unlock raises
 
 Worker execution uses an isolated VM and transfers only supported serialized
 messages; worker tasks do not share guest heap objects. Native FFI operations
-and callbacks require the `ffi` capability. FFI callbacks are synchronous and
-must be invoked on the thread currently executing the native call; native code
-must not retain or concurrently invoke a callback after that call returns.
+and callbacks require the `ffi` capability. FFI callbacks are synchronous,
+scalar-only trampolines and can invoke only a synchronous `Function` or
+`Closure`. They must run on the thread currently executing the native call and
+only before that call returns. A wrong-thread invocation is rejected and
+causes the native call to fail with `TypeError`; callback runtime errors are
+propagated after native code returns and never unwind through C. Native code
+must not retain a callback pointer after the call or invoke it concurrently.
 Async guest functions cannot serve as synchronous native callbacks.
