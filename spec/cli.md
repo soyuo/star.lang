@@ -3,8 +3,9 @@
 Status: draft
 
 The `star` CLI provides source checking and building, single-program execution,
-online-judge fixture execution, and repeatable process-level timing. It preserves
-guest standard input and output for `run`; diagnostics are written to stderr.
+online-judge fixture execution, process-level timing, and source encoding and
+formatting tools. It preserves guest standard input and output for `run`;
+diagnostics are written to stderr.
 
 ## Commands
 
@@ -17,6 +18,10 @@ guest standard input and output for `run`; diagnostics are written to stderr.
 | `star run [file.star|file.starc] [options]` | Executes source with the reference interpreter or bytecode with the VM. If the file is omitted, the `entry` in the nearest `Star.toml` is used. Input and output bytes are preserved. Output is flushed on success and failure. |
 | `star test --suite oj [--solutions <directory>]` | Runs the `tests/oj` paired source/bytecode harness. Solutions use `<case-id>.star` and `<case-id>.starc`; the default directory is `<repository>/tests/oj/solutions`. Requires Python 3.11 or newer. |
 | `star bench [file.star|file.starc] --iterations <count> [--input <file>] [execution options]` | Starts a fresh `star run` process for every iteration, feeds the same bounded input bytes each time, discards guest stdout, and reports total and mean wall time. Process startup is included. Without `--input`, each run receives empty input. If omitted, it uses the nearest `Star.toml` entry. |
+| `star fmt <file.star> [--write]` | Parses source and prints canonical four-space-indented source. `--write` replaces the input file. |
+| `star minify <file.star> [--write]` | Validates source and removes formatting whitespace. `--write` replaces the input file. |
+| `star encode (--int N | --float N | --string TEXT | --file PATH | --opcode NAME)` | Emits a valid Star source representation for the selected value or ordinary assigned opcode. |
+| `star decode <source-file>` | Decodes one value or ordinary instruction token produced by `star encode`. |
 | `star help` | Prints command usage and stable exit codes. |
 
 `check`, `build`, and `run` accept `--strict` for source whitespace handling.
@@ -30,6 +35,9 @@ does not overwrite existing files. `build` and `check` do not execute the
 program, so timeout, call depth, and runtime
 statistics do not apply. Resource defaults and accounting are defined in
 `spec/resource-limits.md`.
+
+The exact source-tooling formats and round-trip behavior are defined in
+`spec/source-tools.md`.
 
 `star test` returns exit code 7 when any fixture fails. Fixture infrastructure
 and file-access failures use the I/O exit code. The manifest supplies the
