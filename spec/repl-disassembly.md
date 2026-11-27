@@ -30,6 +30,31 @@ Input lines are limited to 1 MiB and one pending submission is limited to 64
 MiB. EOF exits successfully when no submission is pending. EOF with incomplete
 source reports the parser diagnostic and exits with source-error status.
 
+## Source debugger and DAP adapter
+
+`star debug <file.star>` runs one source program under the source interpreter.
+The interactive controller pauses on entry and before configured source
+statements. `--break LINE[:COLUMN]` accepts one-based source coordinates and may
+be repeated. The debugger supports continue, step into, step over, step out,
+quit, current location, call stack, locals, and globals. Each stop exposes a
+bounded snapshot with original source spans, up to 256 operand values, bindings,
+and call frames; previews are shallow so inspecting cyclic guest values cannot
+recurse through the heap. `--input <file>` supplies guest `INPUT` separately
+from debugger commands. Without it, guest input is EOF.
+
+`star debug <file.star> --dap` speaks DAP over stdin/stdout; stdout contains
+only framed protocol messages. Guest output is delivered in DAP `output`
+events, and guest input still comes from `--input`. The adapter supports
+`initialize`, `launch`, `setBreakpoints`, `configurationDone`, `threads`,
+`stackTrace`, `scopes`, `variables`, `continue`, `stepIn`, `next`, `stepOut`,
+`disconnect`, and `terminate`. Breakpoints are set before execution and are
+matched by one-based line and optional column; conditional and function
+breakpoints and updates after `configurationDone` are not supported. Stack,
+scope, and value data are limited by the same 256-entry snapshot bounds as the
+interactive debugger. DAP headers are capped at 8 KiB and each JSON message at
+1 MiB. The adapter debugs source files only; bytecode debugging is not exposed
+by this command.
+
 ## Bytecode disassembler
 
 `star disasm <file.starc>` validates the entire file with the normal bytecode

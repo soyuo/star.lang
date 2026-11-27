@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+mod dap;
 mod source_lowering;
 mod source_tools;
 
@@ -15,7 +16,9 @@ use star_compiler::{
 };
 use star_interpreter::{
     runtime::{
-        stdio::InputError, BytecodeVm, ExecutionLimits, Interpreter, RuntimeError, RuntimeErrorKind,
+        stdio::InputError, BytecodeVm, DebugBinding, DebugBreakpoint, DebugCommand,
+        DebugController, DebugExecution, DebugOptions, DebugSnapshot, DebugStopReason,
+        ExecutionLimits, Interpreter, RuntimeError, RuntimeErrorKind,
     },
     semantic::analyze,
 };
@@ -41,6 +44,7 @@ Usage:
   star check [<file.star|file.starc>] [options]
   star build [<file.star>] [--output <file.starc>] [options]
   star run [<file.star|file.starc>] [options]
+  star debug <file.star> [--strict] [--break LINE[:COLUMN]]... [--input <file>] [--dap]
   star test --suite oj [--solutions <directory>]
   star bench [<file.star|file.starc>] --iterations <count> [--input <file>]
   star fmt <file.star> [--write]
@@ -99,6 +103,14 @@ struct BenchOptions {
     input: Option<PathBuf>,
 }
 
+struct DebugFileOptions {
+    path: PathBuf,
+    input: Option<PathBuf>,
+    strict: bool,
+    breakpoints: Vec<DebugBreakpoint>,
+    dap: bool,
+}
+
 fn main() -> ExitCode {
     ExitCode::from(run(env::args().skip(1).collect()))
 }
@@ -135,6 +147,14 @@ fn run(args: Vec<String>) -> u8 {
         },
         "run" => match parse_run_options(&args[1..]) {
             Ok(options) => run_file(options),
+            Err(message) => {
+                eprintln!("star: {message}\n\n{HELP}");
+                EXIT_USAGE
+            }
+        },
+        "debug" => match parse_debug_options(&args[1..]) {
+            Ok(options) if options.dap => debug_file_dap(options),
+            Ok(options) => debug_file(options),
             Err(message) => {
                 eprintln!("star: {message}\n\n{HELP}");
                 EXIT_USAGE
@@ -379,6 +399,301 @@ fn report_pending_repl_error(source: &[u8]) -> u8 {
 
 fn parse_run_options(arguments: &[String]) -> Result<RunOptions, String> {
     parse_execution_options(arguments, "run", true)
+}
+
+fn parse_debug_options(arguments: &[String]) -> Result<DebugFileOptions, String> {
+    let mut path = None;
+    let mut input = None;
+    let mut strict = false;
+    let mut breakpoints = Vec::new();
+    let mut dap = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--strict" => {
+                strict = true;
+                index += 1;
+            }
+            "--dap" => {
+                dap = true;
+                index += 1;
+            }
+            "--input" => {
+                if input.is_some() {
+                    return Err("`--input` may only be specified once".to_owned());
+                }
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for `--input`".to_owned())?;
+                input = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--break" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for `--break`".to_owned())?;
+                breakpoints.push(parse_debug_breakpoint(value)?);
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown debugger option `{option}`"));
+            }
+            _ => {
+                if path.is_some() {
+                    return Err("`star debug` accepts exactly one source file".to_owned());
+                }
+                path = Some(PathBuf::from(&arguments[index]));
+                index += 1;
+            }
+        }
+    }
+    Ok(DebugFileOptions {
+        path: path.ok_or_else(|| "`star debug` requires a source file".to_owned())?,
+        input,
+        strict,
+        breakpoints,
+        dap,
+    })
+}
+
+fn parse_debug_breakpoint(value: &str) -> Result<DebugBreakpoint, String> {
+    let (line, column) = match value.split_once(':') {
+        Some((line, column)) => (
+            line.parse::<usize>()
+                .map_err(|_| format!("invalid breakpoint line `{line}`"))?,
+            Some(
+                column
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid breakpoint column `{column}`"))?,
+            ),
+        ),
+        None => (
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("invalid breakpoint line `{value}`"))?,
+            None,
+        ),
+    };
+    if line == 0 || column == Some(0) {
+        return Err("breakpoint lines and columns are one-based".to_owned());
+    }
+    Ok(DebugBreakpoint { line, column })
+}
+
+fn debug_file(options: DebugFileOptions) -> u8 {
+    let source = match read_limited_file(&options.path, DEFAULT_FILE_BYTES) {
+        Ok(source) => source,
+        Err(code) => return code,
+    };
+    let mode = if options.strict {
+        LexMode::Strict
+    } else {
+        LexMode::Normal
+    };
+    let normalized = match normalize_source(&source, mode) {
+        Ok(normalized) => normalized,
+        Err(error) => {
+            eprintln!("{}: {error}", options.path.display());
+            return EXIT_SOURCE;
+        }
+    };
+    let program = match parse(&normalized) {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("{}: {error}", options.path.display());
+            return EXIT_SOURCE;
+        }
+    };
+    let guest_input = match options.input {
+        Some(path) => match read_limited_file(&path, DEFAULT_FILE_BYTES) {
+            Ok(input) => input,
+            Err(code) => return code,
+        },
+        None => Vec::new(),
+    };
+    let stdout = io::stdout();
+    let mut interpreter = Interpreter::new(BufReader::new(Cursor::new(guest_input)), stdout.lock());
+    let debug_options = DebugOptions {
+        pause_on_entry: true,
+        breakpoints: options.breakpoints,
+    };
+    match interpreter.execute_debug(
+        &program,
+        options.path.to_string_lossy(),
+        debug_options,
+        Box::new(InteractiveDebugger),
+    ) {
+        Ok(DebugExecution::Completed | DebugExecution::Quit) => EXIT_OK,
+        Err(error) => report_runtime_error(&options.path, error),
+    }
+}
+
+fn debug_file_dap(options: DebugFileOptions) -> u8 {
+    let source = match read_limited_file(&options.path, DEFAULT_FILE_BYTES) {
+        Ok(source) => source,
+        Err(code) => return code,
+    };
+    let mode = if options.strict {
+        LexMode::Strict
+    } else {
+        LexMode::Normal
+    };
+    let normalized = match normalize_source(&source, mode) {
+        Ok(normalized) => normalized,
+        Err(error) => {
+            eprintln!("{}: {error}", options.path.display());
+            return EXIT_SOURCE;
+        }
+    };
+    let program = match parse(&normalized) {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("{}: {error}", options.path.display());
+            return EXIT_SOURCE;
+        }
+    };
+    let guest_input = match options.input {
+        Some(path) => match read_limited_file(&path, DEFAULT_FILE_BYTES) {
+            Ok(input) => input,
+            Err(code) => return code,
+        },
+        None => Vec::new(),
+    };
+    let cli_breakpoints = options.breakpoints;
+    let dap_output = dap::DapOutput::new();
+    let mut controller = match dap::DapController::new(&options.path, dap_output.clone()) {
+        Ok(controller) => controller,
+        Err(error) => {
+            eprintln!(
+                "{}: cannot initialize DAP source: {error}",
+                options.path.display()
+            );
+            return EXIT_IO;
+        }
+    };
+    let mut breakpoints = match controller.configure() {
+        Ok(breakpoints) => breakpoints,
+        Err(error) => {
+            if error.kind() != io::ErrorKind::Interrupted {
+                eprintln!("star: DAP configuration failed: {error}");
+            }
+            return if error.kind() == io::ErrorKind::Interrupted {
+                EXIT_OK
+            } else {
+                EXIT_IO
+            };
+        }
+    };
+    breakpoints.extend(cli_breakpoints);
+    let mut interpreter = Interpreter::new(
+        BufReader::new(Cursor::new(guest_input)),
+        dap::DapGuestOutput::new(dap_output.clone()),
+    );
+    let result = interpreter.execute_debug(
+        &program,
+        options.path.to_string_lossy(),
+        DebugOptions {
+            pause_on_entry: true,
+            breakpoints,
+        },
+        Box::new(controller),
+    );
+    match result {
+        Ok(DebugExecution::Completed | DebugExecution::Quit) => {
+            let _ = dap_output.finish(0);
+            EXIT_OK
+        }
+        Err(error) => {
+            let exit = report_runtime_error(&options.path, error);
+            let _ = dap_output.finish(i32::from(exit));
+            exit
+        }
+    }
+}
+
+struct InteractiveDebugger;
+
+impl DebugController for InteractiveDebugger {
+    fn on_stop(&mut self, reason: DebugStopReason, snapshot: &DebugSnapshot) -> DebugCommand {
+        eprintln!(
+            "paused ({reason:?}) at {}:{}:{}",
+            snapshot.source_name, snapshot.location.start.line, snapshot.location.start.column
+        );
+        let stdin = io::stdin();
+        loop {
+            eprint!("(star-debug) ");
+            if let Err(error) = io::stderr().flush() {
+                eprintln!("star: cannot write debugger prompt: {error}");
+                return DebugCommand::Quit;
+            }
+            let mut command = String::new();
+            match stdin.read_line(&mut command) {
+                Ok(0) => return DebugCommand::Quit,
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("star: debugger input failed: {error}");
+                    return DebugCommand::Quit;
+                }
+            }
+            match command.trim() {
+                "continue" | "c" => return DebugCommand::Continue,
+                "step" | "s" => return DebugCommand::StepInto,
+                "next" | "n" => return DebugCommand::StepOver,
+                "finish" | "out" => return DebugCommand::StepOut,
+                "quit" | "q" => return DebugCommand::Quit,
+                "where" => eprintln!(
+                    "{}:{}:{}",
+                    snapshot.source_name,
+                    snapshot.location.start.line,
+                    snapshot.location.start.column
+                ),
+                "stack" => print_debug_stack(snapshot),
+                "locals" => print_debug_bindings("locals", &snapshot.locals),
+                "globals" => print_debug_bindings("globals", &snapshot.globals),
+                "bt" => print_debug_backtrace(snapshot),
+                "help" | "h" => {
+                    eprintln!("Commands: continue, step, next, finish, where, bt, stack, locals, globals, quit");
+                }
+                "" => {}
+                other => eprintln!("unknown debugger command `{other}`; enter `help`"),
+            }
+        }
+    }
+}
+
+fn print_debug_stack(snapshot: &DebugSnapshot) {
+    for (index, value) in snapshot.operand_stack.iter().enumerate() {
+        eprintln!("  [{index}] {} {}", value.type_name, value.preview);
+    }
+    if snapshot.operand_stack_truncated {
+        eprintln!("  ... older stack values omitted");
+    }
+}
+
+fn print_debug_bindings(label: &str, bindings: &[DebugBinding]) {
+    eprintln!("{label}:");
+    for binding in bindings {
+        let mutability = if binding.mutable { "mut" } else { "const" };
+        eprintln!(
+            "  [{}] scope={} {mutability} {} {}",
+            binding.id, binding.scope_depth, binding.value.type_name, binding.value.preview
+        );
+    }
+}
+
+fn print_debug_backtrace(snapshot: &DebugSnapshot) {
+    for (index, frame) in snapshot.call_stack.iter().enumerate().rev() {
+        match (&frame.function_id, frame.call_site) {
+            (Some(function_id), Some(call_site)) => eprintln!(
+                "  #{index} function {function_id} called at {}:{}:{}",
+                snapshot.source_name, call_site.start.line, call_site.start.column
+            ),
+            _ => eprintln!("  #{index} top-level"),
+        }
+    }
+    if snapshot.call_stack_truncated {
+        eprintln!("  ... outer call frames omitted");
+    }
 }
 
 fn parse_new_options(arguments: &[String]) -> Result<(PathBuf, String), String> {

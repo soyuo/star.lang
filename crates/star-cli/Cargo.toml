@@ -16,3 +16,4 @@ star-compiler.workspace = true
 star-lexer.workspace = true
 star-parser.workspace = true
 star-interpreter.workspace = true
+serde_json.workspace = true

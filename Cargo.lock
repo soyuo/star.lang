@@ -479,6 +479,7 @@ version = "0.1.0"
 dependencies = [
  "num-bigint",
  "num-traits",
+ "serde_json",
  "star-common",
  "star-compiler",
  "star-interpreter",

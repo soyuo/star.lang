@@ -32,6 +32,7 @@ use crate::{
 
 pub mod collections;
 pub mod concurrency;
+pub mod debugger;
 pub mod ffi;
 pub mod host;
 pub mod json;
@@ -45,6 +46,10 @@ pub mod worker;
 mod bytecode_vm;
 mod guest_concurrency;
 pub use bytecode_vm::BytecodeVm;
+pub use debugger::{
+    DebugBinding, DebugBreakpoint, DebugCallFrame, DebugCommand, DebugController, DebugExecution,
+    DebugOptions, DebugSnapshot, DebugStopReason, DebugValue,
+};
 
 /// The reason execution stopped.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +83,8 @@ pub enum RuntimeErrorKind {
     Deadlock,
     /// The configured statement execution limit was exceeded.
     ExecutionLimit,
+    /// The host debugger ended the current execution.
+    DebuggerStopped,
     /// A configured runtime memory, operand-stack, or wall-clock ceiling was exceeded.
     ResourceLimit(&'static str),
     /// The instruction is valid source but not implemented by this execution slice.
@@ -108,6 +115,7 @@ impl fmt::Display for RuntimeErrorKind {
             Self::TaskCancelled => formatter.write_str("task was cancelled"),
             Self::Deadlock => formatter.write_str("cooperative scheduler deadlock"),
             Self::ExecutionLimit => formatter.write_str("execution step limit exceeded"),
+            Self::DebuggerStopped => formatter.write_str("execution stopped by debugger"),
             Self::ResourceLimit(resource) => write!(formatter, "{resource} limit exceeded"),
             Self::UnsupportedInstruction(opcode) => {
                 write!(formatter, "unsupported instruction: {opcode:?}")
@@ -126,6 +134,7 @@ impl RuntimeErrorKind {
                 | Self::CompileError(_)
                 | Self::UnsupportedInstruction(_)
                 | Self::Unsupported(_)
+                | Self::DebuggerStopped
         )
     }
 }
@@ -263,6 +272,8 @@ pub struct Interpreter<R: BufRead, W: Write> {
     mutexes: HashMap<u64, GuestMutex>,
     next_mutex_id: u64,
     pending_channel_message_bytes: usize,
+    debug_session: Option<debugger::DebugSession>,
+    debug_nesting: usize,
 }
 
 pub(crate) struct NativeCallPlan {
@@ -383,6 +394,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             mutexes: HashMap::new(),
             next_mutex_id: 1,
             pending_channel_message_bytes: 0,
+            debug_session: None,
+            debug_nesting: 0,
         }
     }
 
@@ -984,7 +997,21 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
         &mut self,
         statements: &[Statement],
     ) -> Result<ControlFlow, RuntimeError> {
+        if self.debug_session.is_none() {
+            return self.execute_statements_inner(statements);
+        }
+        self.debug_nesting = self.debug_nesting.saturating_add(1);
+        let result = self.execute_statements_inner(statements);
+        self.debug_nesting = self.debug_nesting.saturating_sub(1);
+        result
+    }
+
+    fn execute_statements_inner(
+        &mut self,
+        statements: &[Statement],
+    ) -> Result<ControlFlow, RuntimeError> {
         for statement in statements {
+            self.debug_before_statement(statement_span(statement))?;
             self.advance_step(statement_span(statement))?;
             match statement {
                 Statement::Instruction(instruction) => match instruction.opcode {
@@ -4111,7 +4138,8 @@ fn estimated_runtime_error_bytes(error: &RuntimeError) -> usize {
         | RuntimeErrorKind::ExecutionLimit
         | RuntimeErrorKind::ResourceLimit(_)
         | RuntimeErrorKind::UnsupportedInstruction(_)
-        | RuntimeErrorKind::Unsupported(_) => 0,
+        | RuntimeErrorKind::Unsupported(_)
+        | RuntimeErrorKind::DebuggerStopped => 0,
     };
     size_of::<RuntimeError>()
         .saturating_add(message_bytes)
