@@ -97,6 +97,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             })?;
             Ok(result)
         })();
+        self.runtime.set_external_memory_bytes(0);
         if result.is_err() {
             self.cleanup_after_error();
         }
@@ -135,6 +136,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.call_trace.clear();
         self.runtime.call_depth = 0;
         self.runtime.executed_steps = 0;
+        self.runtime.set_external_memory_bytes(0);
     }
 
     fn cleanup_after_error(&mut self) {
@@ -153,8 +155,32 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
 
     fn execute_image(&mut self, image: &Image<'_>) -> Result<Value, RuntimeError> {
         let entry = image.modules[image.entry_module as usize].initializer_index as usize;
-        let mut frames = vec![Frame::initializer(entry, image.functions[entry].clone())];
+        let entry_function = &image.functions[entry];
+        let entry_span = image.span(entry, entry_function.code_offset);
+        let frame_capacity = frame_capacity_after_push(
+            0,
+            0,
+            self.runtime.limits.max_call_depth.saturating_add(1).max(1),
+        )
+        .ok_or_else(|| {
+            self.runtime
+                .error(RuntimeErrorKind::StackOverflow, entry_span)
+        })?;
+        self.runtime.ensure_memory_budget(
+            frame_capacity
+                .saturating_mul(size_of::<Frame>())
+                .saturating_add(function_record_payload_bytes(entry_function)),
+            entry_span,
+        )?;
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(frame_capacity).map_err(|_| {
+            self.runtime
+                .error(RuntimeErrorKind::ResourceLimit("call frames"), entry_span)
+        })?;
+        frames.push(Frame::initializer(entry, entry_function.clone()));
+        self.update_external_frame_memory(&frames);
         loop {
+            self.update_external_frame_memory(&frames);
             let Some(frame) = frames.last() else {
                 return Ok(Value::Null);
             };
@@ -200,13 +226,10 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 let frame = frames.last_mut().expect("active frame");
                 decode_instruction(image, frame, span, &self.runtime)?
             };
-            match self.execute_instruction(
-                image,
-                &mut frames,
-                instruction,
-                instruction_offset,
-                span,
-            ) {
+            let instruction_result =
+                self.execute_instruction(image, &mut frames, instruction, instruction_offset, span);
+            self.update_external_frame_memory(&frames);
+            match instruction_result {
                 Ok(Some(value)) => {
                     self.runtime.check_resource_limits(span)?;
                     return Ok(value);
@@ -226,6 +249,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             }
             self.runtime.collect_if_needed();
         }
+    }
+
+    fn update_external_frame_memory(&mut self, frames: &Vec<Frame>) {
+        self.runtime.set_external_memory_bytes(
+            frame_storage_bytes(frames, frames.capacity())
+                .saturating_add(call_trace_storage_bytes(&self.runtime.call_trace)),
+        );
     }
 
     fn execute_instruction(
@@ -765,25 +795,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         };
         let rest_count = request.arguments.len().saturating_sub(fixed_count);
         let function_copy_bytes = size_of::<FunctionRecord>()
-            .saturating_add(
-                function_record
-                    .parameter_ids
-                    .capacity()
-                    .saturating_mul(size_of::<BigInt>()),
-            )
-            .saturating_add(
-                function_record
-                    .parameter_ids
-                    .iter()
-                    .map(super::estimated_bigint_bytes)
-                    .fold(0usize, usize::saturating_add),
-            )
-            .saturating_add(
-                function_record
-                    .id
-                    .as_ref()
-                    .map_or(0, super::estimated_bigint_bytes),
-            );
+            .saturating_add(function_record_payload_bytes(function_record));
         let argument_storage_bytes = request
             .arguments
             .capacity()
@@ -840,17 +852,60 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 ))
                 .saturating_add(size_of::<RefCell<Vec<Value>>>() + 2 * size_of::<usize>())
         };
+        let frame_capacity = frame_capacity_after_push(
+            frames.capacity(),
+            frames.len(),
+            self.runtime.limits.max_call_depth.saturating_add(1).max(1),
+        )
+        .ok_or_else(|| self.runtime.error(RuntimeErrorKind::StackOverflow, span))?;
+        let frame_capacity_growth = frame_capacity
+            .saturating_sub(frames.capacity())
+            .saturating_mul(size_of::<Frame>());
+        let call_trace_capacity = frame_capacity_after_push(
+            self.runtime.call_trace.capacity(),
+            self.runtime.call_trace.len(),
+            self.runtime.limits.max_call_depth.max(1),
+        )
+        .ok_or_else(|| self.runtime.error(RuntimeErrorKind::StackOverflow, span))?;
+        let call_trace_capacity_growth = call_trace_capacity
+            .saturating_sub(self.runtime.call_trace.capacity())
+            .saturating_mul(size_of::<crate::runtime::StackTraceFrame>());
         self.runtime.ensure_memory_budget(
             function_copy_bytes
-                .saturating_add(super::estimated_bigint_bytes(&request.function_id))
+                .saturating_add(
+                    super::estimated_bigint_bytes(&request.function_id).saturating_mul(2),
+                )
                 .saturating_add(argument_storage_bytes)
                 .saturating_add(capture_storage_bytes)
                 .saturating_add(capture_scope_bytes)
                 .saturating_add(parameter_storage_bytes)
                 .saturating_add(rest_array_bytes)
-                .saturating_add(size_of::<Frame>()),
+                .saturating_add(size_of::<Frame>())
+                .saturating_add(frame_capacity_growth)
+                .saturating_add(call_trace_capacity_growth),
             span,
         )?;
+        if call_trace_capacity > self.runtime.call_trace.capacity() {
+            self.runtime
+                .call_trace
+                .try_reserve_exact(
+                    call_trace_capacity.saturating_sub(self.runtime.call_trace.len()),
+                )
+                .map_err(|_| {
+                    self.runtime
+                        .error(RuntimeErrorKind::ResourceLimit("call trace"), span)
+                })?;
+            self.update_external_frame_memory(frames);
+        }
+        if frame_capacity > frames.capacity() {
+            frames
+                .try_reserve_exact(frame_capacity.saturating_sub(frames.len()))
+                .map_err(|_| {
+                    self.runtime
+                        .error(RuntimeErrorKind::ResourceLimit("call frames"), span)
+                })?;
+            self.update_external_frame_memory(frames);
+        }
         let function = function_record.clone();
         let scope_floor = self.runtime.scopes.len();
         let stack_base = self.runtime.stack.len();
@@ -895,6 +950,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             request.return_action,
             call_site_offset,
         ));
+        self.update_external_frame_memory(frames);
         Ok(())
     }
 
@@ -1838,6 +1894,144 @@ impl Frame {
             function,
         }
     }
+}
+
+fn frame_capacity_after_push(
+    current_capacity: usize,
+    current_length: usize,
+    maximum_frames: usize,
+) -> Option<usize> {
+    let required = current_length.checked_add(1)?;
+    if required > maximum_frames {
+        return None;
+    }
+    if required <= current_capacity {
+        return Some(current_capacity);
+    }
+    Some(
+        current_capacity
+            .saturating_mul(2)
+            .max(required)
+            .min(maximum_frames),
+    )
+}
+
+fn function_record_payload_bytes(function: &FunctionRecord) -> usize {
+    function
+        .parameter_ids
+        .capacity()
+        .saturating_mul(size_of::<BigInt>())
+        .saturating_add(
+            function
+                .id
+                .as_ref()
+                .map(super::estimated_bigint_bytes)
+                .unwrap_or(0),
+        )
+        .saturating_add(
+            function
+                .parameter_ids
+                .iter()
+                .map(super::estimated_bigint_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
+}
+
+fn snapshot_payload_bytes(snapshot: &super::ExecutionSnapshot) -> usize {
+    snapshot
+        .stack
+        .capacity()
+        .saturating_mul(size_of::<Value>())
+        .saturating_add(super::estimate_cloned_value_payloads(&snapshot.stack))
+        .saturating_add(
+            snapshot
+                .capture_lengths
+                .capacity()
+                .saturating_mul(size_of::<usize>()),
+        )
+}
+
+fn pending_exception_bytes(exception: &PendingException) -> usize {
+    exception
+        .error
+        .stack_trace
+        .capacity()
+        .saturating_mul(size_of::<super::StackTraceFrame>())
+        .saturating_add(
+            exception
+                .error
+                .stack_trace
+                .iter()
+                .map(|frame| super::estimated_bigint_bytes(&frame.function_id))
+                .fold(0usize, usize::saturating_add),
+        )
+}
+
+fn frame_storage_bytes(frames: &[Frame], capacity: usize) -> usize {
+    frames.iter().fold(
+        capacity.saturating_mul(size_of::<Frame>()),
+        |total, frame| {
+            let loop_bytes = frame
+                .loop_states
+                .capacity()
+                .saturating_mul(size_of::<(u32, LoopState)>() + 2 * size_of::<usize>())
+                .saturating_add(
+                    frame
+                        .loop_states
+                        .values()
+                        .map(|state| super::estimated_bigint_bytes(&state.variable_id))
+                        .fold(0usize, usize::saturating_add),
+                );
+            let pending_bytes = frame
+                .pending_exceptions
+                .capacity()
+                .saturating_mul(size_of::<PendingException>())
+                .saturating_add(
+                    frame
+                        .pending_exceptions
+                        .iter()
+                        .map(pending_exception_bytes)
+                        .fold(0usize, usize::saturating_add),
+                );
+            let active_bytes = frame
+                .active_exceptions
+                .capacity()
+                .saturating_mul(
+                    size_of::<(usize, super::ExecutionSnapshot)>() + 2 * size_of::<usize>(),
+                )
+                .saturating_add(
+                    frame
+                        .active_exceptions
+                        .values()
+                        .map(snapshot_payload_bytes)
+                        .fold(0usize, usize::saturating_add),
+                );
+            let return_payload = match &frame.return_action {
+                ReturnAction::PushResult => 0,
+                ReturnAction::PushValue(value) => {
+                    super::estimated_unmanaged_payload_bytes(value, 0)
+                }
+            };
+            total
+                .saturating_add(function_record_payload_bytes(&frame.function))
+                .saturating_add(loop_bytes)
+                .saturating_add(pending_bytes)
+                .saturating_add(active_bytes)
+                .saturating_add(return_payload)
+        },
+    )
+}
+
+fn call_trace_storage_bytes(trace: &Vec<crate::runtime::StackTraceFrame>) -> usize {
+    trace
+        .capacity()
+        .saturating_mul(size_of::<crate::runtime::StackTraceFrame>())
+        .saturating_add(
+            trace
+                .iter()
+                .map(|frame| super::estimated_bigint_bytes(&frame.function_id))
+                .fold(0usize, usize::saturating_add),
+        )
 }
 
 #[derive(Clone, Debug)]

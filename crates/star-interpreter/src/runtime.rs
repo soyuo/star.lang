@@ -221,6 +221,7 @@ pub struct Interpreter<R: BufRead, W: Write> {
     call_depth: usize,
     call_trace: Vec<StackTraceFrame>,
     limits: ExecutionLimits,
+    external_memory_bytes: usize,
     execution_started: Option<Instant>,
     executed_steps: u64,
 }
@@ -262,6 +263,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             call_depth: 0,
             call_trace: Vec::new(),
             limits: ExecutionLimits::default(),
+            external_memory_bytes: 0,
             execution_started: None,
             executed_steps: 0,
         }
@@ -338,6 +340,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 self.limits.max_memory_bytes,
             )
             .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span))?;
+        estimated = estimated.saturating_add(self.external_memory_bytes);
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             self.collect_garbage().map_err(|_| {
                 self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
@@ -353,11 +356,16 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 .map_err(|_| {
                     self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span)
                 })?;
+            estimated = estimated.saturating_add(self.external_memory_bytes);
         }
         if estimated.saturating_add(additional) > self.limits.max_memory_bytes {
             return Err(self.error(RuntimeErrorKind::ResourceLimit("memory"), span));
         }
         Ok(())
+    }
+
+    pub(crate) fn set_external_memory_bytes(&mut self, bytes: usize) {
+        self.external_memory_bytes = bytes;
     }
 
     pub(crate) fn push_value(&mut self, value: Value, span: Span) -> Result<(), RuntimeError> {
