@@ -28,6 +28,13 @@ pub struct FunctionRef {
     pub(crate) id: BigInt,
 }
 
+/// A module handle bound to one bytecode execution context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleHandle {
+    pub(crate) execution_id: u64,
+    pub(crate) module_index: u32,
+}
+
 /// A closure's function reference and ordered captured shared cells.
 #[derive(Clone, Debug)]
 pub struct ClosureState {
@@ -112,6 +119,8 @@ pub enum Value {
     Channel(u64),
     /// A stable handle to a cooperative task-owned mutex.
     Mutex(u64),
+    /// A module loaded from the current bytecode image.
+    Module(ModuleHandle),
     /// Absence of a value.
     Null,
 }
@@ -194,7 +203,8 @@ impl RuntimeKey {
             | Value::Handle(_)
             | Value::Task(_)
             | Value::Channel(_)
-            | Value::Mutex(_) => return None,
+            | Value::Mutex(_)
+            | Value::Module(_) => return None,
         })
     }
 }
@@ -283,6 +293,7 @@ fn values_equal(left: &Value, right: &Value, active: &mut ActiveValuePairs) -> b
         (Value::Task(left), Value::Task(right)) => left == right,
         (Value::Channel(left), Value::Channel(right)) => left == right,
         (Value::Mutex(left), Value::Mutex(right)) => left == right,
+        (Value::Module(left), Value::Module(right)) => left == right,
         (Value::Closure(left), Value::Closure(right)) => Rc::ptr_eq(left, right),
         (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
         (Value::Handle(left), Value::Handle(right)) => left.same_handle(right),
@@ -334,6 +345,7 @@ impl Value {
             Self::Task(_) => "Task",
             Self::Channel(_) => "Channel",
             Self::Mutex(_) => "Mutex",
+            Self::Module(_) => "Module",
             Self::Null => "Null",
         }
     }
@@ -412,6 +424,7 @@ fn fmt_value(
         Value::Task(id) => write!(formatter, "Task#{id}"),
         Value::Channel(id) => write!(formatter, "Channel#{id}"),
         Value::Mutex(id) => write!(formatter, "Mutex#{id}"),
+        Value::Module(module) => write!(formatter, "Module#{}", module.module_index),
         Value::Closure(closure) => write!(formatter, "Closure#{}", closure.function.id),
         Value::Object(object) => write!(formatter, "Struct#{}", object.borrow().struct_id),
         Value::Handle(handle) => write!(formatter, "Handle<{}>", handle.kind_name()),

@@ -1,7 +1,8 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -10,7 +11,8 @@ use star_compiler::{verify_bytecode, Capability, IrOp, VerificationPolicy, Verif
 
 use crate::gc::{GcError, GcStats};
 use crate::value::{
-    binding_cell, BindingCell, ClosureState, FunctionRef, IteratorState, ObjectState, Value,
+    binding_cell, Binding, BindingCell, ClosureState, FunctionRef, IteratorState, ModuleHandle,
+    ObjectState, Value,
 };
 
 use super::{empty_span, ffi::NativeCallbackContext, Interpreter, RuntimeError, RuntimeErrorKind};
@@ -29,6 +31,29 @@ pub struct BytecodeVm<R: BufRead, W: Write> {
     next_task_id: u64,
     current_task_id: Option<u64>,
     task_memory_bytes: usize,
+    execution_id: u64,
+    module_states: Vec<ModuleInitializationState>,
+    module_globals: Vec<HashMap<BigInt, ModuleGlobalCell>>,
+    module_exports: Vec<HashMap<BigInt, u8>>,
+    module_memory_bytes: usize,
+    module_dynamic_global_bytes: usize,
+    module_dynamic_export_bytes: usize,
+}
+
+static NEXT_MODULE_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModuleInitializationState {
+    Uninitialized,
+    Initializing,
+    Initialized,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleGlobalCell {
+    cell: BindingCell,
+    initialized: Rc<Cell<bool>>,
 }
 
 struct BytecodeCallbackContext<'a, R: BufRead, W: Write> {
@@ -50,6 +75,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             next_task_id: 1,
             current_task_id: None,
             task_memory_bytes: 0,
+            execution_id: 0,
+            module_states: Vec::new(),
+            module_globals: Vec::new(),
+            module_exports: Vec::new(),
+            module_memory_bytes: 0,
+            module_dynamic_global_bytes: 0,
+            module_dynamic_export_bytes: 0,
         }
     }
 
@@ -188,14 +220,24 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.capture_vectors.push(Vec::new());
         self.runtime.call_trace.clear();
         self.runtime.call_depth = 0;
+        self.runtime.clear_external_binding_roots();
         self.runtime.executed_steps = 0;
         self.runtime.set_external_memory_bytes(0);
-        self.frame_storage_estimates.clear();
-        self.tasks.clear();
-        self.ready_tasks.clear();
+        self.frame_storage_estimates = Vec::new();
+        self.tasks = HashMap::new();
+        self.ready_tasks = VecDeque::new();
         self.next_task_id = 1;
         self.current_task_id = None;
         self.task_memory_bytes = 0;
+        self.execution_id = NEXT_MODULE_EXECUTION_ID
+            .fetch_add(1, Ordering::Relaxed)
+            .max(1);
+        self.module_states = Vec::new();
+        self.module_globals = Vec::new();
+        self.module_exports = Vec::new();
+        self.module_memory_bytes = 0;
+        self.module_dynamic_global_bytes = 0;
+        self.module_dynamic_export_bytes = 0;
     }
 
     fn cleanup_after_error(&mut self) {
@@ -210,12 +252,826 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.capture_vectors[0].clear();
         self.runtime.call_trace.clear();
         self.runtime.call_depth = 0;
+        for state in &mut self.module_states {
+            if *state == ModuleInitializationState::Initializing {
+                *state = ModuleInitializationState::Failed;
+            }
+        }
+    }
+
+    fn module_initialization_order(
+        &self,
+        root: u32,
+        image: &Image<'_>,
+        span: Span,
+    ) -> Result<Vec<u32>, RuntimeError> {
+        fn visit(
+            index: u32,
+            image: &Image<'_>,
+            states: &[ModuleInitializationState],
+            marks: &mut [u8],
+            order: &mut Vec<u32>,
+        ) -> Result<(), String> {
+            let index_usize = index as usize;
+            if index_usize >= image.modules.len() {
+                return Err("module index out of range".into());
+            }
+            if states[index_usize] == ModuleInitializationState::Initialized
+                || marks[index_usize] == 2
+            {
+                return Ok(());
+            }
+            if states[index_usize] == ModuleInitializationState::Failed {
+                return Err("module initialization previously failed".into());
+            }
+            if states[index_usize] == ModuleInitializationState::Initializing {
+                return Ok(());
+            }
+            if marks[index_usize] == 1 {
+                return Ok(());
+            }
+            marks[index_usize] = 1;
+            for import in &image.modules[index_usize].imports {
+                let imported = image.module_index(&import.module_name).ok_or_else(|| {
+                    format!("imported module `{}` is not linked", import.module_name)
+                })?;
+                visit(imported, image, states, marks, order)?;
+            }
+            marks[index_usize] = 2;
+            order.push(index);
+            Ok(())
+        }
+        let mut order = Vec::new();
+        let mut marks = vec![0; image.modules.len()];
+        visit(root, image, &self.module_states, &mut marks, &mut order).map_err(|_| {
+            self.runtime.error(
+                RuntimeErrorKind::ReferenceError("module dependency resolution failed"),
+                span,
+            )
+        })?;
+        Ok(order)
+    }
+
+    fn link_module_imports(
+        &mut self,
+        order: &[u32],
+        image: &Image<'_>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        for &module_index in order {
+            let module = &image.modules[module_index as usize];
+            for import in &module.imports {
+                let imported_index = image.module_index(&import.module_name).ok_or_else(|| {
+                    self.runtime.error(
+                        RuntimeErrorKind::ReferenceError("imported module is not linked"),
+                        span,
+                    )
+                })?;
+                let export = image.modules[imported_index as usize]
+                    .export_by_name(&import.symbol_name)
+                    .ok_or_else(|| {
+                        self.runtime.error(
+                            RuntimeErrorKind::ReferenceError("imported symbol is not exported"),
+                            span,
+                        )
+                    })?;
+                if export.kind != import.kind {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::CompileError(
+                            "import kind does not match export kind".into(),
+                        ),
+                        span,
+                    ));
+                }
+                if import.kind > 2 {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::CompileError("unknown module import kind".into()),
+                        span,
+                    ));
+                }
+                let destination = &self.module_globals[module_index as usize];
+                if destination.contains_key(&import.local_id) {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::CompileError(
+                            "module import binding collides with a declared global".into(),
+                        ),
+                        span,
+                    ));
+                }
+                let current_capacity = destination.capacity();
+                let projected_capacity =
+                    hash_map_capacity_after_insert(current_capacity, destination.len());
+                let binding_bytes = match import.kind {
+                    0 => super::estimated_bigint_bytes(&import.local_id),
+                    1 => module_global_binding_bytes(&import.local_id)
+                        .saturating_add(size_of::<FunctionRef>())
+                        .saturating_add(super::estimated_bigint_bytes(&export.id)),
+                    2 => module_global_binding_bytes(&import.local_id)
+                        .saturating_add(size_of::<BigInt>())
+                        .saturating_add(super::estimated_bigint_bytes(&export.id)),
+                    _ => 0,
+                };
+                let growth_bytes = projected_capacity
+                    .saturating_sub(current_capacity)
+                    .saturating_mul(size_of::<(BigInt, ModuleGlobalCell)>());
+                self.runtime
+                    .ensure_memory_budget(binding_bytes.saturating_add(growth_bytes), span)?;
+                self.module_globals[module_index as usize]
+                    .try_reserve(1)
+                    .map_err(|_| {
+                        self.runtime
+                            .error(RuntimeErrorKind::ResourceLimit("module imports"), span)
+                    })?;
+                let binding = match import.kind {
+                    0 => self.module_globals[imported_index as usize]
+                        .get(&export.id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            self.runtime.error(
+                                RuntimeErrorKind::CompileError(
+                                    "exported global is not declared".into(),
+                                ),
+                                span,
+                            )
+                        })?,
+                    1 => ModuleGlobalCell {
+                        cell: {
+                            if image
+                                .module_function_index(imported_index, &export.id)
+                                .is_none()
+                            {
+                                return Err(self.runtime.error(
+                                    RuntimeErrorKind::ReferenceError(
+                                        "exported function does not exist",
+                                    ),
+                                    span,
+                                ));
+                            }
+                            binding_cell(
+                                Value::Function(FunctionRef {
+                                    module_index: imported_index,
+                                    id: export.id.clone(),
+                                }),
+                                false,
+                            )
+                        },
+                        initialized: Rc::new(Cell::new(true)),
+                    },
+                    2 => ModuleGlobalCell {
+                        cell: binding_cell(Value::Int(export.id.clone()), false),
+                        initialized: Rc::new(Cell::new(true)),
+                    },
+                    _ => {
+                        return Err(self.runtime.error(
+                            RuntimeErrorKind::CompileError("unknown module import kind".into()),
+                            span,
+                        ))
+                    }
+                };
+                self.module_globals[module_index as usize].insert(import.local_id.clone(), binding);
+                let actual_growth = self.module_globals[module_index as usize]
+                    .capacity()
+                    .saturating_sub(current_capacity)
+                    .saturating_mul(size_of::<(BigInt, ModuleGlobalCell)>());
+                self.module_dynamic_global_bytes = self
+                    .module_dynamic_global_bytes
+                    .saturating_add(binding_bytes)
+                    .saturating_add(actual_growth);
+                self.sync_external_memory();
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule_module_initialization(
+        &mut self,
+        root: u32,
+        push_module: bool,
+        image: &Image<'_>,
+        frames: &mut Vec<Frame>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        let state = self
+            .module_states
+            .get(root as usize)
+            .copied()
+            .ok_or_else(|| {
+                self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("module does not exist"),
+                    span,
+                )
+            })?;
+        match state {
+            ModuleInitializationState::Initialized => {
+                if push_module {
+                    self.runtime.push_value(
+                        Value::Module(ModuleHandle {
+                            execution_id: self.execution_id,
+                            module_index: root,
+                        }),
+                        span,
+                    )?;
+                }
+                return Ok(());
+            }
+            ModuleInitializationState::Initializing => {
+                if push_module {
+                    self.runtime.push_value(
+                        Value::Module(ModuleHandle {
+                            execution_id: self.execution_id,
+                            module_index: root,
+                        }),
+                        span,
+                    )?;
+                }
+                return Ok(());
+            }
+            ModuleInitializationState::Failed => {
+                return Err(self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("module initialization previously failed"),
+                    span,
+                ))
+            }
+            ModuleInitializationState::Uninitialized => {}
+        }
+        let order = self.module_initialization_order(root, image, span)?;
+        if let Err(error) = self.link_module_imports(&order, image, span) {
+            for module_index in &order {
+                self.module_states[*module_index as usize] = ModuleInitializationState::Failed;
+            }
+            return Err(error);
+        }
+        for module_index in &order {
+            for binding in self.module_globals[*module_index as usize].values() {
+                self.runtime
+                    .register_external_binding_root(&binding.cell, span)?;
+            }
+        }
+        let maximum = self.runtime.limits.max_call_depth.saturating_add(1).max(1);
+        let mut new_capacity = frames.capacity();
+        let mut new_length = frames.len();
+        for _ in &order {
+            new_capacity = frame_capacity_after_push(new_capacity, new_length, maximum)
+                .ok_or_else(|| self.runtime.error(RuntimeErrorKind::StackOverflow, span))?;
+            new_length += 1;
+        }
+        let function_bytes = order.iter().fold(0usize, |bytes, module_index| {
+            let function_index = image.modules[*module_index as usize].initializer_index as usize;
+            bytes.saturating_add(function_record_payload_bytes(
+                &image.functions[function_index],
+            ))
+        });
+        self.runtime.ensure_memory_budget(
+            new_capacity
+                .saturating_sub(frames.capacity())
+                .saturating_mul(size_of::<Frame>())
+                .saturating_add(function_bytes),
+            span,
+        )?;
+        if new_capacity > frames.capacity() {
+            frames
+                .try_reserve_exact(new_capacity.saturating_sub(frames.capacity()))
+                .map_err(|_| {
+                    self.runtime
+                        .error(RuntimeErrorKind::ResourceLimit("module frames"), span)
+                })?;
+        }
+        let stack_base = self.runtime.stack.len();
+        for module_index in order.iter().rev() {
+            let module = &image.modules[*module_index as usize];
+            let function_index = module.initializer_index as usize;
+            let function = image.functions[function_index].clone();
+            let scope_capacity = super::projected_capacity_after_push(
+                self.runtime.scopes.len(),
+                self.runtime.scopes.capacity(),
+            );
+            let scope_growth_bytes = scope_capacity
+                .saturating_sub(self.runtime.scopes.capacity())
+                .saturating_mul(size_of::<HashMap<BigInt, BindingCell>>());
+            self.runtime.ensure_memory_budget(
+                scope_growth_bytes
+                    .saturating_add(self.runtime.call_frame_bookkeeping_growth_bytes()),
+                span,
+            )?;
+            if scope_capacity > self.runtime.scopes.capacity() {
+                self.runtime
+                    .scopes
+                    .try_reserve_exact(scope_capacity.saturating_sub(self.runtime.scopes.len()))
+                    .map_err(|_| {
+                        self.runtime
+                            .error(RuntimeErrorKind::ResourceLimit("module scopes"), span)
+                    })?;
+            }
+            self.runtime.reserve_call_frame_bookkeeping(span)?;
+            let scope_floor = self.runtime.scopes.len();
+            self.runtime.scopes.push(HashMap::new());
+            self.runtime.scope_floors.push(scope_floor);
+            self.runtime.capture_vectors.push(Vec::new());
+            let mut frame = Frame::initializer_at(
+                *module_index,
+                function_index,
+                function,
+                stack_base,
+                scope_floor,
+                self.runtime.scopes.len(),
+            );
+            frame.return_action = ReturnAction::ModuleInit {
+                module_index: *module_index,
+                push_module: push_module && *module_index == root,
+            };
+            frames.push(frame);
+        }
+        for module_index in &order {
+            self.module_states[*module_index as usize] = ModuleInitializationState::Initializing;
+        }
+        self.update_external_frame_memory(frames);
+        Ok(())
+    }
+
+    fn import_module(
+        &mut self,
+        value: Value,
+        dynamic: bool,
+        image: &Image<'_>,
+        frames: &mut Vec<Frame>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        let name = match value {
+            Value::Bytes(bytes) if !dynamic => String::from_utf8(bytes).map_err(|_| {
+                self.runtime.error(
+                    RuntimeErrorKind::TypeError {
+                        expected: "UTF-8 module path Bytes",
+                        found: "invalid UTF-8 Bytes",
+                    },
+                    span,
+                )
+            })?,
+            Value::String(name) if dynamic => name,
+            other => {
+                return Err(self.runtime.type_error(
+                    if dynamic { "String" } else { "Bytes" },
+                    &other,
+                    span,
+                ))
+            }
+        };
+        if name.contains('\0') {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::TypeError {
+                    expected: "module path without NUL",
+                    found: "module path containing NUL",
+                },
+                span,
+            ));
+        }
+        let importer = frames
+            .last()
+            .map(|frame| frame.module_index)
+            .unwrap_or(image.entry_module);
+        let module_index = image.resolve_module_index(importer, &name).ok_or_else(|| {
+            self.runtime.error(
+                if !self
+                    .policy
+                    .granted_capabilities
+                    .contains(&Capability::EnvRead)
+                {
+                    RuntimeErrorKind::PermissionError("env.read")
+                } else if !self
+                    .policy
+                    .granted_capabilities
+                    .contains(&Capability::FsRead)
+                {
+                    RuntimeErrorKind::PermissionError("fs.read")
+                } else {
+                    RuntimeErrorKind::ReferenceError(
+                        "module is not present in the linked bytecode image",
+                    )
+                },
+                span,
+            )
+        })?;
+        if image.modules[module_index as usize]
+            .name
+            .starts_with("starpath/")
+            && !self
+                .policy
+                .granted_capabilities
+                .contains(&Capability::EnvRead)
+        {
+            return Err(self
+                .runtime
+                .error(RuntimeErrorKind::PermissionError("env.read"), span));
+        }
+        if image.modules[module_index as usize]
+            .name
+            .starts_with("starpath/")
+            && !self
+                .policy
+                .granted_capabilities
+                .contains(&Capability::FsRead)
+        {
+            return Err(self
+                .runtime
+                .error(RuntimeErrorKind::PermissionError("fs.read"), span));
+        }
+        self.schedule_module_initialization(module_index, true, image, frames, span)
+    }
+
+    fn module_get(
+        &mut self,
+        module_value: Value,
+        symbol_id: BigInt,
+        image: &Image<'_>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        let module_index = self.module_handle_index(module_value, span)?;
+        if self.module_states[module_index as usize] == ModuleInitializationState::Failed {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("module initialization previously failed"),
+                span,
+            ));
+        }
+        let export_kind = image.modules[module_index as usize]
+            .export_by_id(&symbol_id)
+            .map(|export| export.kind)
+            .or_else(|| {
+                self.module_exports[module_index as usize]
+                    .get(&symbol_id)
+                    .copied()
+            })
+            .ok_or_else(|| {
+                self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("symbol is not exported by module"),
+                    span,
+                )
+            })?;
+        let value = match export_kind {
+            0 => {
+                let binding = self.module_globals[module_index as usize]
+                    .get(&symbol_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        self.runtime.error(
+                            RuntimeErrorKind::ReferenceError("exported global does not exist"),
+                            span,
+                        )
+                    })?;
+                if !binding.initialized.get() {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::ReferenceError("exported global is not initialized"),
+                        span,
+                    ));
+                }
+                let payload_bytes = {
+                    let borrowed = binding.cell.borrow();
+                    super::estimated_unmanaged_payload_bytes(&borrowed.value, 0)
+                };
+                self.runtime.ensure_memory_budget(payload_bytes, span)?;
+                let value = binding.cell.borrow().value.clone();
+                value
+            }
+            1 => {
+                if image
+                    .module_function_index(module_index, &symbol_id)
+                    .is_none()
+                {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::ReferenceError("exported function does not exist"),
+                        span,
+                    ));
+                }
+                let payload_bytes = size_of::<FunctionRef>()
+                    .saturating_add(super::estimated_bigint_bytes(&symbol_id));
+                self.runtime.ensure_memory_budget(payload_bytes, span)?;
+                Value::Function(FunctionRef {
+                    module_index,
+                    id: symbol_id.clone(),
+                })
+            }
+            2 => {
+                if !self.runtime.structs.contains_key(&symbol_id) {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::ReferenceError("exported structure does not exist"),
+                        span,
+                    ));
+                }
+                Value::Int(symbol_id)
+            }
+            _ => {
+                return Err(self.runtime.error(
+                    RuntimeErrorKind::CompileError("unknown export kind".into()),
+                    span,
+                ))
+            }
+        };
+        self.runtime
+            .ensure_memory_budget(super::estimated_unmanaged_payload_bytes(&value, 0), span)?;
+        self.runtime.push_value(value, span)
+    }
+
+    fn module_call_request(
+        &mut self,
+        module_value: Value,
+        symbol_id: BigInt,
+        count: usize,
+        image: &Image<'_>,
+        span: Span,
+    ) -> Result<CallRequest, RuntimeError> {
+        let module_index = self.module_handle_index(module_value, span)?;
+        if self.module_states[module_index as usize] != ModuleInitializationState::Initialized {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("module call before initialization"),
+                span,
+            ));
+        }
+        let export_kind = image.modules[module_index as usize]
+            .export_by_id(&symbol_id)
+            .map(|export| export.kind)
+            .or_else(|| {
+                self.module_exports[module_index as usize]
+                    .get(&symbol_id)
+                    .copied()
+            })
+            .ok_or_else(|| {
+                self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("function is not exported by module"),
+                    span,
+                )
+            })?;
+        if export_kind != 1
+            || image
+                .module_function_index(module_index, &symbol_id)
+                .is_none()
+        {
+            return Err(self
+                .runtime
+                .type_error("exported Function", &Value::Null, span));
+        }
+        if count > self.runtime.stack.len() {
+            return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
+        }
+        let argument_bytes = count.saturating_mul(size_of::<Value>());
+        self.runtime.ensure_memory_budget(argument_bytes, span)?;
+        let mut arguments = Vec::new();
+        arguments.try_reserve_exact(count).map_err(|_| {
+            self.runtime.error(
+                RuntimeErrorKind::ResourceLimit("module call arguments"),
+                span,
+            )
+        })?;
+        for _ in 0..count {
+            arguments.push(self.runtime.pop(span)?);
+        }
+        arguments.reverse();
+        Ok(CallRequest {
+            module_index,
+            function_id: symbol_id,
+            arguments,
+            captures: Vec::new(),
+            return_action: ReturnAction::PushResult,
+        })
+    }
+
+    fn module_handle_index(&self, value: Value, span: Span) -> Result<u32, RuntimeError> {
+        let Value::Module(handle) = value else {
+            return Err(self.runtime.type_error("Module", &value, span));
+        };
+        if handle.execution_id != self.execution_id
+            || handle.module_index as usize >= self.module_states.len()
+        {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("module handle is stale or invalid"),
+                span,
+            ));
+        }
+        Ok(handle.module_index)
+    }
+
+    fn load_module_global(&mut self, module_index: u32, span: Span) -> Result<(), RuntimeError> {
+        let id = self.runtime.pop_identifier(span)?;
+        let binding = self
+            .module_globals
+            .get(module_index as usize)
+            .and_then(|globals| globals.get(&id))
+            .cloned()
+            .ok_or_else(|| {
+                self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("module global does not exist"),
+                    span,
+                )
+            })?;
+        if !binding.initialized.get() {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("module global is not initialized"),
+                span,
+            ));
+        }
+        let payload_bytes = {
+            let borrowed = binding.cell.borrow();
+            super::estimated_unmanaged_payload_bytes(&borrowed.value, 0)
+        };
+        self.runtime.ensure_memory_budget(payload_bytes, span)?;
+        let value = binding.cell.borrow().value.clone();
+        self.runtime.push_value(value, span)
+    }
+
+    fn store_module_global(&mut self, module_index: u32, span: Span) -> Result<(), RuntimeError> {
+        let id = self.runtime.pop_identifier(span)?;
+        let value = self.runtime.pop(span)?;
+        let globals = self
+            .module_globals
+            .get(module_index as usize)
+            .ok_or_else(|| {
+                self.runtime.error(
+                    RuntimeErrorKind::ReferenceError("module does not exist"),
+                    span,
+                )
+            })?;
+        let existing = globals.get(&id).cloned();
+        let old_payload_bytes = existing
+            .as_ref()
+            .filter(|binding| binding.initialized.get())
+            .map(|binding| {
+                let borrowed = binding.cell.borrow();
+                super::estimated_unmanaged_payload_bytes(&borrowed.value, 0)
+            })
+            .unwrap_or(0);
+        let new_payload_bytes = super::estimated_unmanaged_payload_bytes(&value, 0);
+        let globals_capacity = globals.capacity();
+        let projected_capacity = hash_map_capacity_after_insert(globals_capacity, globals.len());
+        let new_binding_bytes = if existing.is_none() {
+            module_global_binding_bytes(&id).saturating_add(
+                projected_capacity
+                    .saturating_sub(globals_capacity)
+                    .saturating_mul(size_of::<(BigInt, ModuleGlobalCell)>()),
+            )
+        } else {
+            0
+        };
+        let root_growth_bytes = if existing.is_none() {
+            let current_capacity = self.runtime.external_binding_roots.capacity();
+            super::projected_capacity_after_push(
+                self.runtime.external_binding_roots.len(),
+                current_capacity,
+            )
+            .saturating_sub(current_capacity)
+            .saturating_mul(size_of::<BindingCell>())
+        } else {
+            0
+        };
+        let additional_bytes = new_binding_bytes
+            .saturating_add(root_growth_bytes)
+            .saturating_add(new_payload_bytes.saturating_sub(old_payload_bytes));
+        self.runtime.ensure_memory_budget(additional_bytes, span)?;
+        if existing.is_none() {
+            self.module_globals[module_index as usize]
+                .try_reserve(1)
+                .map_err(|_| {
+                    self.runtime
+                        .error(RuntimeErrorKind::ResourceLimit("module globals"), span)
+                })?;
+            self.runtime
+                .external_binding_roots
+                .try_reserve(1)
+                .map_err(|_| {
+                    self.runtime
+                        .error(RuntimeErrorKind::ResourceLimit("module global roots"), span)
+                })?;
+        }
+        let actual_binding_bytes = if existing.is_none() {
+            module_global_binding_bytes(&id).saturating_add(
+                self.module_globals[module_index as usize]
+                    .capacity()
+                    .saturating_sub(globals_capacity)
+                    .saturating_mul(size_of::<(BigInt, ModuleGlobalCell)>()),
+            )
+        } else {
+            0
+        };
+        let binding = if let Some(binding) = existing {
+            binding
+        } else {
+            let binding = ModuleGlobalCell {
+                cell: binding_cell(Value::Null, true),
+                initialized: Rc::new(Cell::new(false)),
+            };
+            self.module_globals[module_index as usize].insert(id, binding.clone());
+            binding
+        };
+        if binding.initialized.get() && !binding.cell.borrow().mutable {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("cannot update an immutable global"),
+                span,
+            ));
+        }
+        binding.cell.borrow_mut().value = value;
+        binding.initialized.set(true);
+        self.runtime
+            .register_reserved_external_binding_root(&binding.cell);
+        self.module_dynamic_global_bytes = self
+            .module_dynamic_global_bytes
+            .saturating_add(actual_binding_bytes)
+            .saturating_add(new_payload_bytes)
+            .saturating_sub(old_payload_bytes);
+        self.sync_external_memory();
+        Ok(())
     }
 
     fn execute_image(&mut self, image: &Image<'_>) -> Result<Value, RuntimeError> {
         let entry = image.modules[image.entry_module as usize].initializer_index as usize;
         let entry_function = &image.functions[entry];
         let entry_span = image.span(entry, entry_function.code_offset);
+        let module_memory = image.modules.iter().fold(
+            image.modules.len().saturating_mul(
+                size_of::<ModuleInitializationState>()
+                    .saturating_add(size_of::<HashMap<BigInt, ModuleGlobalCell>>())
+                    .saturating_add(size_of::<HashMap<BigInt, u8>>()),
+            ),
+            |total, module| {
+                total
+                    .saturating_add(
+                        hash_map_capacity_for_items(module.globals.len())
+                            .saturating_mul(size_of::<(BigInt, ModuleGlobalCell)>()),
+                    )
+                    .saturating_add(module.globals.iter().fold(0usize, |bytes, global| {
+                        bytes.saturating_add(module_global_binding_bytes(&global.id))
+                    }))
+                    .saturating_add(
+                        hash_map_capacity_for_items(module.exports.len())
+                            .saturating_mul(size_of::<(BigInt, u8)>()),
+                    )
+                    .saturating_add(module.exports.iter().fold(0usize, |bytes, export| {
+                        bytes
+                            .saturating_add(super::estimated_bigint_bytes(&export.id))
+                            .saturating_add(size_of::<u8>())
+                    }))
+            },
+        );
+        self.runtime
+            .ensure_memory_budget(module_memory, entry_span)?;
+        self.module_memory_bytes = module_memory;
+        self.module_dynamic_global_bytes = 0;
+        self.module_dynamic_export_bytes = 0;
+        self.module_states.clear();
+        self.module_globals.clear();
+        self.module_exports.clear();
+        self.module_states
+            .try_reserve_exact(image.modules.len())
+            .map_err(|_| {
+                self.runtime
+                    .error(RuntimeErrorKind::ResourceLimit("module states"), entry_span)
+            })?;
+        self.module_states.resize(
+            image.modules.len(),
+            ModuleInitializationState::Uninitialized,
+        );
+        self.module_globals
+            .try_reserve_exact(image.modules.len())
+            .map_err(|_| {
+                self.runtime.error(
+                    RuntimeErrorKind::ResourceLimit("module globals"),
+                    entry_span,
+                )
+            })?;
+        self.module_exports
+            .try_reserve_exact(image.modules.len())
+            .map_err(|_| {
+                self.runtime.error(
+                    RuntimeErrorKind::ResourceLimit("module exports"),
+                    entry_span,
+                )
+            })?;
+        for module in &image.modules {
+            let mut globals = HashMap::new();
+            globals.try_reserve(module.globals.len()).map_err(|_| {
+                self.runtime.error(
+                    RuntimeErrorKind::ResourceLimit("module globals"),
+                    entry_span,
+                )
+            })?;
+            for spec in &module.globals {
+                globals.insert(
+                    spec.id.clone(),
+                    ModuleGlobalCell {
+                        cell: binding_cell(Value::Null, !spec.immutable),
+                        initialized: Rc::new(Cell::new(false)),
+                    },
+                );
+            }
+            self.module_globals.push(globals);
+            let mut exports = HashMap::new();
+            exports.try_reserve(module.exports.len()).map_err(|_| {
+                self.runtime.error(
+                    RuntimeErrorKind::ResourceLimit("module exports"),
+                    entry_span,
+                )
+            })?;
+            for export in &module.exports {
+                exports.insert(export.id.clone(), export.kind);
+            }
+            self.module_exports.push(exports);
+        }
+        self.sync_external_memory();
         let frame_capacity = frame_capacity_after_push(
             0,
             0,
@@ -236,7 +1092,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             self.runtime
                 .error(RuntimeErrorKind::ResourceLimit("call frames"), entry_span)
         })?;
-        frames.push(Frame::initializer(entry, entry_function.clone()));
+        self.schedule_module_initialization(
+            image.entry_module,
+            false,
+            image,
+            &mut frames,
+            entry_span,
+        )?;
         self.run_frames(image, &mut frames)
     }
 
@@ -342,8 +1204,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             .iter()
             .copied()
             .fold(0usize, usize::saturating_add);
-        self.runtime
-            .set_external_memory_bytes(frame_bytes.saturating_add(self.task_memory_bytes));
+        self.runtime.set_external_memory_bytes(
+            frame_bytes
+                .saturating_add(self.task_memory_bytes)
+                .saturating_add(self.module_memory_bytes)
+                .saturating_add(self.module_dynamic_global_bytes)
+                .saturating_add(self.module_dynamic_export_bytes),
+        );
     }
 
     fn enqueue_task(&mut self, request: CallRequest, span: Span) -> Result<u64, RuntimeError> {
@@ -557,7 +1424,12 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         }
     }
 
-    fn spawn_task(&mut self, span: Span, image: &Image<'_>) -> Result<(), RuntimeError> {
+    fn spawn_task(
+        &mut self,
+        span: Span,
+        image: &Image<'_>,
+        frames: &[Frame],
+    ) -> Result<(), RuntimeError> {
         if !self.runtime.host_services().task_creation_enabled() {
             return Err(self
                 .runtime
@@ -580,12 +1452,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             other => return Err(self.runtime.type_error("Function or Closure", &other, span)),
         };
         let function_index = image
-            .functions
-            .iter()
-            .position(|function| {
-                function.module_index == function_module
-                    && function.id.as_ref() == Some(function_id)
-            })
+            .module_function_index(function_module, function_id)
             .ok_or_else(|| {
                 self.runtime.error(
                     RuntimeErrorKind::ReferenceError("function does not exist"),
@@ -593,6 +1460,19 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 )
             })?;
         let function_record = &image.functions[function_index];
+        let caller_module = frames
+            .last()
+            .map_or(image.entry_module, |frame| frame.module_index);
+        let target_state = self.module_states[function_module as usize];
+        if target_state == ModuleInitializationState::Failed
+            || (target_state != ModuleInitializationState::Initialized
+                && caller_module != function_module)
+        {
+            return Err(self.runtime.error(
+                RuntimeErrorKind::ReferenceError("function scheduled before module initialization"),
+                span,
+            ));
+        }
         let parameter_count = function_record.parameter_ids.len();
         let required = if function_record.rest_parameter_code == 0 {
             parameter_count
@@ -854,6 +1734,14 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 match action {
                     ReturnAction::PushResult => self.runtime.push_value(value, span)?,
                     ReturnAction::PushValue(value) => self.runtime.push_value(value, span)?,
+                    ReturnAction::ModuleInit { .. } => {
+                        return Err(self.runtime.error(
+                            RuntimeErrorKind::CompileError(
+                                "module initializer used RETURN_TOP".into(),
+                            ),
+                            span,
+                        ))
+                    }
                 }
             }
             Instruction::Halt => {
@@ -863,7 +1751,36 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         span,
                     ));
                 }
-                return Ok(Some(Value::Null));
+                let frame = frames.pop().expect("module initializer frame");
+                let ReturnAction::ModuleInit {
+                    module_index,
+                    push_module,
+                } = frame.return_action
+                else {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::CompileError(
+                            "invalid module initializer return action".into(),
+                        ),
+                        span,
+                    ));
+                };
+                self.module_states[module_index as usize] = ModuleInitializationState::Initialized;
+                self.runtime.stack.truncate(frame.stack_base);
+                self.runtime.scopes.truncate(frame.scope_floor);
+                self.runtime.scope_floors.pop();
+                self.runtime.capture_vectors.pop();
+                if push_module {
+                    self.runtime.push_value(
+                        Value::Module(ModuleHandle {
+                            execution_id: self.execution_id,
+                            module_index,
+                        }),
+                        span,
+                    )?;
+                }
+                if frames.is_empty() {
+                    return Ok(Some(Value::Null));
+                }
             }
             Instruction::Trap => {
                 return Err(self
@@ -1007,10 +1924,14 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         self.runtime.stack.truncate(frame.stack_base);
         self.runtime.scopes.truncate(frame.scope_floor);
         self.runtime.scope_floors.pop();
-        self.runtime.frame_stack_bases.pop();
         self.runtime.capture_vectors.pop();
-        self.runtime.call_depth = self.runtime.call_depth.saturating_sub(1);
-        self.runtime.call_trace.pop();
+        if frame.initializer {
+            self.module_states[frame.module_index as usize] = ModuleInitializationState::Failed;
+        } else {
+            self.runtime.frame_stack_bases.pop();
+            self.runtime.call_depth = self.runtime.call_depth.saturating_sub(1);
+            self.runtime.call_trace.pop();
+        }
     }
 
     fn error_for(
@@ -1220,12 +2141,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         task_entry: bool,
     ) -> Result<(), RuntimeError> {
         let function_index = image
-            .functions
-            .iter()
-            .position(|function| {
-                function.module_index == request.module_index
-                    && function.id.as_ref() == Some(&request.function_id)
-            })
+            .module_function_index(request.module_index, &request.function_id)
             .ok_or_else(|| {
                 self.runtime.error(
                     RuntimeErrorKind::ReferenceError("function does not exist"),
@@ -1968,8 +2884,8 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             Declare => self.runtime.declare(span, true)?,
             Const => self.runtime.declare(span, false)?,
             Delete => self.runtime.delete(span)?,
-            LoadGlobal => self.runtime.load(span, true)?,
-            StoreGlobal => self.runtime.store_global(span)?,
+            LoadGlobal => self.load_module_global(module_index, span)?,
+            StoreGlobal => self.store_module_global(module_index, span)?,
             StructDef => self.runtime.define_struct(span)?,
             MethodDef => {
                 let function_ids = image
@@ -2016,9 +2932,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 if count > self.runtime.stack.len() {
                     return Err(self.runtime.error(RuntimeErrorKind::StackUnderflow, span));
                 }
-                self.runtime
-                    .ensure_memory_budget(count.saturating_mul(size_of::<Value>()), span)?;
-                let mut arguments = Vec::with_capacity(count);
+                let argument_bytes = count.saturating_mul(size_of::<Value>());
+                self.runtime.ensure_memory_budget(argument_bytes, span)?;
+                let mut arguments = Vec::new();
+                arguments.try_reserve_exact(count).map_err(|_| {
+                    self.runtime
+                        .error(RuntimeErrorKind::ResourceLimit("object arguments"), span)
+                })?;
                 for _ in 0..count {
                     arguments.push(self.runtime.pop(span)?);
                 }
@@ -2151,7 +3071,13 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             }
             ObjectIs => self.runtime.object_is(span)?,
             ObjectClone => self.runtime.object_clone(span)?,
-            Capture => self.runtime.capture(span)?,
+            Capture => {
+                let id = self.runtime.pop_identifier(span)?;
+                let global = self.module_globals[module_index as usize]
+                    .get(&id)
+                    .map(|binding| binding.cell.clone());
+                self.runtime.capture_module_global(id, global, span)?;
+            }
             Lambda => {
                 let parameter_count = self
                     .runtime
@@ -2230,6 +3156,30 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         return Err(self.runtime.type_error("Function or Closure", &other, span))
                     }
                 };
+                let caller_module = frames
+                    .last()
+                    .map_or(image.entry_module, |frame| frame.module_index);
+                let target_state = self
+                    .module_states
+                    .get(function.module_index as usize)
+                    .copied()
+                    .ok_or_else(|| {
+                        self.runtime.error(
+                            RuntimeErrorKind::ReferenceError("function module does not exist"),
+                            span,
+                        )
+                    })?;
+                if target_state == ModuleInitializationState::Failed
+                    || (target_state != ModuleInitializationState::Initialized
+                        && caller_module != function.module_index)
+                {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::ReferenceError(
+                            "function called before module initialization",
+                        ),
+                        span,
+                    ));
+                }
                 return Ok(Some(CallRequest {
                     module_index: function.module_index,
                     function_id: function.id,
@@ -2269,7 +3219,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                 let result = self.await_task(image, id, span)?;
                 self.runtime.push_value(result, span)?;
             }
-            Spawn => self.spawn_task(span, image)?,
+            Spawn => self.spawn_task(span, image, frames)?,
             Yield => {
                 if self.current_task_id.is_none() {
                     return Err(self.runtime.error(
@@ -2291,7 +3241,102 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
             MutexLock => self.lock_mutex(image, span)?,
             MutexUnlock => self.unlock_mutex(span)?,
             Import | ImportDynamic => {
-                return Err(self.unsupported(span, "module import resolution"))
+                let dynamic = operation == ImportDynamic;
+                let value = self.runtime.pop(span)?;
+                self.import_module(value, dynamic, image, frames, span)?;
+            }
+            Export => {
+                let id = self.runtime.pop_identifier(span)?;
+                let module_index = module_index as usize;
+                let global = self.module_globals[module_index].contains_key(&id);
+                let structure = self.runtime.structs.contains_key(&id);
+                let function = image
+                    .module_function_index(module_index as u32, &id)
+                    .is_some();
+                let kind = match (global, function, structure) {
+                    (true, false, false) => 0,
+                    (false, true, false) => 1,
+                    (false, false, true) => 2,
+                    (false, false, false) => {
+                        return Err(self.runtime.error(
+                            RuntimeErrorKind::ReferenceError("symbol is not declared for export"),
+                            span,
+                        ))
+                    }
+                    _ => {
+                        return Err(self.runtime.error(
+                            RuntimeErrorKind::CompileError("export identifier is ambiguous".into()),
+                            span,
+                        ))
+                    }
+                };
+                let static_kind = image.modules[module_index]
+                    .export_by_id(&id)
+                    .map(|export| export.kind);
+                if static_kind.is_some_and(|static_kind| static_kind != kind) {
+                    return Err(self.runtime.error(
+                        RuntimeErrorKind::CompileError(
+                            "export kind disagrees with module table".into(),
+                        ),
+                        span,
+                    ));
+                }
+                if static_kind.is_none() {
+                    if self.module_exports[module_index].contains_key(&id) {
+                        return Err(self.runtime.error(
+                            RuntimeErrorKind::ReferenceError("symbol is already exported"),
+                            span,
+                        ));
+                    }
+                    let export_bytes = size_of::<(BigInt, u8)>()
+                        .saturating_add(super::estimated_bigint_bytes(&id));
+                    let exports = &self.module_exports[module_index];
+                    let current_capacity = exports.capacity();
+                    let projected_capacity =
+                        hash_map_capacity_after_insert(current_capacity, exports.len());
+                    let projected_bytes = export_bytes.saturating_add(
+                        projected_capacity
+                            .saturating_sub(current_capacity)
+                            .saturating_mul(size_of::<(BigInt, u8)>()),
+                    );
+                    self.runtime.ensure_memory_budget(projected_bytes, span)?;
+                    self.module_exports[module_index]
+                        .try_reserve(1)
+                        .map_err(|_| {
+                            self.runtime
+                                .error(RuntimeErrorKind::ResourceLimit("module exports"), span)
+                        })?;
+                    let actual_bytes = export_bytes.saturating_add(
+                        self.module_exports[module_index]
+                            .capacity()
+                            .saturating_sub(current_capacity)
+                            .saturating_mul(size_of::<(BigInt, u8)>()),
+                    );
+                    self.module_exports[module_index].insert(id, kind);
+                    self.module_dynamic_export_bytes = self
+                        .module_dynamic_export_bytes
+                        .saturating_add(actual_bytes);
+                    self.sync_external_memory();
+                }
+            }
+            ModuleGet => {
+                let id = self.runtime.pop_identifier(span)?;
+                let module = self.runtime.pop(span)?;
+                self.module_get(module, id, image, span)?;
+            }
+            ModuleCall => {
+                let id = self.runtime.pop_identifier(span)?;
+                let module = self.runtime.pop(span)?;
+                let count = self
+                    .runtime
+                    .pop_count(span, "nonnegative Int argument count")?;
+                let request = self.module_call_request(module, id, count, image, span)?;
+                return Ok(Some(request));
+            }
+            ModuleInit => {
+                let module = self.runtime.pop(span)?;
+                let module_index = self.module_handle_index(module, span)?;
+                self.schedule_module_initialization(module_index, false, image, frames, span)?;
             }
             NativeLoad => self.runtime.execute_native_instruction(0xB0, span, None)?,
             NativeSymbol => self.runtime.execute_native_instruction(0xB1, span, None)?,
@@ -2620,8 +3665,44 @@ struct FunctionRecord {
 
 #[derive(Clone, Debug)]
 struct ModuleRecord {
+    name: String,
     initializer_index: u32,
-    has_imports: bool,
+    first_function_index: u32,
+    function_count: u32,
+    globals: Vec<ModuleGlobalSpec>,
+    imports: Vec<ModuleImportSpec>,
+    exports: Vec<ModuleExportSpec>,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleGlobalSpec {
+    id: BigInt,
+    immutable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleImportSpec {
+    module_name: String,
+    symbol_name: String,
+    local_id: BigInt,
+    kind: u8,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleExportSpec {
+    name: String,
+    id: BigInt,
+    kind: u8,
+}
+
+impl ModuleRecord {
+    fn export_by_id(&self, id: &BigInt) -> Option<&ModuleExportSpec> {
+        self.exports.iter().find(|export| &export.id == id)
+    }
+
+    fn export_by_name(&self, name: &str) -> Option<&ModuleExportSpec> {
+        self.exports.iter().find(|export| export.name == name)
+    }
 }
 
 struct Image<'a> {
@@ -2654,15 +3735,9 @@ struct PendingException {
 impl<'a> Image<'a> {
     fn parse(program: &VerifiedProgram<'a>) -> Result<Self, String> {
         let bytes = program.bytes();
-        if program.module_count != 1 {
-            return Err("the runtime slice supports one module".into());
-        }
         let sections = sections(bytes)?;
         let constants = parse_constants(section(bytes, &sections, 1)?)?;
-        let (modules, entry_module) = parse_modules(section(bytes, &sections, 2)?)?;
-        if modules.iter().any(|module| module.has_imports) {
-            return Err("module imports are not implemented by this runtime slice".into());
-        }
+        let (modules, entry_module) = parse_modules(section(bytes, &sections, 2)?, &constants)?;
         let functions = parse_functions(section(bytes, &sections, 3)?, &constants)?;
         let exceptions = parse_exceptions(section(bytes, &sections, 6)?)?;
         let code = section(bytes, &sections, 4)?;
@@ -2688,6 +3763,93 @@ impl<'a> Image<'a> {
             entry_module,
             source_spans,
         })
+    }
+
+    fn module_index(&self, name: &str) -> Option<u32> {
+        self.modules
+            .iter()
+            .position(|module| module.name == name)
+            .and_then(|index| u32::try_from(index).ok())
+    }
+
+    fn resolve_module_index(&self, importer: u32, request: &str) -> Option<u32> {
+        if request.is_empty() || request.starts_with('/') || request.contains('\\') {
+            return None;
+        }
+        let mut prefixes = Vec::new();
+        if let Some(module) = self.modules.get(importer as usize) {
+            if let Some((parent, _)) = module.name.rsplit_once('/') {
+                prefixes.push(parent.to_owned());
+            }
+        }
+        prefixes.push("src".to_owned());
+        let mut dependency_names: Vec<_> = self
+            .modules
+            .iter()
+            .filter_map(|module| {
+                let rest = module.name.strip_prefix("deps/")?;
+                let mut components = rest.splitn(3, '/');
+                let name = components.next()?;
+                let version = components.next()?;
+                if components.next()? != "src" {
+                    return None;
+                }
+                Some((name.to_owned(), version.to_owned()))
+            })
+            .collect();
+        dependency_names.sort();
+        dependency_names.dedup();
+        prefixes.extend(
+            dependency_names
+                .into_iter()
+                .map(|(name, version)| format!("deps/{name}/{version}/src")),
+        );
+        prefixes.push("stdlib".to_owned());
+        let mut star_paths: Vec<_> = self
+            .modules
+            .iter()
+            .filter_map(|module| {
+                let rest = module.name.strip_prefix("starpath/")?;
+                let (index, _) = rest.split_once('/')?;
+                Some(format!("starpath/{index}"))
+            })
+            .collect();
+        star_paths.sort_by_key(|path| {
+            path.strip_prefix("starpath/")
+                .and_then(|index| index.parse::<usize>().ok())
+                .unwrap_or(usize::MAX)
+        });
+        star_paths.dedup();
+        prefixes.extend(star_paths);
+
+        let mut seen = HashSet::new();
+        for prefix in prefixes {
+            let Some(base) = normalize_module_key(&prefix, request) else {
+                continue;
+            };
+            for candidate in with_source_extensions(base) {
+                if !seen.insert(candidate.clone()) {
+                    continue;
+                }
+                if let Some(index) = self.module_index(&candidate) {
+                    return Some(index);
+                }
+            }
+        }
+        None
+    }
+
+    fn module_function_index(&self, module_index: u32, id: &BigInt) -> Option<usize> {
+        let module = self.modules.get(module_index as usize)?;
+        let start = usize::try_from(module.first_function_index).ok()?;
+        let end = start.checked_add(usize::try_from(module.function_count).ok()?)?;
+        self.functions
+            .get(start..end)?
+            .iter()
+            .position(|function| {
+                function.module_index == module_index && function.id.as_ref() == Some(id)
+            })
+            .map(|offset| start + offset)
     }
 
     fn span(&self, function_index: usize, code_offset: usize) -> Span {
@@ -2716,21 +3878,31 @@ struct Frame {
 }
 
 impl Frame {
-    fn initializer(function_index: usize, function: FunctionRecord) -> Self {
+    fn initializer_at(
+        module_index: u32,
+        function_index: usize,
+        function: FunctionRecord,
+        stack_base: usize,
+        scope_floor: usize,
+        base_scope_depth: usize,
+    ) -> Self {
         Self {
             function_index,
-            module_index: function.module_index,
+            function,
+            module_index,
             ip: 0,
-            stack_base: 0,
-            scope_floor: 1,
-            base_scope_depth: 1,
+            stack_base,
+            scope_floor,
+            base_scope_depth,
             initializer: true,
-            return_action: ReturnAction::PushResult,
+            return_action: ReturnAction::ModuleInit {
+                module_index,
+                push_module: false,
+            },
             loop_states: HashMap::new(),
             call_site_offset: 0,
             pending_exceptions: Vec::new(),
             active_exceptions: HashMap::new(),
-            function,
         }
     }
 
@@ -2759,6 +3931,57 @@ impl Frame {
             function,
         }
     }
+}
+
+fn normalize_module_key(prefix: &str, request: &str) -> Option<String> {
+    let mut components: Vec<&str> = prefix
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    for component in request.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            value if value.contains(':') => return None,
+            value => components.push(value),
+        }
+    }
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
+fn with_source_extensions(base: String) -> Vec<String> {
+    if base.ends_with(".star") || base.ends_with(".starc") {
+        vec![base]
+    } else {
+        vec![format!("{base}.star"), format!("{base}.starc")]
+    }
+}
+
+fn hash_map_capacity_after_insert(current_capacity: usize, current_len: usize) -> usize {
+    if current_len < current_capacity {
+        current_capacity
+    } else if current_capacity == 0 {
+        3
+    } else {
+        current_capacity.saturating_mul(2).saturating_add(1)
+    }
+}
+
+fn hash_map_capacity_for_items(item_count: usize) -> usize {
+    if item_count == 0 {
+        0
+    } else {
+        item_count.saturating_mul(2).saturating_add(1)
+    }
+}
+
+fn module_global_binding_bytes(id: &BigInt) -> usize {
+    size_of::<BigInt>()
+        .saturating_add(super::estimated_bigint_bytes(id))
+        .saturating_add(size_of::<RefCell<Binding>>())
+        .saturating_add(size_of::<Binding>())
+        .saturating_add(size_of::<Cell<bool>>())
+        .saturating_add(4 * size_of::<usize>())
 }
 
 fn frame_capacity_after_push(
@@ -2876,6 +4099,7 @@ fn frame_storage_bytes(frames: &[Frame], capacity: usize) -> usize {
                 ReturnAction::PushValue(value) => {
                     super::estimated_unmanaged_payload_bytes(value, 0)
                 }
+                ReturnAction::ModuleInit { .. } => 0,
             };
             total
                 .saturating_add(function_record_payload_bytes(&frame.function))
@@ -2927,6 +4151,10 @@ struct CallRequest {
 enum ReturnAction {
     PushResult,
     PushValue(Value),
+    ModuleInit {
+        module_index: u32,
+        push_module: bool,
+    },
 }
 
 fn bytecode_task_memory_bytes(
@@ -2979,6 +4207,7 @@ fn call_request_memory_bytes(request: &CallRequest) -> usize {
         + match &request.return_action {
             ReturnAction::PushResult => 0,
             ReturnAction::PushValue(value) => super::estimated_unmanaged_payload_bytes(value, 0),
+            ReturnAction::ModuleInit { .. } => 0,
         }
 }
 
@@ -3135,34 +4364,59 @@ fn parse_exceptions(bytes: &[u8]) -> Result<Vec<ExceptionRegion>, String> {
     Ok(regions)
 }
 
-fn parse_modules(bytes: &[u8]) -> Result<(Vec<ModuleRecord>, u32), String> {
+fn parse_modules(bytes: &[u8], constants: &[Constant]) -> Result<(Vec<ModuleRecord>, u32), String> {
     let mut reader = Cursor::new(bytes);
     let count = reader.count()?;
     let entry = reader.u32()?;
     let mut modules = Vec::with_capacity(count);
     for _ in 0..count {
-        reader.u32()?; // name constant
+        let name = constant_string(constants, reader.u32()?)?;
         let initializer_index = reader.u32()?;
-        reader.u32()?; // first function
-        reader.u32()?; // function count
+        let first_function_index = reader.u32()?;
+        let function_count = reader.u32()?;
         reader.u32()?; // flags
         let globals = reader.count()?;
-        reader.skip(globals.checked_mul(8).ok_or("global table overflow")?)?;
+        let mut global_specs = Vec::with_capacity(globals);
+        for _ in 0..globals {
+            let id = constant_integer(constants, reader.u32()?)?;
+            let flags = reader.u32()?;
+            global_specs.push(ModuleGlobalSpec {
+                id,
+                immutable: flags & 1 != 0,
+            });
+        }
         let import_count = reader.count()?;
-        reader.skip(
-            import_count
-                .checked_mul(16)
-                .ok_or("import table overflow")?,
-        )?;
+        let mut imports = Vec::with_capacity(import_count);
+        for _ in 0..import_count {
+            let module_name = constant_string(constants, reader.u32()?)?;
+            let symbol_name = constant_string(constants, reader.u32()?)?;
+            let local_id = constant_integer(constants, reader.u32()?)?;
+            let kind = reader.u8()?;
+            reader.skip(3)?;
+            imports.push(ModuleImportSpec {
+                module_name,
+                symbol_name,
+                local_id,
+                kind,
+            });
+        }
         let export_count = reader.count()?;
-        reader.skip(
-            export_count
-                .checked_mul(12)
-                .ok_or("export table overflow")?,
-        )?;
+        let mut exports = Vec::with_capacity(export_count);
+        for _ in 0..export_count {
+            let name = constant_string(constants, reader.u32()?)?;
+            let id = constant_integer(constants, reader.u32()?)?;
+            let kind = reader.u8()?;
+            reader.skip(3)?;
+            exports.push(ModuleExportSpec { name, id, kind });
+        }
         modules.push(ModuleRecord {
+            name,
             initializer_index,
-            has_imports: import_count != 0,
+            first_function_index,
+            function_count,
+            globals: global_specs,
+            imports,
+            exports,
         });
     }
     reader.finish("ModuleTable")?;
@@ -3170,6 +4424,13 @@ fn parse_modules(bytes: &[u8]) -> Result<(Vec<ModuleRecord>, u32), String> {
         return Err("entry module index out of range".into());
     }
     Ok((modules, entry))
+}
+
+fn constant_string(constants: &[Constant], index: u32) -> Result<String, String> {
+    match constants.get(index as usize) {
+        Some(Constant::Value(Value::String(value))) => Ok(value.clone()),
+        _ => Err("string constant reference is invalid".into()),
+    }
 }
 
 fn parse_functions(bytes: &[u8], constants: &[Constant]) -> Result<Vec<FunctionRecord>, String> {

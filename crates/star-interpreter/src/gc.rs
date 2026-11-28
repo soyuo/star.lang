@@ -337,6 +337,7 @@ impl GcHeap {
         stack: &Vec<Value>,
         scopes: &Vec<HashMap<BigInt, BindingCell>>,
         capture_vectors: &Vec<Vec<(BigInt, BindingCell)>>,
+        external_binding_roots: &Vec<BindingCell>,
         limit: usize,
     ) -> Result<usize, GcError> {
         let mut meter = MemoryEstimator::with_limit(limit);
@@ -390,6 +391,11 @@ impl GcHeap {
                 }
             }
         }
+        meter.charge(
+            external_binding_roots
+                .capacity()
+                .saturating_mul(size_of::<BindingCell>()),
+        );
         for node in self.nodes.iter().filter_map(WeakNode::upgrade) {
             let value = match node {
                 StrongNode::Array(value) => Value::Array(value),
@@ -461,6 +467,7 @@ impl GcHeap {
         stack: &[Value],
         scopes: &[HashMap<BigInt, BindingCell>],
         capture_vectors: &[Vec<(BigInt, BindingCell)>],
+        external_binding_roots: &[BindingCell],
     ) -> Result<GcStats, GcError> {
         let live_nodes = self
             .nodes
@@ -482,6 +489,9 @@ impl GcHeap {
                 count_binding_cell(cell, &mut incoming, &mut counted_cells)?;
             }
         }
+        for cell in external_binding_roots {
+            count_binding_cell(cell, &mut incoming, &mut counted_cells)?;
+        }
         for node in &live_nodes {
             node.count_children(&mut incoming, &mut counted_cells)?;
         }
@@ -500,6 +510,9 @@ impl GcHeap {
             for (_, cell) in capture_vector {
                 trace_binding_cell(cell, &mut marked, &mut seen_cells)?;
             }
+        }
+        for cell in external_binding_roots {
+            trace_binding_cell(cell, &mut marked, &mut seen_cells)?;
         }
         for node in &live_nodes {
             // `live_nodes` contributes one temporary strong handle per node.
@@ -807,7 +820,8 @@ impl MemoryEstimator {
             | Value::Handle(_)
             | Value::Task(_)
             | Value::Channel(_)
-            | Value::Mutex(_) => {}
+            | Value::Mutex(_)
+            | Value::Module(_) => {}
         }
         Ok(())
     }
