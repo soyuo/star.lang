@@ -580,7 +580,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "star-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -596,11 +596,11 @@ dependencies = [
 
 [[package]]
 name = "star-common"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "star-compiler"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "star-interpreter"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cap-std",
  "http",
@@ -630,14 +630,14 @@ dependencies = [
 
 [[package]]
 name = "star-lexer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "star-common",
 ]
 
 [[package]]
 name = "star-lsp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "lsp-server",
  "lsp-types",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "star-package"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "semver",
  "serde",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "star-parser"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "star-common",
  "star-lexer",
