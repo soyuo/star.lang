@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufReader, Cursor, Write};
@@ -7,12 +8,13 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 mod dap;
+mod package_commands;
 mod source_lowering;
 mod source_tools;
 
 use star_compiler::{
-    compile, disassemble_bytecode, verify_bytecode, Capability, VerificationLimits,
-    VerificationPolicy,
+    compile, compile_modules, disassemble_bytecode, verify_bytecode, Capability, CompileModule,
+    ModuleIr, VerificationLimits, VerificationPolicy,
 };
 use star_interpreter::{
     runtime::{
@@ -23,6 +25,7 @@ use star_interpreter::{
     semantic::analyze,
 };
 use star_lexer::{normalize_source, LexMode};
+use star_package::{locate_manifest, Manifest, Permissions, ResolvedPackage};
 use star_parser::{parse, ParseErrorKind};
 
 const EXIT_OK: u8 = 0;
@@ -41,6 +44,9 @@ Star command line
 Usage:
   star new <directory>
   star init [package-name]
+  star add <name> [--version <requirement>|--path <directory>|--git <url> --rev <commit>]
+  star remove <name>
+  star install | update | search <query> | package | publish | audit
   star check [<file.star|file.starc>] [options]
   star build [<file.star>] [--output <file.starc>] [options]
   star run [<file.star|file.starc>] [options]
@@ -153,6 +159,8 @@ fn run(args: Vec<String>) -> u8 {
                 EXIT_USAGE
             }
         },
+        "add" | "remove" | "install" | "update" | "search" | "package" | "publish" | "audit"
+        | "login" => package_commands::run(command, &args[1..]),
         "run" => match parse_run_options(&args[1..]) {
             Ok(options) => run_file(options),
             Err(message) => {
@@ -762,33 +770,50 @@ fn validate_project_name(name: &str) -> Result<(), String> {
 }
 
 fn create_project(directory: &Path, name: &str, create_directory: bool) -> u8 {
-    let manifest = directory.join("Star.toml");
+    let manifest = directory.join(star_package::MANIFEST_FILE);
     let source_dir = directory.join("src");
     let source = source_dir.join("main.star");
+    let library = source_dir.join("lib.star");
+    let example_dir = directory.join("examples");
+    let example = example_dir.join("hello.star");
     let gitignore = directory.join(".gitignore");
-    for path in [&manifest, &source, &gitignore] {
+    for path in [&manifest, &source, &library, &example, &gitignore] {
         if path.exists() {
             eprintln!("{}: project file already exists", path.display());
             return EXIT_IO;
         }
     }
+    if directory.join("Star.toml").exists() {
+        eprintln!(
+            "{}: project manifest already exists",
+            directory.join("Star.toml").display()
+        );
+        return EXIT_IO;
+    }
     if create_directory && directory.exists() {
         eprintln!("{}: project directory already exists", directory.display());
         return EXIT_IO;
     }
-    if let Err(error) = fs::create_dir_all(&source_dir) {
+    if let Err(error) =
+        fs::create_dir_all(&source_dir).and_then(|()| fs::create_dir_all(&example_dir))
+    {
         eprintln!("{}: {error}", source_dir.display());
         return EXIT_IO;
     }
     let source_bits = "010010000110010101101100011011000110111100101100001000000101001101110100011000010111001000100001";
     let source_text = format!("\"{source_bits}\"******'\n");
     let manifest_text = format!(
-        "schema_version = 1\n\n[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nentry = \"src/main.star\"\n"
+        "schema_version = 1\n\n[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"1\"\ndescription = \"A Star language project\"\n\n[build]\nentry = \"src/main.star\"\ntarget = \"bytecode\"\noptimization = 0\n\n[dependencies]\n\n[permissions]\nfilesystem = false\nnetwork = false\nprocess = false\nffi = false\nenvironment = false\n"
     );
     for (path, contents) in [
         (&manifest, manifest_text.as_bytes()),
         (&source, source_text.as_bytes()),
-        (&gitignore, b"/target/\n/src/*.starc\n".as_slice()),
+        (&library, b"".as_slice()),
+        (&example, source_text.as_bytes()),
+        (
+            &gitignore,
+            b"/target/\n/deps/\n/.star/\n/src/*.starc\n".as_slice(),
+        ),
     ] {
         if let Err(error) = fs::write(path, contents) {
             eprintln!("{}: {error}", path.display());
@@ -1099,11 +1124,17 @@ fn check_file(options: RunOptions) -> u8 {
             }
         }
         Some("star") => {
-            let program = match parse_source(&options.path, &bytes, options.strict) {
-                Ok(program) => program,
-                Err(code) => return code,
+            let compilation = if package_root_for(&options.path).is_some() {
+                compile_project_source(&options.path, options.strict, options.limits.clone())
+                    .map(|(bytecode, _)| bytecode)
+            } else {
+                let program = match parse_source(&options.path, &bytes, options.strict) {
+                    Ok(program) => program,
+                    Err(code) => return code,
+                };
+                compile_source_program(&options.path, &program, options.limits.clone())
             };
-            match compile_source_program(&options.path, &program, options.limits) {
+            match compilation {
                 Ok(_) => {
                     println!("{}: valid source", options.path.display());
                     EXIT_OK
@@ -1132,15 +1163,21 @@ fn build_file(options: BuildOptions) -> u8 {
         );
         return EXIT_USAGE;
     }
-    let bytes = match read_limited_file(&options.path, options.limits.max_memory_bytes) {
-        Ok(bytes) => bytes,
-        Err(code) => return code,
+    let bytecode_result = if package_root_for(&options.path).is_some() {
+        compile_project_source(&options.path, options.strict, options.limits.clone())
+            .map(|(bytecode, _)| bytecode)
+    } else {
+        let bytes = match read_limited_file(&options.path, options.limits.max_memory_bytes) {
+            Ok(bytes) => bytes,
+            Err(code) => return code,
+        };
+        let program = match parse_source(&options.path, &bytes, options.strict) {
+            Ok(program) => program,
+            Err(code) => return code,
+        };
+        compile_source_program(&options.path, &program, options.limits.clone())
     };
-    let program = match parse_source(&options.path, &bytes, options.strict) {
-        Ok(program) => program,
-        Err(code) => return code,
-    };
-    let bytecode = match compile_source_program(&options.path, &program, options.limits) {
+    let bytecode = match bytecode_result {
         Ok(bytecode) => bytecode,
         Err(error) => {
             eprintln!("{}: {error}", options.path.display());
@@ -1197,6 +1234,320 @@ fn compile_source_program(
         compile(&module, module_name, &source_file).map_err(|error| error.to_string())?;
     verify_bytecode(&bytecode, &verification_policy(&limits)).map_err(|error| error.to_string())?;
     Ok(bytecode)
+}
+
+struct ProjectModuleBuild {
+    ir: ModuleIr,
+    name: String,
+    source_file: String,
+}
+
+fn resolve_project_packages(
+    root: &Path,
+    manifest: &Manifest,
+) -> Result<Vec<ResolvedPackage>, String> {
+    if manifest.dependencies.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lock = star_package::read_lock(root)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "star.lock is missing; run `star install`".to_owned())?;
+    let (resolved_lock, mut packages) = star_package::resolve_dependencies_from_lock(
+        root,
+        &package_commands::local_registry(),
+        &lock,
+    )
+    .map_err(|error| error.to_string())?;
+    if resolved_lock != lock {
+        return Err("star.lock does not match the manifest; run `star update`".to_owned());
+    }
+    for package in &mut packages {
+        let installed = if package.locked.source.starts_with("path+") {
+            package.root.clone()
+        } else {
+            root.join("deps")
+                .join(&package.locked.name)
+                .join(&package.locked.version)
+        };
+        let installed = installed.canonicalize().map_err(|error| {
+            format!(
+                "dependency `{}` is not installed; run `star install`: {error}",
+                package.locked.name
+            )
+        })?;
+        if !installed.starts_with(root) {
+            return Err(format!(
+                "dependency `{}` escapes the project root",
+                package.locked.name
+            ));
+        }
+        let checksum =
+            star_package::source_checksum(&installed).map_err(|error| error.to_string())?;
+        if checksum != package.locked.checksum {
+            return Err(format!(
+                "installed dependency `{}` checksum does not match star.lock; run `star install`",
+                package.locked.name
+            ));
+        }
+        let installed_manifest = Manifest::read(&installed).map_err(|error| error.to_string())?;
+        if installed_manifest.package.name != package.locked.name
+            || installed_manifest.package.version != package.locked.version
+        {
+            return Err(format!(
+                "installed dependency `{}` has a mismatched manifest identity",
+                package.locked.name
+            ));
+        }
+        package.root = installed;
+    }
+    Ok(packages)
+}
+
+fn compile_project_source(
+    entry_path: &Path,
+    strict: bool,
+    limits: ExecutionLimits,
+) -> Result<(Vec<u8>, VerificationPolicy), String> {
+    let root = package_root_for(entry_path)
+        .ok_or_else(|| "source file is not inside a Star project".to_owned())?;
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve project root: {error}"))?;
+    let entry = entry_path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve entry source: {error}"))?;
+    if !entry.starts_with(&root) {
+        return Err("entry source escapes its project root".to_owned());
+    }
+    let manifest = Manifest::read(&root).map_err(|error| error.to_string())?;
+    let resolved_packages = resolve_project_packages(&root, &manifest)?;
+    let mut named_paths = Vec::new();
+    let mut seen_paths = HashSet::new();
+    let mut project_paths = Vec::new();
+    collect_star_sources(&root.join("src"), &mut project_paths)
+        .map_err(|error| error.to_string())?;
+    project_paths.push(entry.clone());
+    for path in project_paths {
+        let path = path
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve source {}: {error}", path.display()))?;
+        if !path.starts_with(&root) {
+            return Err(format!("module {} escapes project root", path.display()));
+        }
+        if seen_paths.insert(path.clone()) {
+            let relative = path
+                .strip_prefix(&root)
+                .expect("path is under project root");
+            let name = relative.to_string_lossy().replace('\\', "/");
+            named_paths.push((path, name));
+        }
+    }
+    for package in &resolved_packages {
+        let source_root = package.root.join("src");
+        let source_root = match source_root.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut package_paths = Vec::new();
+        collect_star_sources(&source_root, &mut package_paths)
+            .map_err(|error| error.to_string())?;
+        for path in package_paths {
+            let path = path.canonicalize().map_err(|error| error.to_string())?;
+            if !path.starts_with(&source_root) {
+                return Err(format!(
+                    "module {} escapes package source root",
+                    path.display()
+                ));
+            }
+            if seen_paths.insert(path.clone()) {
+                let relative = path
+                    .strip_prefix(&source_root)
+                    .expect("path is under package source root");
+                let name = format!(
+                    "deps/{}/{}/src/{}",
+                    package.locked.name,
+                    package.locked.version,
+                    relative.to_string_lossy().replace('\\', "/")
+                );
+                named_paths.push((path, name));
+            }
+        }
+    }
+    named_paths.sort_by_key(|(path, _)| (path != &entry, path.clone()));
+    if manifest.permissions.environment && manifest.permissions.filesystem {
+        if let Some(star_path) = env::var_os("STAR_PATH") {
+            for (root_index, search_root) in env::split_paths(&star_path).enumerate() {
+                let canonical_search_root = match search_root.canonicalize() {
+                    Ok(path) => path,
+                    Err(_) => continue,
+                };
+                let mut external_paths = Vec::new();
+                collect_star_sources(&canonical_search_root, &mut external_paths)
+                    .map_err(|error| error.to_string())?;
+                for path in external_paths {
+                    let path = path.canonicalize().map_err(|error| error.to_string())?;
+                    let relative = path
+                        .strip_prefix(&canonical_search_root)
+                        .map_err(|_| "STAR_PATH module escapes its search root".to_owned())?;
+                    let name = relative.to_string_lossy().replace('\\', "/");
+                    if seen_paths.insert(path.clone()) {
+                        named_paths.push((path, format!("starpath/{root_index}/{name}")));
+                    }
+                }
+            }
+        }
+    }
+
+    let max_stack = u32::try_from(limits.max_stack_values).unwrap_or(u32::MAX);
+    let mut modules = Vec::with_capacity(named_paths.len());
+    let mut entry_index = None;
+    let mut total_source_bytes = 0usize;
+    for (path, name) in named_paths {
+        if path == entry {
+            entry_index = Some(
+                u32::try_from(modules.len())
+                    .map_err(|_| "project has too many modules".to_owned())?,
+            );
+        }
+        let source_limit = limits.max_memory_bytes.min(DEFAULT_FILE_BYTES);
+        let metadata =
+            fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let metadata_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if metadata_len > source_limit
+            || total_source_bytes.saturating_add(metadata_len) > source_limit
+        {
+            return Err("project source exceeds configured aggregate file limit".to_owned());
+        }
+        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        total_source_bytes = total_source_bytes.saturating_add(bytes.len());
+        if total_source_bytes > source_limit {
+            return Err("project source exceeds configured aggregate file limit".to_owned());
+        }
+        let mode = if strict {
+            LexMode::Strict
+        } else {
+            LexMode::Normal
+        };
+        let normalized = normalize_source(&bytes, mode)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let program = parse(&normalized).map_err(|error| format!("{}: {error}", path.display()))?;
+        analyze(&program).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut ir = source_lowering::lower(&program, max_stack)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        ir.functions.sort_by(|left, right| left.id.cmp(&right.id));
+        let source_file = name.clone();
+        modules.push(ProjectModuleBuild {
+            ir,
+            name,
+            source_file,
+        });
+    }
+    let entry_index = entry_index.ok_or_else(|| "project entry module is missing".to_owned())?;
+    let module_views: Vec<_> = modules
+        .iter()
+        .map(|module| CompileModule {
+            ir: &module.ir,
+            name: &module.name,
+            source_file: &module.source_file,
+        })
+        .collect();
+    let policy = policy_with_permissions(&limits, &manifest.permissions);
+    let provisional =
+        compile_modules(&module_views, entry_index).map_err(|error| error.to_string())?;
+    let verified = verify_bytecode(&provisional, &policy).map_err(|error| error.to_string())?;
+    if verified.function_stack_depths.len()
+        != modules
+            .iter()
+            .map(|module| module.ir.functions.len() + 1)
+            .sum::<usize>()
+    {
+        return Err("verified function table does not match project modules".to_owned());
+    }
+    let mut function_index = 0;
+    for module in &mut modules {
+        module.ir.initializer.max_stack = verified.function_stack_depths[function_index];
+        function_index += 1;
+        for function in &mut module.ir.functions {
+            function.max_stack = verified.function_stack_depths[function_index];
+            function_index += 1;
+        }
+    }
+    let module_views: Vec<_> = modules
+        .iter()
+        .map(|module| CompileModule {
+            ir: &module.ir,
+            name: &module.name,
+            source_file: &module.source_file,
+        })
+        .collect();
+    let bytecode =
+        compile_modules(&module_views, entry_index).map_err(|error| error.to_string())?;
+    verify_bytecode(&bytecode, &policy).map_err(|error| error.to_string())?;
+    Ok((bytecode, policy))
+}
+
+fn package_root_for(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir().ok()?.join(path)
+    };
+    let start = absolute.canonicalize().ok()?;
+    let start = if start.is_dir() {
+        start
+    } else {
+        start.parent()?.to_path_buf()
+    };
+    start
+        .ancestors()
+        .find(|ancestor| locate_manifest(ancestor).is_ok())
+        .map(Path::to_path_buf)
+}
+
+fn collect_star_sources(root: &Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = fs::read_dir(root)?.collect::<Result<_, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_star_sources(&path, output)?;
+        } else if file_type.is_file() && extension(&path).as_deref() == Some("star") {
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn policy_with_permissions(
+    limits: &ExecutionLimits,
+    permissions: &Permissions,
+) -> VerificationPolicy {
+    let mut policy = verification_policy(limits);
+    let mut capabilities = BTreeSet::new();
+    if permissions.filesystem {
+        capabilities.insert(Capability::FsRead);
+        capabilities.insert(Capability::FsWrite);
+    }
+    if permissions.network {
+        capabilities.insert(Capability::NetConnect);
+        capabilities.insert(Capability::NetListen);
+    }
+    if permissions.process {
+        capabilities.insert(Capability::ProcessSpawn);
+    }
+    if permissions.ffi {
+        capabilities.insert(Capability::Ffi);
+    }
+    if permissions.environment {
+        capabilities.insert(Capability::EnvRead);
+    }
+    policy.granted_capabilities = capabilities;
+    policy
 }
 
 fn parse_source(path: &Path, bytes: &[u8], strict: bool) -> Result<star_parser::Program, u8> {
@@ -1329,22 +1680,12 @@ fn resolve_project_entry() -> Result<PathBuf, String> {
         .map_err(|error| format!("cannot determine current directory: {error}"))?;
     let root = current
         .ancestors()
-        .find(|directory| directory.join("Star.toml").is_file())
+        .find(|directory| locate_manifest(directory).is_ok())
         .ok_or_else(|| {
-            "no `Star.toml` project found; supply a source file or run `star init`".to_owned()
+            "no `star.toml` project found; supply a source file or run `star init`".to_owned()
         })?;
-    let manifest_path = root.join("Star.toml");
-    let manifest = fs::read_to_string(&manifest_path)
-        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
-    let entry = manifest
-        .lines()
-        .map(str::trim)
-        .find_map(|line| line.strip_prefix("entry ="))
-        .map(str::trim)
-        .map(|value| value.trim_matches('"'))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("{} has no nonempty `entry` field", manifest_path.display()))?;
-    let entry = PathBuf::from(entry);
+    let manifest = Manifest::read(root).map_err(|error| error.to_string())?;
+    let entry = manifest.build.entry;
     if entry.is_absolute() {
         return Err("project entry must be a relative path".to_owned());
     }
@@ -1446,6 +1787,21 @@ fn run_file(options: RunOptions) -> u8 {
             }
             run_bytecode(&options.path, &bytes, options.limits, options.stats)
         }
+        Some("star") if package_root_for(&options.path).is_some() => {
+            match compile_project_source(&options.path, options.strict, options.limits.clone()) {
+                Ok((bytecode, policy)) => run_bytecode_with_policy(
+                    &options.path,
+                    &bytecode,
+                    options.limits,
+                    options.stats,
+                    policy,
+                ),
+                Err(error) => {
+                    eprintln!("{}: {error}", options.path.display());
+                    EXIT_SOURCE
+                }
+            }
+        }
         Some("star") => run_source(
             &options.path,
             &bytes,
@@ -1503,16 +1859,17 @@ fn run_source(path: &Path, bytes: &[u8], strict: bool, limits: ExecutionLimits, 
 }
 
 fn run_bytecode(path: &Path, bytes: &[u8], limits: ExecutionLimits, stats: bool) -> u8 {
-    let max_stack_depth = u32::try_from(limits.max_stack_values).unwrap_or(u32::MAX);
-    let policy = VerificationPolicy {
-        limits: VerificationLimits {
-            max_file_bytes: limits.max_memory_bytes.min(DEFAULT_FILE_BYTES),
-            max_table_entries: 65_536,
-            max_instructions: limits.max_instructions,
-            max_stack_depth,
-        },
-        granted_capabilities: BTreeSet::new(),
-    };
+    let policy = verification_policy(&limits);
+    run_bytecode_with_policy(path, bytes, limits, stats, policy)
+}
+
+fn run_bytecode_with_policy(
+    path: &Path,
+    bytes: &[u8],
+    limits: ExecutionLimits,
+    stats: bool,
+    policy: VerificationPolicy,
+) -> u8 {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut vm = BytecodeVm::new(BufReader::new(stdin.lock()), stdout.lock(), policy)

@@ -6,6 +6,7 @@ members = [
     "crates/star-interpreter",
     "crates/star-compiler",
     "crates/star-lsp",
+    "crates/star-package",
     "crates/star-cli",
 ]
 resolver = "2"
@@ -35,3 +36,7 @@ star-interpreter = { path = "crates/star-interpreter" }
 star-lsp = { path = "crates/star-lsp" }
 lsp-server = "0.10.0"
 lsp-types = "0.97.0"
+serde = { version = "1.0", features = ["derive"] }
+semver = "1.0"
+toml = "0.8"
+star-package = { path = "crates/star-package" }

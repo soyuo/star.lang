@@ -6,6 +6,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
 use std::mem::size_of;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use num_bigint::Sign;
@@ -253,6 +254,7 @@ pub struct Interpreter<R: BufRead, W: Write> {
     structs: HashMap<BigInt, StructDefinition>,
     interfaces: HashMap<BigInt, InterfaceDefinition>,
     capture_vectors: Vec<Vec<(BigInt, BindingCell)>>,
+    external_binding_roots: Vec<BindingCell>,
     gc: GcHeap,
     call_depth: usize,
     call_trace: Vec<StackTraceFrame>,
@@ -375,6 +377,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             structs: HashMap::new(),
             interfaces: HashMap::new(),
             capture_vectors: vec![Vec::new()],
+            external_binding_roots: Vec::new(),
             gc: GcHeap::default(),
             call_depth: 0,
             call_trace: Vec::new(),
@@ -443,8 +446,12 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
     /// Returns `GcError::BorrowConflict` without modifying the heap if the host
     /// currently borrows a runtime value.
     pub fn collect_garbage(&mut self) -> Result<GcStats, GcError> {
-        self.gc
-            .collect(&self.stack, &self.scopes, &self.capture_vectors)
+        self.gc.collect(
+            &self.stack,
+            &self.scopes,
+            &self.capture_vectors,
+            &self.external_binding_roots,
+        )
     }
 
     fn collect_if_needed(&mut self) {
@@ -496,6 +503,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 &self.stack,
                 &self.scopes,
                 &self.capture_vectors,
+                &self.external_binding_roots,
                 self.limits.max_memory_bytes,
             )
             .map_err(|_| self.error(RuntimeErrorKind::ResourceLimit("memory accounting"), span))?;
@@ -516,6 +524,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                     &self.stack,
                     &self.scopes,
                     &self.capture_vectors,
+                    &self.external_binding_roots,
                     self.limits.max_memory_bytes,
                 )
                 .map_err(|_| {
@@ -539,6 +548,45 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     pub(crate) fn set_external_memory_bytes(&mut self, bytes: usize) {
         self.external_memory_bytes = bytes;
+    }
+
+    pub(crate) fn register_external_binding_root(
+        &mut self,
+        cell: &BindingCell,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        if self
+            .external_binding_roots
+            .iter()
+            .any(|root| Rc::ptr_eq(root, cell))
+        {
+            return Ok(());
+        }
+        let capacity = self.external_binding_roots.capacity();
+        let projected = projected_capacity_after_push(self.external_binding_roots.len(), capacity);
+        let growth = projected
+            .saturating_sub(capacity)
+            .saturating_mul(size_of::<BindingCell>());
+        self.ensure_memory_budget(growth, span)?;
+        self.external_binding_roots.try_reserve(1).map_err(|_| {
+            self.error(RuntimeErrorKind::ResourceLimit("module global roots"), span)
+        })?;
+        self.external_binding_roots.push(cell.clone());
+        Ok(())
+    }
+
+    pub(crate) fn register_reserved_external_binding_root(&mut self, cell: &BindingCell) {
+        if !self
+            .external_binding_roots
+            .iter()
+            .any(|root| Rc::ptr_eq(root, cell))
+        {
+            self.external_binding_roots.push(cell.clone());
+        }
+    }
+
+    pub(crate) fn clear_external_binding_roots(&mut self) {
+        self.external_binding_roots.clear();
     }
 
     fn call_trace_memory_bytes(&self) -> usize {
@@ -755,6 +803,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 &self.stack,
                 &self.scopes,
                 &self.capture_vectors,
+                &self.external_binding_roots,
                 self.limits.max_memory_bytes,
             )
             .map(|estimated| self.limits.max_memory_bytes.saturating_sub(estimated))
@@ -1774,6 +1823,24 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
 
     fn capture(&mut self, span: Span) -> Result<(), RuntimeError> {
         let id = self.pop_identifier(span)?;
+        self.capture_id(id, None, span)
+    }
+
+    pub(crate) fn capture_module_global(
+        &mut self,
+        id: BigInt,
+        module_global: Option<BindingCell>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
+        self.capture_id(id, module_global, span)
+    }
+
+    fn capture_id(
+        &mut self,
+        id: BigInt,
+        module_global: Option<BindingCell>,
+        span: Span,
+    ) -> Result<(), RuntimeError> {
         let floor = *self.scope_floors.last().unwrap_or(&0);
         let cell = self
             .scopes
@@ -1786,7 +1853,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 (floor > 0)
                     .then(|| self.scopes[0].get(&id).cloned())
                     .flatten()
-            });
+            })
+            .or(module_global);
         let Some(cell) = cell else {
             return Err(self.error(
                 RuntimeErrorKind::ReferenceError("captured binding does not exist"),
@@ -2926,7 +2994,8 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
             | Value::Handle(_)
             | Value::Task(_)
             | Value::Channel(_)
-            | Value::Mutex(_) => true,
+            | Value::Mutex(_)
+            | Value::Module(_) => true,
         };
         self.push_value(Value::Bool(truthy), span)?;
         Ok(())
@@ -3988,6 +4057,7 @@ impl<R: BufRead, W: Write> Interpreter<R, W> {
                 &self.stack,
                 &self.scopes,
                 &self.capture_vectors,
+                &self.external_binding_roots,
                 self.limits.max_memory_bytes,
             )
             .map(|bytes| {
@@ -4083,7 +4153,11 @@ fn estimated_key_clone_bytes(value: &Value, depth: usize) -> usize {
         | Value::Function(_)
         | Value::Closure(_)
         | Value::Object(_) => 0,
-        Value::Handle(_) | Value::Task(_) | Value::Channel(_) | Value::Mutex(_) => 0,
+        Value::Handle(_)
+        | Value::Task(_)
+        | Value::Channel(_)
+        | Value::Mutex(_)
+        | Value::Module(_) => 0,
     }
 }
 
@@ -4112,7 +4186,8 @@ fn estimated_unmanaged_payload_bytes(value: &Value, depth: usize) -> usize {
         | Value::Object(_)
         | Value::Task(_)
         | Value::Channel(_)
-        | Value::Mutex(_) => 0,
+        | Value::Mutex(_)
+        | Value::Module(_) => 0,
         Value::Handle(handle) => handle.estimated_bytes(),
     }
 }

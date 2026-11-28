@@ -51,7 +51,7 @@ The logical path uses `/` as its separator on every host. Resolution searches in
 
 The final step reads the `STAR_PATH` environment variable and requires the `env.read` capability. If resolution reaches this step without that permission, import raises `PermissionError` without reading the variable. Earlier resolution steps remain available without `env.read`.
 
-Path matching is exact and case-sensitive at the language level. On a case-insensitive host filesystem, the resolver must verify the exact component spelling before accepting a match. `.` path components are removed. `..` may move within a permitted root but must not escape it. Embedded NUL is invalid and raises `TypeError`. Absolute paths and attempts to escape a permitted root are rejected with `PermissionError`; symlink resolution must not bypass the same root restriction. Filesystem capability checks still apply. If no module resolves, import raises `ReferenceError`.
+Path matching is exact and case-sensitive at the language level. On a case-insensitive host filesystem, the resolver must verify the exact component spelling before accepting a match. `.` path components are removed; any `..` component is rejected so module paths cannot traverse out of their search root. Embedded NUL is invalid and raises `TypeError`. Absolute paths and attempts to escape a permitted root are rejected with `PermissionError`; symlink resolution must not bypass the same root restriction. Filesystem capability checks still apply. If no module resolves, import raises `ReferenceError`.
 
 The resolved canonical module identity, rather than the spelling of the path used to find it, keys module state. Two paths that resolve to the same module therefore share one module instance within an execution context.
 

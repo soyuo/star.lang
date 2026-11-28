@@ -211,7 +211,8 @@ fn value_to_json(
         | Value::Handle(_)
         | Value::Task(_)
         | Value::Channel(_)
-        | Value::Mutex(_) => Err(WorkerError::NonSerializable(value.type_name())),
+        | Value::Mutex(_)
+        | Value::Module(_) => Err(WorkerError::NonSerializable(value.type_name())),
     }
 }
 
