@@ -1,6 +1,6 @@
 # Identifiers, Scope, and Modules
 
-Status: draft
+Status: stable
 
 This document defines numeric identifiers, variable binding and lookup, module path encoding, exports, resolution, and initialization. Identifier values use `Int` as defined by `spec/integer-encoding.md`; string paths use `spec/string-byte-encoding.md`. Opcode stack effects are in `spec/instruction-semantics.md`; function calls, frames, and closure capture are in `spec/function-abi.md`.
 

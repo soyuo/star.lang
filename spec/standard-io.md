@@ -1,6 +1,8 @@
 # Standard I/O
 
-This document defines the reusable Rust I/O primitives used by the reference interpreter and bytecode VM. The public implementation is `star_interpreter::runtime::stdio`; module loading later binds these primitives as `std.io` functions for Star programs.
+Status: stable
+
+This document defines the reusable Rust I/O primitives used by the reference interpreter and bytecode VM. The public implementation is `star_interpreter::runtime::stdio`; Star 1.0 does not register these primitives as guest `std.io` functions.
 
 ## Input
 
@@ -27,4 +29,4 @@ Both `Interpreter::execute` and `BytecodeVm::execute` attempt to flush on succes
 
 ## Scope
 
-These primitives are reusable from Rust and are the implementation foundation for `std.io`. Star-level module names and exports are connected when module loading is implemented; this specification does not define imports or module initialization.
+These primitives are reusable from Rust. Guest `std.io` module names and exports are outside the Star 1.0 surface; import and module-initialization behavior is defined by `spec/package-management.md`.

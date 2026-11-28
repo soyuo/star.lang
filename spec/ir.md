@@ -1,8 +1,8 @@
 # Intermediate Representation and Lowering
 
-Status: draft
+Status: stable
 
-This document defines the target-independent IR and the lowering contract for parsed, semantically valid Star programs. The current `star-compiler::compile` API consumes an already constructed `ModuleIR`; an AST-to-IR lowering pass is not yet implemented in this repository. The reference source interpreter executes parsed programs directly. It does not define `.starc` serialization, bytecode opcode values, or VM instruction selection; those belong to the bytecode and compiler roadmap items. Source opcode assignments remain in `spec/opcodes.toml`, while stack effects and failures remain in `spec/instruction-semantics.md`.
+This document defines the target-independent IR and the lowering contract for parsed, semantically valid Star programs. The `star-compiler::compile` API consumes a `ModuleIR`; the CLI front end in `crates/star-cli/src/source_lowering.rs` lowers the supported parsed source and linked project modules into that IR. The reference source interpreter can also execute parsed programs directly. This document does not define `.starc` serialization, bytecode opcode values, or VM instruction selection; those are in the bytecode references. Source opcode assignments remain in `spec/opcodes.toml`, while stack effects and failures remain in `spec/instruction-semantics.md`.
 
 ## IR model
 
@@ -120,4 +120,4 @@ Control-flow targets are function-local `BlockId`s, not source opcode values or 
 - Reserved or pending source opcode values have no IR operation. `.starc` opcodes are assigned independently by the bytecode format.
 - Exception regions are function-local, half-open instruction intervals after layout. They are serialized in function/start/end order; ranges may be disjoint or properly nested, never partially overlapping. `stack_depth` is the number of operand slots retained at handler entry and must not exceed `max_stack`.
 - Future optimization passes may add constants, simplify branches, or remove dead blocks only when they preserve output, I/O, bindings, errors and their order, function behavior, and source attribution.
-- IR is an in-memory compiler representation. `.starc` serialization and the emitted bytecode instruction subset are defined by `spec/bytecode-format.md` and `spec/bytecode-instructions.md`; VM verification remains a later roadmap item.
+- IR is an in-memory compiler representation. `.starc` serialization, the emitted bytecode instruction subset, and VM verification are defined by `spec/bytecode-format.md`, `spec/bytecode-instructions.md`, and `spec/bytecode-verification.md`.

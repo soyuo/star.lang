@@ -1,12 +1,13 @@
 # Standalone Distribution and Installation
 
-Status: draft
+Status: stable
 
 The `star` CLI release is a standalone toolchain package. It contains the Star
 executable, license, and README; users do not need Rust or Cargo to run Star
-source files or verified `.starc` programs. This package distributes the CLI
-and runtime, not a native executable bundle generated from an individual Star
-application.
+source files, verified `.starc` programs, or bundle a host-native application.
+`star build --target native --release` combines the installed runtime with
+verified application bytecode. It is interpreter bundling, not AOT compilation;
+see `spec/standalone-applications.md`.
 
 ## Supported release targets
 
@@ -31,7 +32,7 @@ platform archives.
 GitHub-hosted runner for each target above. It runs for pull requests that
 touch release inputs and pushes to `develop`; those runs provide one archive
 artifact per target without publishing a release. A version tag such as
-`v0.1.0` builds the same packages and publishes them as a GitHub release. The
+`v1.0.0` builds the same packages and publishes them as a GitHub release. The
 tag must match the workspace version in `Cargo.toml`. The release job requires
 the workflow token to have `contents: write` permission.
 
@@ -61,7 +62,7 @@ Invoke-WebRequest `
 ./install.ps1
 ```
 
-Use `-Version v0.1.0` to select a release, `-InstallDir <path>` to choose a
+Use `-Version v1.0.0` to select a release, `-InstallDir <path>` to choose a
 destination, and `-AddToPath` to add the destination to the current user's
 PATH. The default destination is `%LOCALAPPDATA%\Programs\Star\bin`.
 

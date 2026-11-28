@@ -1,6 +1,6 @@
 # Runtime Types, Conversions, and Type Errors
 
-Status: draft
+Status: stable
 
 This document defines runtime type tags, explicit conversions, truthiness, and type-error behavior. Instruction stack effects are in `spec/instruction-semantics.md`; integer and string encodings are in `spec/integer-encoding.md` and `spec/string-byte-encoding.md`. Arithmetic promotion and overflow rules are completed separately in `spec/arithmetic-semantics.md`.
 

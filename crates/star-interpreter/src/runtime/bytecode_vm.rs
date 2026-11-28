@@ -19,9 +19,9 @@ use super::{empty_span, ffi::NativeCallbackContext, Interpreter, RuntimeError, R
 
 /// Executes verified version 1.0 `.starc` bytecode using the reference runtime.
 ///
-/// This VM implements the emitted control-flow instructions and the current
-/// primitive, variable, I/O, collection, and direct-call runtime slice. Features
-/// assigned to later runtime roadmap items return an explicit unsupported error.
+/// This VM executes the bytecode operations implemented by Star 1.0. Operations
+/// outside that supported subset return an explicit unsupported error, as
+/// documented by the bytecode and host API references.
 pub struct BytecodeVm<R: BufRead, W: Write> {
     runtime: Interpreter<R, W>,
     policy: VerificationPolicy,
@@ -1979,7 +1979,7 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
         let required: &[Capability] = match operation {
             // Import permissions depend on the resolution path: check fs.read
             // on an actual file read and env.read only when STAR_PATH is used.
-            // This runtime slice has no module resolver and rejects imports.
+            // The import dispatch path checks grants after resolving the linked module name.
             IrOp::Import | IrOp::ImportDynamic => &[],
             IrOp::Sleep => &[Capability::Clock],
             IrOp::NativeLoad

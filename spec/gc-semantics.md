@@ -1,6 +1,6 @@
 # Tracing Garbage Collection
 
-Status: draft
+Status: stable
 
 The reference interpreter uses a non-moving tracing collector for managed runtime values. Collection preserves object identity and does not relocate values.
 

@@ -4,7 +4,7 @@
 //! interpreter value/runtime operations. These stack, queue, and deque types
 //! provide the additional standard-library structures without introducing a
 //! second guest-value representation. Module registration can expose them as
-//! `std.collections` when module loading is implemented.
+//! `std.collections`; Star 1.0 does not register these primitives as a guest module.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, TryReserveError, VecDeque};

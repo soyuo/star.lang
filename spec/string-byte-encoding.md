@@ -1,6 +1,6 @@
 # String and Byte Encoding
 
-Status: draft
+Status: stable
 
 This document defines how source integer payloads construct byte sequences and UTF-8 strings. `spec/integer-encoding.md` defines the source bit mapping and `Int` values; `spec/source-format.md` defines which characters and formatting whitespace are accepted.
 

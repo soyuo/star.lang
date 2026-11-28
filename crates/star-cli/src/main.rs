@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ mod dap;
 mod package_commands;
 mod source_lowering;
 mod source_tools;
+mod standalone;
 
 use star_compiler::{
     compile, compile_modules, disassemble_bytecode, verify_bytecode, Capability, CompileModule,
@@ -48,7 +50,7 @@ Usage:
   star remove <name>
   star install | update | search <query> | package | publish | audit
   star check [<file.star|file.starc>] [options]
-  star build [<file.star>] [--output <file.starc>] [options]
+  star build [<file.star>] [--target bytecode|native] [--release] [--output <file>] [options]
   star run [<file.star|file.starc>] [options]
   star debug <file.star> [--strict] [--break LINE[:COLUMN]]... [--input <file>] [--dap]
   star test --suite oj [--solutions <directory>]
@@ -60,6 +62,7 @@ Usage:
   star disasm <file.starc>
   star lsp
   star repl
+  star --version
   star help
 
 Execution options:
@@ -72,8 +75,11 @@ Execution options:
   --stats                     Run only: write timing and guest-memory estimate to stderr
 
 `check` validates source semantics and bytecode generation, or verifies `.starc`.
-`build` compiles supported `.star` source to `.starc`; TRY/CATCH lowering is not
-yet supported. `test --suite oj` requires paired solutions and Python 3.11+.
+`build` defaults to `.starc`; `--target native --release` bundles source bytecode
+with the release executable for the current host platform. Source
+`TRY/CATCH/FINALLY` runs through `star run` but is not yet lowered to bytecode,
+so `build` reports a lowering diagnostic for it. `test --suite oj` requires
+paired solutions and Python 3.11+.
 `bench` launches a fresh process per iteration and suppresses guest stdout.
 `fmt` and `minify` print validated source transformations; `--write` replaces
 the input file. `encode` emits valid source and `decode` reads one encoded value.
@@ -96,8 +102,15 @@ struct RunOptions {
 struct BuildOptions {
     path: PathBuf,
     output: Option<PathBuf>,
+    target: BuildTarget,
     strict: bool,
     limits: ExecutionLimits,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildTarget {
+    Bytecode,
+    Native,
 }
 
 struct TestOptions {
@@ -119,7 +132,14 @@ struct DebugFileOptions {
 }
 
 fn main() -> ExitCode {
-    ExitCode::from(run(env::args().skip(1).collect()))
+    match standalone::read_current_executable() {
+        Ok(Some(application)) => ExitCode::from(run_embedded_application(application)),
+        Ok(None) => ExitCode::from(run(env::args().skip(1).collect())),
+        Err(error) => {
+            eprintln!("star: cannot read standalone application: {error}");
+            ExitCode::from(EXIT_IO)
+        }
+    }
 }
 
 fn run(args: Vec<String>) -> u8 {
@@ -128,6 +148,13 @@ fn run(args: Vec<String>) -> u8 {
         return EXIT_USAGE;
     };
     match command {
+        "--version" | "-V" | "version" if args.len() == 1 => {
+            println!(
+                "star {} (language 1.0, .starc 1.0)",
+                env!("CARGO_PKG_VERSION")
+            );
+            EXIT_OK
+        }
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             EXIT_OK
@@ -909,6 +936,9 @@ fn parse_execution_options(
 fn parse_build_options(arguments: &[String]) -> Result<BuildOptions, String> {
     let mut path = None;
     let mut output = None;
+    let mut target = BuildTarget::Bytecode;
+    let mut target_seen = false;
+    let mut release = false;
     let mut strict = false;
     let mut limits = ExecutionLimits::default();
     let mut index = 0;
@@ -927,6 +957,30 @@ fn parse_build_options(arguments: &[String]) -> Result<BuildOptions, String> {
                 return Err("`star build` accepts `--output` once".to_owned());
             }
             index += 2;
+            continue;
+        }
+        if argument == "--target" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "missing value for `--target`".to_owned())?;
+            if target_seen {
+                return Err("`star build` accepts `--target` once".to_owned());
+            }
+            target = match value.as_str() {
+                "bytecode" => BuildTarget::Bytecode,
+                "native" => BuildTarget::Native,
+                _ => return Err("`--target` must be `bytecode` or `native`".to_owned()),
+            };
+            target_seen = true;
+            index += 2;
+            continue;
+        }
+        if argument == "--release" {
+            if release {
+                return Err("`star build` accepts `--release` once".to_owned());
+            }
+            release = true;
+            index += 1;
             continue;
         }
         let option = argument.as_str();
@@ -960,6 +1014,12 @@ fn parse_build_options(arguments: &[String]) -> Result<BuildOptions, String> {
         }
         index += 1;
     }
+    if release && target != BuildTarget::Native {
+        return Err("`--release` is only supported with `--target native`".to_owned());
+    }
+    if target == BuildTarget::Native && !release {
+        return Err("`--target native` requires `--release`".to_owned());
+    }
     Ok(BuildOptions {
         path: match path {
             Some(path) => path,
@@ -967,6 +1027,7 @@ fn parse_build_options(arguments: &[String]) -> Result<BuildOptions, String> {
                 .map_err(|error| format!("missing source file for `star build`: {error}"))?,
         },
         output,
+        target,
         strict,
         limits,
     })
@@ -1163,38 +1224,134 @@ fn build_file(options: BuildOptions) -> u8 {
         );
         return EXIT_USAGE;
     }
-    let bytecode_result = if package_root_for(&options.path).is_some() {
-        compile_project_source(&options.path, options.strict, options.limits.clone())
-            .map(|(bytecode, _)| bytecode)
-    } else {
-        let bytes = match read_limited_file(&options.path, options.limits.max_memory_bytes) {
-            Ok(bytes) => bytes,
-            Err(code) => return code,
+    if options.target == BuildTarget::Native && cfg!(debug_assertions) {
+        eprintln!(
+            "star: native app bundling requires a release-compiled `star` executable; rebuild `star-cli` with `--release`"
+        );
+        return EXIT_USAGE;
+    }
+    let bytecode_result: Result<(Vec<u8>, VerificationPolicy), String> =
+        if package_root_for(&options.path).is_some() {
+            compile_project_source(&options.path, options.strict, options.limits.clone())
+        } else {
+            let bytes = match read_limited_file(&options.path, options.limits.max_memory_bytes) {
+                Ok(bytes) => bytes,
+                Err(code) => return code,
+            };
+            let program = match parse_source(&options.path, &bytes, options.strict) {
+                Ok(program) => program,
+                Err(code) => return code,
+            };
+            let policy = verification_policy(&options.limits);
+            compile_source_program(&options.path, &program, options.limits.clone())
+                .map(|bytecode| (bytecode, policy))
         };
-        let program = match parse_source(&options.path, &bytes, options.strict) {
-            Ok(program) => program,
-            Err(code) => return code,
-        };
-        compile_source_program(&options.path, &program, options.limits.clone())
-    };
-    let bytecode = match bytecode_result {
-        Ok(bytecode) => bytecode,
+    let (bytecode, policy) = match bytecode_result {
+        Ok(compiled) => compiled,
         Err(error) => {
             eprintln!("{}: {error}", options.path.display());
             return EXIT_SOURCE;
         }
     };
-    let output = options.output.unwrap_or_else(|| {
-        let mut output = options.path.clone();
-        output.set_extension("starc");
-        output
+    let output = options.output.unwrap_or_else(|| match options.target {
+        BuildTarget::Bytecode => {
+            let mut output = options.path.clone();
+            output.set_extension("starc");
+            output
+        }
+        BuildTarget::Native => default_native_output(&options.path),
     });
-    if let Err(error) = fs::write(&output, bytecode) {
+    let write_result = match options.target {
+        BuildTarget::Bytecode => fs::write(&output, bytecode),
+        BuildTarget::Native => {
+            if let (Ok(source_path), Ok(output_path)) =
+                (fs::canonicalize(&options.path), fs::canonicalize(&output))
+            {
+                if source_path == output_path {
+                    eprintln!(
+                        "{}: output path would overwrite the source file",
+                        output.display()
+                    );
+                    return EXIT_USAGE;
+                }
+            }
+            let runtime_path = match env::current_exe() {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!("star: cannot locate the running Star executable: {error}");
+                    return EXIT_IO;
+                }
+            };
+            standalone::write_application(
+                &runtime_path,
+                &output,
+                &bytecode,
+                capability_bits(&policy),
+            )
+        }
+    };
+    if let Err(error) = write_result {
         eprintln!("{}: {error}", output.display());
         return EXIT_IO;
     }
-    println!("built {}", output.display());
+    match options.target {
+        BuildTarget::Bytecode => println!("built {}", output.display()),
+        BuildTarget::Native => println!("bundled {}", output.display()),
+    }
     EXIT_OK
+}
+
+fn default_native_output(source: &Path) -> PathBuf {
+    let mut name: OsString = source
+        .file_stem()
+        .unwrap_or_else(|| OsStr::new("star-app"))
+        .to_os_string();
+    if cfg!(windows) {
+        name.push(".exe");
+    }
+    source.parent().unwrap_or_else(|| Path::new(".")).join(name)
+}
+
+fn run_embedded_application(application: standalone::EmbeddedApplication) -> u8 {
+    let limits = ExecutionLimits::default();
+    let mut policy = verification_policy(&limits);
+    policy.granted_capabilities = capabilities_from_bits(application.capability_bits);
+    run_bytecode_with_policy(
+        Path::new("<embedded application>"),
+        &application.bytecode,
+        limits,
+        false,
+        policy,
+    )
+}
+
+const STANDALONE_CAPABILITIES: [Capability; 9] = [
+    Capability::FsRead,
+    Capability::FsWrite,
+    Capability::NetConnect,
+    Capability::NetListen,
+    Capability::ProcessSpawn,
+    Capability::EnvRead,
+    Capability::Ffi,
+    Capability::Clock,
+    Capability::Random,
+];
+
+fn capability_bits(policy: &VerificationPolicy) -> u64 {
+    STANDALONE_CAPABILITIES
+        .iter()
+        .enumerate()
+        .filter(|(_, capability)| policy.granted_capabilities.contains(*capability))
+        .fold(0_u64, |bits, (index, _)| bits | (1 << index))
+}
+
+fn capabilities_from_bits(bits: u64) -> BTreeSet<Capability> {
+    STANDALONE_CAPABILITIES
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| bits & (1_u64 << *index) != 0)
+        .map(|(_, capability)| *capability)
+        .collect()
 }
 
 fn compile_source_program(

@@ -1,5 +1,7 @@
 # Editor and Language Server Support
 
+Status: stable
+
 `star lsp` starts the Star Language Server Protocol server on standard input and
 standard output. It supports full-document synchronization, lexical/parser/
 semantic diagnostics, instruction completion, hover, semantic tokens, mnemonic

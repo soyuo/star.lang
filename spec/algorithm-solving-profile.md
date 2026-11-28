@@ -1,6 +1,6 @@
 # Algorithm-Solving Profile
 
-Status: draft
+Status: stable
 
 This profile defines the supported command-line execution path and the published online-judge fixture format for multi-case Star solutions.
 

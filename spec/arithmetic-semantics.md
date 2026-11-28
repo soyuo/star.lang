@@ -1,6 +1,6 @@
 # Arithmetic and Numeric Semantics
 
-Status: draft
+Status: stable
 
 This document defines arithmetic, numeric comparison, integer division and remainder, mixed `Int`/`Float` operations, and bitwise behavior. The runtime types and conversions used here are defined in `spec/type-semantics.md`; instruction stack effects are in `spec/instruction-semantics.md`; source integer and byte encodings are in `spec/integer-encoding.md`. This is source-language behavior and does not define `.starc` opcodes. Examples use infix mathematical notation only; Star executes postfix instructions.
 

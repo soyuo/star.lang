@@ -1,6 +1,6 @@
 # Integer Math
 
-Status: draft
+Status: stable
 
 `star_interpreter::runtime::math` provides exact integer helpers for the `std.math` implementation. Inputs and results use arbitrary-precision signed `Int`; none of these operations silently wrap.
 
@@ -17,4 +17,4 @@ Modulus zero or a negative modulus returns `ModularError::NonPositiveModulus`; a
 
 ## Standard-library boundary
 
-These Rust implementations are available through the interpreter crate. Binding them as `std.math` functions depends on the later standard-module loading work; this document does not claim that imports are available yet.
+These Rust implementations are available through the interpreter crate. Star 1.0 does not register them as guest `std.math` functions, so they are not available through `import std.math` unless an embedding host exposes them.

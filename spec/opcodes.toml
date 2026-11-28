@@ -1,5 +1,5 @@
 schema_version = 1
-status = "draft"
+status = "stable"
 namespace = "source"
 
 # This catalog describes source-level Star instructions only.

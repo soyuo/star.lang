@@ -1,5 +1,7 @@
 # Stabilization Quality Gates
 
+Status: stable
+
 The gates run from `.github/workflows/quality-gates.yml` on pull requests and
 pushes to `develop`:
 

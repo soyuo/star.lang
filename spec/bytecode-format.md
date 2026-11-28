@@ -1,6 +1,6 @@
 # `.starc` Bytecode File Format
 
-Status: draft
+Status: stable
 
 This document defines version 1.0 of the serialized `.starc` container, its sections, constant pool, module/type/function tables, and code ranges. The container's numeric fields are independent of source instruction encodings in `spec/opcodes.toml`. IR lowering is defined in `spec/ir.md`; source-language stack behavior remains in `spec/instruction-semantics.md`.
 

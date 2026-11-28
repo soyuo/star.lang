@@ -1,6 +1,6 @@
 # Core Collections
 
-Status: draft
+Status: stable
 
 Star's guest-visible dynamic arrays, hash maps, and hash sets are the `Array`, `Map`, and `Set` values defined in [collection semantics](collection-semantics.md). They provide mutable zero-based arrays, value-keyed hash lookup, deterministic insertion-order iteration, stable replacement positions, and the documented empty/error behavior. Their map and set implementation uses hashing for membership and a separate order sequence for deterministic traversal.
 
@@ -20,4 +20,4 @@ The module also provides `sort` (ascending, unstable), `stable_sort` (ascending,
 
 ## Star standard-library boundary
 
-The Rust collection primitives are implemented now, while guest module loading and native module registration are a later roadmap item. When exposed through `std.collections`, empty `pop`/`dequeue`/`peek` results map to Star `Null`; allocation and configured-memory-limit failures map to the runtime's resource-limit error. Guest bindings must account for backing storage under `max_memory_bytes`. This boundary keeps the host implementations available without claiming that `import std.collections` already works.
+The Rust collection primitives are implemented. Star 1.0 does not register them as a guest `std.collections` module, so `import std.collections` is not part of the 1.0 surface. If a host exposes these APIs to guest code, empty `pop`/`dequeue`/`peek` results map to Star `Null`; allocation and configured-memory-limit failures map to the runtime's resource-limit error. Guest bindings must account for backing storage under `max_memory_bytes`.

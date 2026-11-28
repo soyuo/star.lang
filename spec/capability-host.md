@@ -1,13 +1,14 @@
 # Capability-Gated Host Services
 
-Status: draft
+Status: stable
 
 The Rust reference runtime exposes filesystem, path, environment, and process
 operations through `runtime::host::HostServices`. The service checks a host-
 provided `star_compiler::Capability` grant on every operation and denies all
-capabilities by default. These Rust APIs are not yet registered as guest
-`std.fs`, `std.path`, `std.env`, or `std.process` functions; guest module
-registration belongs to the later module-loading work.
+capabilities by default. These Rust APIs are not registered as guest `std.fs`,
+`std.path`, `std.env`, or `std.process` modules in Star 1.0. Guest code can use
+only services explicitly exposed by its runtime environment; a host-side Rust
+API does not imply a guest-visible standard-library binding.
 
 ## Configuration and capability ownership
 

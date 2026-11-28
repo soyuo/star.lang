@@ -1,6 +1,6 @@
 # Structs, Methods, Functions, and Closures
 
-Status: draft
+Status: stable
 
 This document defines the runtime behavior for the object and callable instructions in `spec/instruction-semantics.md`. It builds on the function-frame and closure ABI in `spec/function-abi.md`.
 

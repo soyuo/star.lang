@@ -1,6 +1,6 @@
 # Bytecode Verification
 
-Status: draft
+Status: stable
 
 `star-compiler::verify_bytecode` validates untrusted `.starc` version 1.0 data before a VM consumes it. Container layout and instruction encoding remain defined by `spec/bytecode-format.md` and `spec/bytecode-instructions.md`.
 
@@ -16,9 +16,9 @@ The caller also supplies granted capabilities. Verification rejects a resource-s
 | `SLEEP` | `clock` |
 | `NATIVE_LOAD`, `NATIVE_SYMBOL`, `NATIVE_CALL`, `NATIVE_CLOSE`, `NATIVE_CALLBACK`, `NATIVE_BUFFER` | `ffi` |
 
-The VM must check capabilities again when an operation executes. Passing verification never grants a capability. Since the opcode alone cannot determine an import's resolution path, verification does not reject imports based on these path-dependent permissions; the module resolver enforces them before accessing the file or environment variable. The current reference VM has no module resolver and reports imports as unsupported without performing either access.
+The VM checks capabilities again when an import executes. Passing verification never grants a capability. The CLI resolves project and package source modules before compilation; reading a module under `STAR_PATH` requires both `env.read` and `fs.read`. At runtime, `IMPORT` and `IMPORT_DYNAMIC` can resolve only modules already present in the linked image and recheck those grants for `starpath/` modules. The VM does not load new files during execution. A name absent from the image raises `ReferenceError`.
 
-The host capability vocabulary is `fs.read`, `fs.write`, `net.connect`, `net.listen`, `process.spawn`, `env.read`, `ffi`, `clock`, and `random`. The current bytecode slice uses `clock` for `SLEEP`, `ffi` for native operations, and the path-dependent import permissions above. Other listed capabilities are reserved for operations that are not yet implemented; granting one does not enable an unsupported operation. The source interpreter has no ambient filesystem, network, process, environment, native-library, or random-source access; its standard input and output are explicit host-provided streams.
+The host capability vocabulary is `fs.read`, `fs.write`, `net.connect`, `net.listen`, `process.spawn`, `env.read`, `ffi`, `clock`, and `random`. Runtime and host APIs check the applicable grant at each operation. A grant does not create an API that the current runtime does not expose. The source interpreter has no ambient filesystem, network, process, environment, native-library, clock, or random-source access; trusted hosts may inject capability-gated services, and standard input and output are explicit host-provided streams.
 
 ## Container and table validation
 
@@ -36,4 +36,4 @@ The verifier also tracks the pending closure-capture vector as hidden control-fl
 
 ## Version boundary
 
-Version 1.0 verification rejects unknown minor versions, sections, direct VM opcodes, and intrinsic IDs. Exception-region records are validated structurally, but exception execution is outside the emitted version 1.0 instruction subset. The verifier does not execute bytecode, prove dynamic Star value types, or replace semantic analysis.
+Version 1.0 verification rejects unknown minor versions, required unknown sections, direct VM opcodes, and intrinsic IDs. Catch-all exception regions are verified and executed by the version 1.0 runtime; typed exception matching is unsupported. The verifier does not execute bytecode, prove dynamic Star value types, or replace semantic analysis.

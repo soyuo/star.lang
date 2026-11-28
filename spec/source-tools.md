@@ -1,6 +1,6 @@
 # Source Encoding and Formatting Tools
 
-Status: draft
+Status: stable
 
 This document defines the source encoder, decoder, formatter, and minifier. All tools use the source character, grammar, integer, and string contracts in `spec/source-format.md`, `spec/grammar.ebnf`, `spec/integer-encoding.md`, and `spec/string-byte-encoding.md`.
 

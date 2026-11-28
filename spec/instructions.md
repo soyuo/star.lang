@@ -1,6 +1,6 @@
 # Instruction Encodings
 
-Status: draft
+Status: stable
 
 This document defines the source spelling and source-level opcode representation for every assigned instruction in `spec/opcodes.toml`. The catalog is authoritative for IDs, names, ordinals, and opcode values; this document makes their encoding explicit.
 
