@@ -1,6 +1,6 @@
 # Instruction Semantics
 
-Status: draft
+Status: stable
 
 This document specifies operands, stack effects, side effects, and additional failure cases for every assigned source instruction in `spec/opcodes.toml`. Source spellings and opcode values are in `spec/instructions.md`; integer literal and `INT_TO_BYTES` rules are in `spec/integer-encoding.md`; identifier, scope, module, and import rules are in `spec/identifier-module-semantics.md`; block matching and logical branch-target rules are in `spec/control-flow.md`; function calls, frames, returns, and closure capture are in `spec/function-abi.md`; runtime tags and conversion rules are in `spec/type-semantics.md`; arithmetic and numeric comparison rules are in `spec/arithmetic-semantics.md`. This document does not define `.starc` bytecode.
 

@@ -1,11 +1,11 @@
 # JSON and Network Host APIs
 
-Status: draft
+Status: stable
 
-This document describes the Rust host APIs for JSON, TCP, UDP, and HTTP. Guest
-module registration is deferred to the standard-library module-loading
-roadmap item. These host APIs do not imply that a Star program can import
-`std.json`, `std.net`, or `std.http` yet.
+This document describes the Rust host APIs for JSON, TCP, UDP, and HTTP. Star
+1.0 does not register these APIs as guest `std.json`, `std.net`, or `std.http`
+modules. A Rust host may call the APIs directly, subject to the capability and
+endpoint checks documented here; host APIs do not imply guest module support.
 
 ## JSON
 
@@ -101,8 +101,8 @@ network confinement than this capability and endpoint policy provides.
 
 ## Scope
 
-These are host-side Rust APIs. Guest-visible standard-library modules,
-structured guest values, and module imports will be connected during the
-module-loading roadmap work. The API does not provide DNS refresh, arbitrary
+These are host-side Rust APIs. Guest-visible standard-library modules and
+structured guest values are outside the Star 1.0 surface. The API does not
+provide DNS refresh, arbitrary
 proxy configuration, redirect following, TLS server setup, persistent HTTP
 connections, or unbounded JSON or HTTP body reads.

@@ -1,6 +1,6 @@
 # Native Foreign Function Interface
 
-Status: draft
+Status: stable
 
 ## Capability and signatures
 

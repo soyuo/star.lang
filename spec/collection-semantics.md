@@ -1,6 +1,6 @@
 # Collection and String Semantics
 
-Status: draft
+Status: stable
 
 This document defines the runtime behavior shared by the source interpreter and bytecode VM for `Array`, `Tuple`, `Map`, `Set`, `String`, `Bytes`, and `Iterator` values. Opcode stack effects are in `spec/instruction-semantics.md`.
 

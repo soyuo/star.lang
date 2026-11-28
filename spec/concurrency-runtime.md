@@ -1,6 +1,6 @@
 # Concurrency Runtime
 
-Status: draft
+Status: stable
 
 ## Cooperative tasks
 

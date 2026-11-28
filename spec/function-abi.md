@@ -1,6 +1,6 @@
 # Function ABI
 
-Status: draft
+Status: stable
 
 This document defines the logical calling convention for named functions, closures, native functions, and asynchronous functions. It specifies source-level stack inputs and runtime frame behavior, but not `.starc` function-table serialization or physical VM opcodes. Source instruction stack effects remain listed in `spec/instruction-semantics.md`.
 

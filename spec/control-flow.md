@@ -1,8 +1,8 @@
 # Blocks and Control Flow
 
-Status: draft
+Status: stable
 
-This document defines structural block matching, source control-flow behavior, and logical branch targets. `spec/grammar.ebnf` defines the nested syntax, `spec/opcodes.toml` assigns source opcodes, and `spec/instruction-semantics.md` defines their stack effects. `.starc` jump operand serialization is defined by the bytecode-format roadmap item.
+This document defines structural block matching, source control-flow behavior, and logical branch targets. `spec/grammar.ebnf` defines the nested syntax, `spec/opcodes.toml` assigns source opcodes, and `spec/instruction-semantics.md` defines their stack effects. `.starc` jump operand serialization is defined by `spec/bytecode-format.md`.
 
 ## Structural block boundaries
 

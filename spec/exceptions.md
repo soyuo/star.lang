@@ -1,6 +1,6 @@
 # Exception Propagation and Runtime Cleanup
 
-Status: draft
+Status: stable
 
 ## Runtime errors
 

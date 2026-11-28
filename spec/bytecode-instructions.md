@@ -1,6 +1,6 @@
 # Bytecode Instruction Set
 
-Status: draft
+Status: stable
 
 This document defines the bytecode instruction subset emitted by `star-compiler` for the IR in `spec/ir.md`. One-byte VM opcodes and their operands are independent of source opcodes, IR names, intrinsic IDs, and `.starc` section IDs. All fixed-width operands are little-endian. Branch targets are absolute byte offsets from the start of the containing function code range and identify instruction starts.
 

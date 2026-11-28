@@ -1,6 +1,6 @@
 # Star Grammar
 
-Status: draft
+Status: stable
 
 This document defines token syntax and the nested block structure of Star source programs. Control-flow behavior and logical branch-target rules are in `spec/control-flow.md`. `spec/source-format.md` defines UTF-8 validation and character handling. `spec/opcodes.toml` is the authority for which instruction opcodes are assigned.
 

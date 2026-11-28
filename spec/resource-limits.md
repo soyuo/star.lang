@@ -1,6 +1,6 @@
 # Runtime Resource Limits and Sandbox Policy
 
-Status: draft
+Status: stable
 
 ## Configurable limits
 
@@ -28,6 +28,6 @@ Limit errors are fatal to the current execution and bypass Star-level exception 
 
 The bytecode host supplies an explicit `VerificationPolicy::granted_capabilities` allowlist. The verifier checks required capabilities before execution, and the VM checks them again when the resource operation runs. The capability vocabulary and currently supported operations are listed in `spec/bytecode-verification.md`. A grant authorizes only an implemented operation; it does not enable a feature that the current VM reports as unsupported.
 
-The source reference interpreter has no ambient filesystem, network, process, environment, native-library, or random-source access. Standard input and output are injected by the host as explicit streams. Imports are unsupported in the current VM slice; if a future resolver reads a module file, it must require `fs.read` at that access, and it must require `env.read` only if it consults `STAR_PATH`.
+The source reference interpreter has no ambient filesystem, network, process, environment, native-library, clock, or random-source access. Trusted hosts may inject the capability-gated services in `spec/capability-host.md`; standard input and output are explicit host-provided streams. The CLI resolves project and package modules before compilation. Reading a module under `STAR_PATH` requires both `env.read` and `fs.read`; the bytecode VM links only modules already present in the image and does not read new files during execution.
 
 VM-level limits and capabilities reduce accidental or bytecode-driven resource access. They are not a substitute for OS process isolation when executing hostile programs.

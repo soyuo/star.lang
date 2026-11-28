@@ -105,8 +105,8 @@ fn assert_conformance(
     expected_output: &[u8],
     fixture_name: &str,
 ) {
-    // Source-to-IR lowering is a later roadmap item, so each shared source
-    // fixture is paired here with its equivalent hand-built IR module.
+    // This conformance layer pairs each shared source fixture with an
+    // equivalent hand-built IR module, then compares both engines.
     let normalized = normalize_source(source_text.as_bytes(), LexMode::Normal).unwrap();
     let program = parse(&normalized).unwrap();
     let mut reference = Interpreter::new(Cursor::new(Vec::<u8>::new()), Vec::<u8>::new());

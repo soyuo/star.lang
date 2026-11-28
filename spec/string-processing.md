@@ -1,6 +1,6 @@
 # String and Byte Processing
 
-Status: draft
+Status: stable
 
 `star_interpreter::runtime::strings` provides zero-copy Rust helpers for the `std.string` and `std.bytes` implementations. Guest-visible `String` values are valid UTF-8; `Bytes` values are arbitrary bytes. String indices count Unicode scalar values, while byte indices count UTF-8 or raw bytes. Neither API counts grapheme clusters.
 
@@ -23,4 +23,4 @@ The helpers return borrowed slices or iterators and do not allocate. Guest wrapp
 
 ## Standard-library boundary
 
-These Rust helpers are available through the interpreter crate. Binding them as `std.string` and `std.bytes` functions depends on later standard-module loading; this document does not claim those imports already work. Existing `GET_ITEM`, `LENGTH`, `SLICE`, `CONTAINS`, `UTF8_ENCODE`, and `UTF8_DECODE` retain the contracts in `spec/collection-semantics.md`.
+These Rust helpers are available through the interpreter crate. Star 1.0 does not register them as guest `std.string` and `std.bytes` functions, so those imports are not part of the 1.0 surface. Existing `GET_ITEM`, `LENGTH`, `SLICE`, `CONTAINS`, `UTF8_ENCODE`, and `UTF8_DECODE` retain the contracts in `spec/collection-semantics.md`.

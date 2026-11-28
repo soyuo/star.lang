@@ -1,6 +1,6 @@
 # Integer Literal Encoding
 
-Status: draft
+Status: stable
 
 This document defines source integer literal values, the signed `Int` domain, and conversion of an `Int` to bytes. `spec/grammar.ebnf` defines token boundaries; `spec/source-format.md` defines source character validation.
 

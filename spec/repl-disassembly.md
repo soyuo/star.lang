@@ -1,6 +1,6 @@
 # REPL and Bytecode Disassembly
 
-Status: draft
+Status: stable
 
 ## Source REPL
 

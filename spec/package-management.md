@@ -1,5 +1,7 @@
 # Packages and Module Resolution
 
+Status: stable
+
 `star-package` is the reusable Rust SDK for Star project manifests, lockfiles, module search, and a local source registry. `star` exposes the project operations described below. The public hosted registry is not part of this release; the local registry provides the same version selection and checksum path without a network service.
 
 ## Project manifest

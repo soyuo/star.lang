@@ -1,6 +1,6 @@
 # Star Source Format
 
-Status: draft
+Status: stable
 
 This document defines the character-level format of Star source files. It does not define the full token grammar, which is specified separately in `grammar.ebnf`.
 
