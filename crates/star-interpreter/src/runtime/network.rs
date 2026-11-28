@@ -654,7 +654,6 @@ fn read_http_request(
         .iter()
         .map(|header| (header.name.to_owned(), header.value.to_vec()))
         .collect();
-    drop(parsed);
     if version == 1
         && headers
             .iter()

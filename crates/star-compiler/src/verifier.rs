@@ -289,8 +289,8 @@ fn charge_entries(
     Ok(())
 }
 
-fn parse_container<'a>(
-    bytes: &'a [u8],
+fn parse_container(
+    bytes: &[u8],
     limits: &VerificationLimits,
 ) -> Result<(HashMap<u32, Section>, u32), VerificationError> {
     if bytes.len() > limits.max_file_bytes {
@@ -502,11 +502,11 @@ fn read_count(
     Ok(count)
 }
 
-fn constant_at<'a>(
-    constants: &'a [Constant],
+fn constant_at(
+    constants: &[Constant],
     index: u32,
     offset: usize,
-) -> Result<&'a Constant, VerificationError> {
+) -> Result<&Constant, VerificationError> {
     constants.get(index as usize).ok_or_else(|| {
         failure(
             Some(offset),
@@ -515,11 +515,11 @@ fn constant_at<'a>(
     })
 }
 
-fn string_constant<'a>(
-    constants: &'a [Constant],
+fn string_constant(
+    constants: &[Constant],
     index: u32,
     offset: usize,
-) -> Result<&'a str, VerificationError> {
+) -> Result<&str, VerificationError> {
     let constant = constant_at(constants, index, offset)?;
     if constant.tag != 0x04 {
         return Err(failure(
