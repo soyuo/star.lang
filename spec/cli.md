@@ -53,6 +53,9 @@ and file-access failures use the I/O exit code. The manifest supplies the
 resource limits for each case; the CLI does not execute the test suite unless
 the user invokes `star test`.
 
+Supported release targets, standalone archives, checksums, and installation
+scripts are defined in `spec/distribution.md`.
+
 ## Exit codes
 
 | Code | Meaning |
