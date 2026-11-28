@@ -327,6 +327,29 @@ impl<R: BufRead, W: Write> BytecodeVm<R, W> {
                         span,
                     )
                 })?;
+                if image.modules[imported_index as usize]
+                    .name
+                    .starts_with("starpath/")
+                {
+                    if !self
+                        .policy
+                        .granted_capabilities
+                        .contains(&Capability::EnvRead)
+                    {
+                        return Err(self
+                            .runtime
+                            .error(RuntimeErrorKind::PermissionError("env.read"), span));
+                    }
+                    if !self
+                        .policy
+                        .granted_capabilities
+                        .contains(&Capability::FsRead)
+                    {
+                        return Err(self
+                            .runtime
+                            .error(RuntimeErrorKind::PermissionError("fs.read"), span));
+                    }
+                }
                 let export = image.modules[imported_index as usize]
                     .export_by_name(&import.symbol_name)
                     .ok_or_else(|| {
