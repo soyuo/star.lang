@@ -45,35 +45,35 @@ if [ "$actual_hash" != "$expected_hash" ]; then
     exit 1
 fi
 
-entries=$(tar -tzf "$temporary_dir/$archive")
-entry_count=0
-seen_binary=0
-seen_license=0
-seen_readme=0
-while IFS= read -r entry; do
-    case "$entry" in
-        star)
-            [ "$seen_binary" -eq 0 ] || { echo 'Duplicate executable in release archive.' >&2; exit 1; }
-            seen_binary=1
-            ;;
-        LICENSE)
-            [ "$seen_license" -eq 0 ] || { echo 'Duplicate license in release archive.' >&2; exit 1; }
-            seen_license=1
-            ;;
-        README.md)
-            [ "$seen_readme" -eq 0 ] || { echo 'Duplicate README in release archive.' >&2; exit 1; }
-            seen_readme=1
-            ;;
-        *) echo "Unexpected archive entry: $entry" >&2; exit 1 ;;
-    esac
-    entry_count=$((entry_count + 1))
-done <<EOF
-$entries
-EOF
-if [ "$entry_count" -ne 3 ] || [ "$seen_binary" -ne 1 ] || [ "$seen_license" -ne 1 ] || [ "$seen_readme" -ne 1 ]; then
-    echo 'The release archive does not contain the expected three files.' >&2
+if ! tar -tvzf "$temporary_dir/$archive" > "$temporary_dir/archive-listing"; then
+    echo 'Could not read the release archive.' >&2
     exit 1
 fi
+awk '
+    {
+        type = substr($0, 1, 1)
+        name = $NF
+        if (type != "-") {
+            print "Release archive members must be regular files." > "/dev/stderr"
+            exit 1
+        }
+        if (name != "star" && name != "LICENSE" && name != "README.md") {
+            print "Unexpected archive entry: " name > "/dev/stderr"
+            exit 1
+        }
+        if (seen[name]++) {
+            print "Duplicate archive entry: " name > "/dev/stderr"
+            exit 1
+        }
+        count++
+    }
+    END {
+        if (count != 3 || !seen["star"] || !seen["LICENSE"] || !seen["README.md"]) {
+            print "The release archive does not contain the expected three files." > "/dev/stderr"
+            exit 1
+        }
+    }
+' "$temporary_dir/archive-listing"
 
 mkdir -p "$temporary_dir/extracted" "$install_dir"
 tar -xzf "$temporary_dir/$archive" -C "$temporary_dir/extracted"

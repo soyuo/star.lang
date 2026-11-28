@@ -58,6 +58,10 @@ try {
             if ($allowedEntries -notcontains $entry.FullName) {
                 throw "Unexpected archive entry: $($entry.FullName)"
             }
+            $unixFileType = ($entry.ExternalAttributes -shr 16) -band 0xF000
+            if ($unixFileType -ne 0x8000 -or ($entry.ExternalAttributes -band 0x10) -ne 0) {
+                throw "Archive member is not a regular file: $($entry.FullName)"
+            }
         }
     } finally {
         $zip.Dispose()
