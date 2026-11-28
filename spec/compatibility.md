@@ -28,7 +28,7 @@ Compatibility guarantees apply to documented public behavior. Undocumented Rust 
 
 ## Source compatibility
 
-The v1.0 source grammar, source characters, instruction spellings, typing and conversion rules, instruction effects, and runtime failure behavior in the normative documents listed by `spec/index.md` define language version 1.0. A 1.x toolchain accepts valid 1.0 source and preserves its specified observable behavior, including output bytes, exit status, and documented errors.
+The v1.0 source grammar, source characters, instruction spellings, typing and conversion rules, instruction effects, and runtime failure behavior in the normative documents listed by `spec/index.md` define language version 1.0. The source reference interpreter accepts valid 1.0 source and preserves its specified observable behavior, including output bytes, exit status, and documented errors. CLI commands that compile source support the subset listed in `spec/cli.md`; valid source outside that lowering subset remains valid language 1.0 and can be run by the reference interpreter, but compilation produces a lowering diagnostic.
 
 A 1.x minor release may add syntax or APIs only when existing 1.0 programs keep their meaning and remain valid. New reserved words, token spellings, or overloads must not reinterpret valid 1.0 programs. Removing or changing a documented 1.x behavior requires a new language major version and a migration note.
 

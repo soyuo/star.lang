@@ -11,7 +11,7 @@ This document specifies operands, stack effects, side effects, and additional fa
 - A `CompileError` from a structural instruction means the source is rejected before execution. Structural instructions are consumed by the compiler and have no separate runtime bytecode effect. The compiler must verify stack depth and compatible types at control-flow joins.
 - Variable, function, field, method, module, and type identifiers are nonnegative `Int` values unless otherwise stated. A non-`Int` identifier operand raises `TypeError`; a negative ID or missing binding raises the applicable `ReferenceError`. A source operation that declares a stack effect must leave the remaining stack intact.
 - `Null` is used for an absent optional result. `TYPE_OF` returns a canonical type-name `String`; `TYPE_CHECK` and `TYPE_ANNOTATE` take that same name as a `String`.
-- The source documents do not yet define every operand layout. Where a row below makes one explicit, it is the draft contract for the reference implementation and must remain consistent with the catalog and this notation.
+- The operand notation and stack layouts in each row are normative for source language 1.0. Together with `spec/instructions.md`, they define the complete source-level instruction contract; `.starc` VM operand encodings are specified separately in `spec/bytecode-instructions.md`.
 
 ## Basic instructions
 

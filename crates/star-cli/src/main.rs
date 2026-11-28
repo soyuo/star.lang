@@ -76,8 +76,10 @@ Execution options:
 
 `check` validates source semantics and bytecode generation, or verifies `.starc`.
 `build` defaults to `.starc`; `--target native --release` bundles source bytecode
-with the release executable for the current host platform. `test --suite oj`
-requires paired solutions and Python 3.11+.
+with the release executable for the current host platform. Source
+`TRY/CATCH/FINALLY` runs through `star run` but is not yet lowered to bytecode,
+so `build` reports a lowering diagnostic for it. `test --suite oj` requires
+paired solutions and Python 3.11+.
 `bench` launches a fresh process per iteration and suppresses guest stdout.
 `fmt` and `minify` print validated source transformations; `--write` replaces
 the input file. `encode` emits valid source and `decode` reads one encoded value.
