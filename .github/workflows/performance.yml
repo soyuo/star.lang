@@ -1,0 +1,46 @@
+name: Performance baseline
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/star-cli/**"
+      - "crates/star-interpreter/**"
+      - "crates/star-compiler/**"
+      - "examples/**"
+      - "benchmarks/**"
+      - "scripts/benchmark_suite.py"
+  workflow_dispatch:
+  push:
+    branches: [develop]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/star-cli/**"
+      - "crates/star-interpreter/**"
+      - "crates/star-compiler/**"
+      - "examples/**"
+      - "benchmarks/**"
+      - "scripts/benchmark_suite.py"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo build --locked --release -p star-cli
+      - run: python scripts/benchmark_suite.py --star-cli target/release/star --iterations 10 --output target/benchmark-results.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: star-performance-${{ github.sha }}
+          path: target/benchmark-results.json
+          if-no-files-found: error
+          retention-days: 90

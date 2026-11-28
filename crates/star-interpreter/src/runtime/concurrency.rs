@@ -140,7 +140,12 @@ impl<T> Channel<T> {
         let mut value = Some(value);
         loop {
             let notified = self.inner.changed.notified();
-            let accepted = {
+            enum SendAction {
+                Accepted,
+                Wait(oneshot::Receiver<()>),
+                Retry,
+            }
+            let action = {
                 let mut state = self.inner.state.borrow_mut();
                 if state.closed {
                     return Err(ChannelClosed);
@@ -148,73 +153,84 @@ impl<T> Channel<T> {
                 if let Some(receiver) = state.receivers.pop_front() {
                     if let Some(pending_value) = value.take() {
                         match receiver.send(pending_value) {
-                            Ok(()) => true,
+                            Ok(()) => SendAction::Accepted,
                             Err(pending_value) => {
                                 value = Some(pending_value);
                                 self.inner.changed.notify_one();
-                                false
+                                SendAction::Retry
                             }
                         }
                     } else {
-                        false
+                        SendAction::Retry
                     }
                 } else if self.inner.capacity > 0 && state.queue.len() < self.inner.capacity {
                     if let Some(value) = value.take() {
                         state.queue.push_back(value);
                     }
-                    true
+                    SendAction::Accepted
                 } else if self.inner.capacity == 0 {
                     let (accepted, wait) = oneshot::channel();
                     state.senders.push_back(PendingSend {
                         value: value.take().expect("value is submitted once"),
                         accepted,
                     });
-                    drop(state);
-                    self.inner.changed.notify_one();
-                    wait.await.map_err(|_| ChannelClosed)?;
-                    true
+                    SendAction::Wait(wait)
                 } else {
-                    false
+                    SendAction::Retry
                 }
             };
-            if accepted {
-                self.inner.changed.notify_one();
-                return Ok(());
+            match action {
+                SendAction::Accepted => {
+                    self.inner.changed.notify_one();
+                    return Ok(());
+                }
+                SendAction::Wait(wait) => {
+                    self.inner.changed.notify_one();
+                    wait.await.map_err(|_| ChannelClosed)?;
+                    return Ok(());
+                }
+                SendAction::Retry => notified.await,
             }
-            notified.await;
         }
     }
 
     /// Receives the next value, waiting while the channel is empty.
     pub async fn recv(&self) -> Result<T, ChannelClosed> {
-        loop {
-            let notified = self.inner.changed.notified();
-            let (value, accepted) = {
-                let mut state = self.inner.state.borrow_mut();
-                if let Some(value) = state.queue.pop_front() {
-                    (Some(value), None)
-                } else if let Some(sender) = state.senders.pop_front() {
-                    (Some(sender.value), Some(sender.accepted))
-                } else if state.closed {
-                    return Err(ChannelClosed);
-                } else {
-                    let (sender, receiver) = oneshot::channel();
-                    state.receivers.push_back(sender);
-                    drop(state);
-                    self.inner.changed.notify_one();
-                    let value = receiver.await.map_err(|_| ChannelClosed)?;
-                    self.inner.changed.notify_one();
-                    return Ok(value);
-                }
-            };
-            if let Some(accepted) = accepted {
-                let _ = accepted.send(());
+        enum ReceiveAction<T> {
+            Value(T),
+            Sender(T, oneshot::Sender<()>),
+            Wait(oneshot::Receiver<T>),
+        }
+        let action = {
+            let mut state = self.inner.state.borrow_mut();
+            if let Some(value) = state.queue.pop_front() {
+                ReceiveAction::Value(value)
+            } else if let Some(sender) = state.senders.pop_front() {
+                ReceiveAction::Sender(sender.value, sender.accepted)
+            } else if state.closed {
+                return Err(ChannelClosed);
+            } else {
+                let (sender, receiver) = oneshot::channel();
+                state.receivers.push_back(sender);
+                ReceiveAction::Wait(receiver)
             }
-            if let Some(value) = value {
+        };
+        match action {
+            ReceiveAction::Value(value) => {
                 self.inner.changed.notify_one();
-                return Ok(value);
+                Ok(value)
             }
-            notified.await;
+            ReceiveAction::Sender(value, accepted) => {
+                let _ = accepted.send(());
+                self.inner.changed.notify_one();
+                Ok(value)
+            }
+            ReceiveAction::Wait(receiver) => {
+                self.inner.changed.notify_one();
+                let value = receiver.await.map_err(|_| ChannelClosed)?;
+                self.inner.changed.notify_one();
+                Ok(value)
+            }
         }
     }
 

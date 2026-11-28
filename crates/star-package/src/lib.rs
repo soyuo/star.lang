@@ -686,7 +686,6 @@ fn resolve_dependencies_with_lock(
 ) -> Result<(Lockfile, Vec<ResolvedPackage>), PackageError> {
     let root = project.canonicalize()?;
     let manifest = Manifest::read(&root)?;
-    let mut output = Vec::new();
     let locked_by_name = lock.map(|lock| {
         let mut packages = BTreeMap::<String, Vec<&LockedPackage>>::new();
         for package in &lock.packages {
@@ -697,8 +696,7 @@ fn resolve_dependencies_with_lock(
         }
         packages
     });
-    let mut seen = BTreeMap::new();
-    let mut visiting = BTreeSet::new();
+    let mut state = ResolveState::default();
     for (name, dependency) in &manifest.dependencies {
         resolve_one(
             &root,
@@ -706,18 +704,17 @@ fn resolve_dependencies_with_lock(
             dependency,
             registry,
             locked_by_name.as_ref(),
-            &mut seen,
-            &mut visiting,
-            &mut output,
+            &mut state,
         )?;
     }
-    output.sort_by(|a, b| {
+    state.output.sort_by(|a, b| {
         a.locked
             .name
             .cmp(&b.locked.name)
             .then(a.locked.version.cmp(&b.locked.version))
     });
-    let packages = output
+    let packages = state
+        .output
         .iter()
         .map(|resolved| resolved.locked.clone())
         .collect();
@@ -726,8 +723,15 @@ fn resolve_dependencies_with_lock(
             lock_version: 1,
             packages,
         },
-        output,
+        state.output,
     ))
+}
+
+#[derive(Default)]
+struct ResolveState {
+    seen: BTreeMap<String, (String, String)>,
+    visiting: BTreeSet<String>,
+    output: Vec<ResolvedPackage>,
 }
 
 fn resolve_one(
@@ -736,9 +740,7 @@ fn resolve_one(
     dependency: &Dependency,
     registry: &LocalRegistry,
     locked_by_name: Option<&BTreeMap<String, Vec<&LockedPackage>>>,
-    seen: &mut BTreeMap<String, (String, String)>,
-    visiting: &mut BTreeSet<String>,
-    output: &mut Vec<ResolvedPackage>,
+    state: &mut ResolveState,
 ) -> Result<(), PackageError> {
     let source = dependency.source();
     let pinned = locked_by_name
@@ -913,12 +915,12 @@ fn resolve_one(
             )));
         }
     }
-    if visiting.contains(&package_key) {
+    if state.visiting.contains(&package_key) {
         return Err(PackageError::Invalid(format!(
             "dependency cycle detected at `{package_key}`"
         )));
     }
-    if let Some((existing_source, existing_checksum)) = seen.get(&package_key) {
+    if let Some((existing_source, existing_checksum)) = state.seen.get(&package_key) {
         if existing_source != &source_id || existing_checksum != &checksum {
             return Err(PackageError::Invalid(format!(
                 "conflicting sources resolve to `{package_key}`"
@@ -926,22 +928,15 @@ fn resolve_one(
         }
         return Ok(());
     }
-    visiting.insert(package_key.clone());
+    state.visiting.insert(package_key.clone());
     for (child_name, child) in &manifest.dependencies {
-        resolve_one(
-            &root,
-            child_name,
-            child,
-            registry,
-            locked_by_name,
-            seen,
-            visiting,
-            output,
-        )?;
+        resolve_one(&root, child_name, child, registry, locked_by_name, state)?;
     }
-    visiting.remove(&package_key);
-    seen.insert(package_key, (source_id.clone(), checksum.clone()));
-    output.push(ResolvedPackage {
+    state.visiting.remove(&package_key);
+    state
+        .seen
+        .insert(package_key, (source_id.clone(), checksum.clone()));
+    state.output.push(ResolvedPackage {
         root,
         locked: LockedPackage {
             name: manifest.package.name,

@@ -1,0 +1,24 @@
+schema_version = 1
+iterations = 10
+memory_limit_bytes = 268435456
+time_limit_ms = 30000
+
+[[case]]
+id = "factorial"
+source = "examples/factorial.star"
+input = ""
+
+[[case]]
+id = "fibonacci-recursive"
+source = "examples/fibonacci.star"
+input = ""
+
+[[case]]
+id = "calculator-big-integer"
+source = "examples/calculator.star"
+input = "123456789012345678901234567890\n987654321098765432109876543210\n"
+
+[[case]]
+id = "brainfuck-interpreter"
+source = "examples/brainfuck.star"
+input = "++++++++[>++++++++<-]>+.<\n\n"
